@@ -136,6 +136,45 @@ Out of scope for v1 (deferred):
              "App.Colors.App.Colors") strip to the unit name -
              correct behaviour.
 
+[x] M2 phase C: opaque globals support  (2026-05-22).
+         Cheapest variable-inspection PoC: emit DW_TAG_variable per
+         .map public symbol whose segment is data (.data/.bss/.tls),
+         no type info yet. gdb defaults the type rendering to int.
+         What changed:
+           - model::Symbol gained a SymbolKind {Unknown, Function,
+             Variable}. Drives DIE emission decisions.
+           - src/map/map_reader.cpp populate():
+               * classifies each public symbol by segment.klass
+                 (CODE -> Function, anything else -> Variable).
+               * functions keep the QUALIFIED Pascal name
+                 ("Geometry.Add") - good for stack traces and
+                 `break Unit.Foo`.
+               * variables use the UNQUALIFIED local name
+                 ("S" instead of "two_units.S"). Required because
+                 gdb's Pascal expression parser interprets `.` as
+                 field access; VSCode's -var-create otherwise fails
+                 with "unable to create variable object".
+           - src/dwarf/dwarf_emitter.cpp:
+               * new abbrev (code 3) for DW_TAG_variable
+                 (name + location[DW_FORM_exprloc] + external).
+               * CU child dispatch by SymbolKind:
+                   Function -> DW_TAG_subprogram (as before)
+                   Variable -> DW_TAG_variable with
+                              DW_OP_addr <absolute VA>
+                   Unknown  -> skipped.
+         User-verified in VSCode (2026-05-22):
+           - Watch "S", "D", "C" inside two_units evaluate after
+             breaking on the Writeln line:
+               S=4 D=25 C=1   (=Ord(clGreen))
+           - gdb `info variables` shows the 5 user globals.
+           - "Cannot create var object" error gone.
+         Limits (will be removed in next RSM milestones):
+           - All variables show as `int` (gdb default when DW_AT_type
+             is omitted). P1/P2 records show only their first 4 bytes.
+           - No locals or parameters yet (need RSM proc records).
+         Tests: 16 cases / 146 assertions all green; new regression
+         test locks in unqualified-variable-name behaviour.
+
 [x] M1 cleanup pass: production-ready (2026-05-22).
          Goal of pass: consolidate after PoC, drop scaffolding, give
          a coherent "production" surface for M1.

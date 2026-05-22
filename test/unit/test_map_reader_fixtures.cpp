@@ -108,6 +108,38 @@ TEST_CASE("Fixture two_units.map: multi-unit with dotted unit name") {
 }
 
 
+TEST_CASE("Fixture two_units.map: variables use unqualified names; functions stay qualified") {
+    rsm2pdb::map::Reader r;
+    REQUIRE(r.open(std::string(RSM2PDB_FIXTURES_DIR) + "/two_units.map"));
+    rsm2pdb::model::Module mod;
+    rsm2pdb::map::populate(r.file(), mod);
+
+    const rsm2pdb::model::CompileUnit* two_units_cu = nullptr;
+    for (const auto& cu : mod.units) {
+        if (cu.source_path == "two_units.dpr") { two_units_cu = &cu; break; }
+    }
+    REQUIRE(two_units_cu != nullptr);
+
+    // Variables: unqualified ("S", not "two_units.S") so gdb's
+    // Pascal expression parser accepts them in Watch expressions.
+    const auto* var_s = findSymbol(*two_units_cu, "S");
+    REQUIRE(var_s != nullptr);
+    CHECK(var_s->kind == rsm2pdb::model::SymbolKind::Variable);
+
+    CHECK(findSymbol(*two_units_cu, "D")  != nullptr);
+    CHECK(findSymbol(*two_units_cu, "C")  != nullptr);
+    CHECK(findSymbol(*two_units_cu, "P1") != nullptr);
+
+    // Qualified form must NOT be the stored name for variables.
+    CHECK(findSymbol(*two_units_cu, "two_units.S") == nullptr);
+
+    // Functions in this CU stay qualified.
+    const auto* fn = findSymbol(*two_units_cu, "two_units.two_units");
+    REQUIRE(fn != nullptr);
+    CHECK(fn->kind == rsm2pdb::model::SymbolKind::Function);
+}
+
+
 TEST_CASE("Fixture two_units.map: adapter keeps qualified names, filters aux") {
     rsm2pdb::map::Reader r;
     REQUIRE(r.open(std::string(RSM2PDB_FIXTURES_DIR) + "/two_units.map"));

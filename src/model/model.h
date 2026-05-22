@@ -65,11 +65,18 @@ struct LineEntry {
     std::uint32_t line;
 };
 
+enum class SymbolKind {
+    Unknown,
+    Function,    // code (e.g. .text segment)
+    Variable     // data (e.g. .data / .bss / .tls segments)
+};
+
 struct Symbol {
     std::string name;
     std::uint64_t address;
     std::uint64_t size;
     TypeId type;
+    SymbolKind kind = SymbolKind::Unknown;
 };
 
 struct CompileUnit {

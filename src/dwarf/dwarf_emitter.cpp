@@ -112,16 +112,15 @@ PathSplit splitPath(const std::string& path) {
 
 // ---------------------------------------------------------------------
 // Abbreviation codes.
-// All CUs share abbreviation code 1; subprograms share code 2.
 // ---------------------------------------------------------------------
 constexpr std::uint64_t kAbbrevCu         = 1;
 constexpr std::uint64_t kAbbrevSubprogram = 2;
+constexpr std::uint64_t kAbbrevVariable   = 3;
 
 void writeAbbrevTable(BytesBuf& abbrev) {
     using namespace llvm::dwarf;
 
-    // Abbrev 1: DW_TAG_compile_unit, HAS children (subprograms are
-    // emitted as children of the CU DIE).
+    // Abbrev 1: DW_TAG_compile_unit, HAS children.
     abbrev.uleb128(kAbbrevCu);
     abbrev.uleb128(DW_TAG_compile_unit);
     abbrev.u8(DW_CHILDREN_yes);
@@ -134,13 +133,25 @@ void writeAbbrevTable(BytesBuf& abbrev) {
     abbrev.uleb128(DW_AT_stmt_list); abbrev.uleb128(DW_FORM_sec_offset);
     abbrev.uleb128(0);               abbrev.uleb128(0);
 
-    // Abbrev 2: DW_TAG_subprogram, no children (no params/locals in D2).
+    // Abbrev 2: DW_TAG_subprogram, no children.
     abbrev.uleb128(kAbbrevSubprogram);
     abbrev.uleb128(DW_TAG_subprogram);
     abbrev.u8(DW_CHILDREN_no);
     abbrev.uleb128(DW_AT_name);      abbrev.uleb128(DW_FORM_string);
     abbrev.uleb128(DW_AT_low_pc);    abbrev.uleb128(DW_FORM_addr);
     abbrev.uleb128(DW_AT_high_pc);   abbrev.uleb128(DW_FORM_addr);
+    abbrev.uleb128(DW_AT_external);  abbrev.uleb128(DW_FORM_flag);
+    abbrev.uleb128(0);               abbrev.uleb128(0);
+
+    // Abbrev 3: DW_TAG_variable, no children.
+    // No DW_AT_type yet: M2-phase-C is intentionally untyped. gdb
+    // shows the variable name + address; the value is rendered as
+    // raw memory in the Variables panel.
+    abbrev.uleb128(kAbbrevVariable);
+    abbrev.uleb128(DW_TAG_variable);
+    abbrev.u8(DW_CHILDREN_no);
+    abbrev.uleb128(DW_AT_name);      abbrev.uleb128(DW_FORM_string);
+    abbrev.uleb128(DW_AT_location);  abbrev.uleb128(DW_FORM_exprloc);
     abbrev.uleb128(DW_AT_external);  abbrev.uleb128(DW_FORM_flag);
     abbrev.uleb128(0);               abbrev.uleb128(0);
 
@@ -391,19 +402,41 @@ void writeCompileUnit(BytesBuf& info,
     info.u64(rng.hi + 1);                 // DW_AT_high_pc         (addr, exclusive)
     info.u32(stmt_list_offset);           // DW_AT_stmt_list       (sec_offset)
 
-    // ---- Child DIEs: one DW_TAG_subprogram per public function ----
-    // We filter to symbols whose address falls within the CU's
-    // address range. Aux symbols ($pdata$, $unwind$) are already
-    // filtered by the .map adapter.
+    // ---- Child DIEs: subprograms (functions) + variables (data) ----
+    // Function symbols must fall within the CU's code address range
+    // (computed from line entries); variables are in data segments
+    // and have no such range constraint - they just belong to the
+    // CU because they share the module name.
     for (const auto& sym : cu.symbols) {
-        if (sym.address < rng.lo || sym.address > rng.hi) continue;
+        switch (sym.kind) {
+        case model::SymbolKind::Function: {
+            if (sym.address < rng.lo || sym.address > rng.hi) break;
+            std::uint64_t end = symbolEnd(cu, sym, rng.hi + 1);
+            info.uleb128(kAbbrevSubprogram);
+            info.cstr(sym.name);
+            info.u64(sym.address);
+            info.u64(end);
+            info.u8(1);  // external
+            break;
+        }
+        case model::SymbolKind::Variable: {
+            info.uleb128(kAbbrevVariable);
+            info.cstr(sym.name);
 
-        std::uint64_t end = symbolEnd(cu, sym, rng.hi + 1);
-        info.uleb128(kAbbrevSubprogram);
-        info.cstr(sym.name);              // DW_AT_name   (string)
-        info.u64(sym.address);            // DW_AT_low_pc (addr)
-        info.u64(end);                    // DW_AT_high_pc (addr, exclusive)
-        info.u8(1);                       // DW_AT_external = true (flag)
+            // DW_AT_location: exprloc = ULEB128 length + bytes.
+            // Expression: DW_OP_addr <8-byte address>.
+            // Total expression length = 1 + 8 = 9 bytes.
+            info.uleb128(1 + 8);
+            info.u8(DW_OP_addr);
+            info.u64(sym.address);
+
+            info.u8(1);  // external
+            break;
+        }
+        case model::SymbolKind::Unknown:
+            // Skip; we don't know how to describe it.
+            break;
+        }
     }
 
     // End-of-children marker for the CU.

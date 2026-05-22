@@ -425,10 +425,31 @@ void populate(const MapFile& mf, model::Module& mod) {
             if (local.front() == '.')            continue;
 
             model::Symbol s;
-            s.name    = p.name;   // full qualified name
             s.address = resolveVA(mf, p.segment_id, p.segment_offset);
-            s.size    = 0;        // .map doesn't give sizes; D2 computes
+            s.size    = 0;        // .map doesn't give sizes; emitter computes
             s.type    = model::kNoType;
+
+            // Classify by segment class:
+            //   CODE                       -> Function
+            //   DATA / BSS / TLS / PDATA   -> Variable
+            if (const auto* seg = mf.findSegment(p.segment_id)) {
+                if (seg->klass == "CODE")
+                    s.kind = model::SymbolKind::Function;
+                else
+                    s.kind = model::SymbolKind::Variable;
+            }
+
+            // Naming convention:
+            //  - Functions: keep the qualified Pascal name
+            //    ("Geometry.Add") so stack traces and `break Unit.Foo`
+            //    work nicely.
+            //  - Variables: drop the module prefix and store just the
+            //    local identifier ("S" instead of "two_units.S").
+            //    gdb's Pascal expression parser treats `.` as field
+            //    access, so the qualified form fails for VSCode's
+            //    -var-create watch expressions.
+            s.name = (s.kind == model::SymbolKind::Variable) ? local : p.name;
+
             cu.symbols.push_back(std::move(s));
         }
 
