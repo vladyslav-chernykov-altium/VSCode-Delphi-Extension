@@ -1,0 +1,57 @@
+# Build output
+build/
+out/
+.cache/
+CMakeUserPresets.json
+
+# Editor / IDE
+.vs/
+.idea/
+*.user
+*.swp
+*.tmp
+
+# C/C++ artifacts at the project root or under build/ (we DO commit
+# the .exe/.rsm pairs that live under test/fixtures - see below).
+*.o
+*.obj
+*.ilk
+*.exp
+*.lib
+*.dll
+*.pdb
+
+# Delphi build artifacts (we keep .dpr/.pas sources, drop the rest)
+examples/**/*.dcu
+examples/**/*.identcache
+examples/**/*.local
+examples/**/__history/
+examples/**/__recovery/
+examples/**/Win32/
+examples/**/Win64/
+examples/**/*.exe
+examples/**/*.rsm
+examples/**/*.map
+examples/**/*.dsk
+
+# Keep committed fixtures even though they are .exe / .rsm
+!test/fixtures/**
+
+# Claude Code per-workspace settings
+.claude/
+
+# One-off debug logs from build setup
+configure.log
+
+# Local-only CMake/VSCode overrides
+.vscode/settings.local.json
+
+# Misc Delphi artifacts
+examples/**/*.drc
+examples/**/*.dproj.local
+examples/**/*.dcu
+examples/**/*.identcache
+examples/**/*.res
+
+# Stray byte dumps anywhere (we have no production .bin artifacts)
+*.bin

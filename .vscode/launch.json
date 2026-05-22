@@ -1,0 +1,53 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Delphi two_units: line debug via gdb",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/02_two_units/Win64/Debug/two_units.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/examples/02_two_units/Win64/Debug",
+      "environment": [],
+      "externalConsole": true,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/Dev/Tools/msys64/mingw64/bin/gdb.exe",
+      "sourceFileMap": {
+        "Geometry.pas":   "${workspaceFolder}/examples/02_two_units/Geometry.pas",
+        "App.Colors.pas": "${workspaceFolder}/examples/02_two_units/App.Colors.pas",
+        "two_units.dpr":  "${workspaceFolder}/examples/02_two_units/two_units.dpr"
+      }
+    },
+    {
+      "name": "Delphi hello: line debug via gdb",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/01_hello/Win64/Debug/hello.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/examples/01_hello/Win64/Debug",
+      "environment": [],
+      "externalConsole": true,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/Dev/Tools/msys64/mingw64/bin/gdb.exe",
+      "sourceFileMap": {
+        "hello.dpr": "${workspaceFolder}/examples/01_hello/hello.dpr"
+      }
+    },
+    {
+      "name": "rsm2pdb: dump (gdb)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/src/rsm2pdb.exe",
+      "args": ["dump", "${workspaceFolder}/test/fixtures/two_units.map"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/Dev/Tools/msys64/mingw64/bin/gdb.exe",
+      "preLaunchTask": "build"
+    }
+  ]
+}

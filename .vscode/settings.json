@@ -1,0 +1,20 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.buildDirectory": "${workspaceFolder}/build",
+  "cmake.generator": "Ninja",
+  "cmake.configureArgs": [
+    "-DLLVM_DIR=C:/Dev/Lib/LLVM-18/lib/cmake/llvm"
+  ],
+  "files.associations": {
+    "*.dpr": "pascal",
+    "*.pas": "pascal",
+    "*.dproj": "xml",
+    "*.inc": "pascal"
+  },
+  // VSCode's cppdbg only allows breakpoints in languages it knows
+  // (C/C++/Rust/...). Pascal isn't in that list, so without this
+  // setting the gutter click is silently ignored on .pas/.dpr files.
+  "debug.allowBreakpointsEverywhere": true,
+  "C_Cpp.default.cppStandard": "c++20",
+  "C_Cpp.default.intelliSenseMode": "windows-msvc-x64"
+}

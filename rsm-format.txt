@@ -1,0 +1,353 @@
+================================================================================
+  rsm-format.txt  -  Reverse-engineering notebook for the Delphi .rsm format
+================================================================================
+
+This file is a running notebook. Append-only style: new findings at the
+bottom, dated. Never delete past observations; if a hypothesis is later
+disproven, leave it and add a correction below.
+
+Convention:
+  - Plain text, no Markdown ceremony.
+  - Use Unix time / dates in ISO-8601 (YYYY-MM-DD).
+  - Hex dumps with absolute file offsets in left column.
+  - Tag entries with [FACT], [GUESS], [DISPROVEN], [QUESTION].
+
+Polished design view of the format lives in docs/02-rsm-format-notes.md.
+This file is the messy lab notebook behind that doc.
+
+
+================================================================================
+  WORKING ASSUMPTIONS (revisit as we learn more)
+================================================================================
+
+- Target: modern Delphi (10.2+ Tokyo), Win64 (x86_64) only for v1.
+- Endianness: LITTLE-ENDIAN throughout (TD32 was LE; assume same here).
+- Address width: 64-bit for Win64 RSM. To verify.
+- File is laid out as: fixed header + directory + subsections + ...
+  but we haven't validated this; could be more like a stream of typed
+  records.
+
+
+================================================================================
+  TEST FIXTURES
+================================================================================
+
+F-001  test/fixtures/hello.rsm
+       Source:    examples/01_hello/hello.dpr (42 lines)
+       Compiler:  Embarcadero Delphi for Win64 v32.0  (Studio 19 = 10.2 Tokyo)
+       Switches:  via hello.dproj - Debug, Win64, DebugInformation=1,
+                  LocalDebugSymbols=true, SymbolReferenceInfo=1,
+                  MapFile=3, Optimize=false, DebugInfoInExe=true.
+                  DCC_RemoteDebug auto-on for Win64.
+       Size:      3,516,365 bytes
+       Companion: test/fixtures/hello.exe   (1.4 MB, has embedded TD32 too)
+                  test/fixtures/hello.map   (318 KB, human-readable)
+       What hello.exe does at runtime: prints "Sum = 7, Color = 1"
+
+
+================================================================================
+  2026-05-22  Initial inspection of hello.rsm
+================================================================================
+
+Raw hex of first 64 bytes:
+
+offset  hex                                              ascii
+------  -----------------------------------------------  ----------------
+0x0000  43 53 48 37 20 04 00 00 0e 00 00 00 01 00 00 00  CSH7 ...........
+0x0010  17 52 b6 5c 4d 23 00 20 00 00 40 00 00 00 00 00  .R.\M#. ..@.....
+0x0020  2e 5c 57 69 6e 36 34 5c 44 65 62 75 67 5c 68 65  .\Win64\Debug\he
+0x0030  6c 6c 6f 2e 65 78 65 00 00 00 00 00 00 00 00 00  llo.exe.........
+
+[FACT]   Magic is ASCII "CSH7" at offset 0. Probably stands for
+         "Code Symbol Hierarchy v7" or similar. The "7" likely a
+         format version.
+
+[FACT]   This is NOT the legacy Borland TD32/TDS layout (which used
+         "FB09" / "FB0A" magic and is what JCL's JclTD32.pas parses).
+         Embarcadero replaced or substantially redesigned the format
+         at some point. JCL is a hint but not a translation source.
+
+[GUESS]  offset 0x04: uint32 0x00000420 = 1056. Probably an offset
+         into the file (header end? directory start?). Plausible
+         since 1056 is well past our 64-byte sampled header.
+
+[GUESS]  offset 0x08: uint32 0x0000000E = 14. Maybe a count
+         (subsections / modules / something).
+
+[GUESS]  offset 0x0C: uint32 0x00000001 = 1. Maybe a sub-version,
+         flag, or "module count" if 0x08 was section count.
+
+[GUESS]  offset 0x10: uint32 0x5CB65217 = 1555471895 = 2019-04-17
+         13:51:35 UTC. Looks like a Unix timestamp. Could be the
+         RSM format epoch (when this version of the format was
+         frozen) OR the build timestamp of this specific .rsm.
+
+[QUESTION] offset 0x14: uint32 0x2000234D. No clean interpretation.
+         If we read it as two uint16: 0x234D, 0x2000. 0x2000 might
+         be alignment or flags. 0x234D unclear.
+
+[GUESS]  offset 0x18: uint32 0x00400000. This is the canonical
+         Win32 default PE ImageBase. Weird because our EXE is Win64
+         with ImageBase 0x140000000. Maybe a legacy field; maybe
+         a different VA the symbols are relative to; maybe a
+         relocation hint.
+
+[FACT]   offset 0x20: null-terminated ASCII path to the EXE this
+         RSM was generated for. ".\Win64\Debug\hello.exe" here.
+         Notice the relative path - the linker writes it as
+         relative to the .dproj directory.
+
+[QUESTION] Where does the path field end (max length)? Padded to
+         some boundary? Need to check by varying the .dpr path.
+
+[QUESTION] Right after the path, what comes? Zeros visible in the
+         sample, but is that padding to alignment, or actual data?
+
+
+================================================================================
+  TODO  (next things to investigate, before writing the parser)
+================================================================================
+
+I-001  Dump bytes 0x40..0x100 of hello.rsm and look for ASCII
+       strings, recognizable structure.
+
+I-002  Verify the "directory offset" hypothesis: read bytes at
+       offset 0x420 (if that field really points there) and see if
+       the content looks like a table.
+
+I-003  Cross-reference with hello.map: find a known symbol address
+       (e.g. Add() function), search hello.rsm for those bytes /
+       string "Add", see what surrounds them. This is the Rosetta
+       stone approach.
+
+I-004  Build a SECOND fixture (examples/02_arrays or just modify
+       hello.dpr) and diff the two RSM headers. Bytes that change
+       are dynamic per-build (paths, timestamps, sizes); bytes that
+       stay identical are likely format constants.
+
+I-005  Compare the embedded TD32 section in hello.exe vs hello.rsm
+       byte-for-byte at the data portions (after each respective
+       header). They likely contain the SAME content - that would
+       confirm RSM is just "TD32 with a different wrapper", which
+       hugely helps us.
+
+I-006  Check what the OS thinks the file type is - does
+       hello.rsm have any standard signature (Windows file
+       association data, etc.)?
+
+
+================================================================================
+  2026-05-22 (cont)  Wider hex scan + .map cross-reference of hello.rsm
+================================================================================
+
+[FACT]   Header proper is just bytes 0x00 - ~0x3F. The block 0x40 - 0x425
+         is all zeros (padding/reserved).
+
+[FACT]   At offset 0x426 a structured block begins. The bytes
+         0x426..0x42c are: 07 00 55 01 00 00 00, then ASCII paths
+         follow at 0x42D.
+
+[FACT]   The library/import search path list appears verbatim seven
+         times back-to-back, ending around 0xAD0. The 6 paths inside
+         each copy are (in order):
+           c:\dev\tools\embarcadero\studio\19.0\lib\Win64\release\EN\
+           c:\dev\tools\embarcadero\studio\19.0\lib\Win64\release\
+           C:\Users\vladyslav.chernykov\Documents\Embarcadero\Studio\19.0\Imports\
+           C:\Dev\Tools\Embarcadero\Studio\19.0\Imports\
+           C:\Users\Public\Documents\Embarcadero\Studio\19.0\Dcp\Win64\
+           C:\Dev\Tools\Embarcadero\Studio\19.0\include\
+         Each path is null-terminated. Path lists separated by another
+         small structure (a few bytes between them).
+
+[GUESS]  The uint16 0x0007 at offset 0x426 = count of path-list copies.
+         If this stays at 7 for our simple project, it's a per-fixed
+         count (six standard categories + "user/include" paths)
+         indexed by some module-builder concept. Or it's the same list
+         repeated because Delphi serializes each search path per
+         purpose: unit search / namespace / hpp / include / object /
+         resource. To verify by varying compile options.
+
+[FACT]   Immediately after the path lists (around 0xADE): the
+         DCC_UnitAliases string is stored as one big delimited list:
+           DbiErrs=BDE;DbiProcs=BDE;DbiTypes=BDE;WinProcs=Winapi.Windows;
+           WinTypes=Winapi.Windows;Generics.Defaults=System.Generics.Defaults;
+           Generics.Collections=System.Generics.Collections
+
+[FACT]   At offset 0xB90: the relative EXE path appears AGAIN
+         (.\Win64\Debug\hello.exe). So this string is stored at least
+         twice in the file (once near offset 0x20, once near 0xB90).
+
+[FACT]   Most of the 3.5 MB is Delphi RTL: unit names (System,
+         SysUtils, Winapi.Windows, ...) and imported symbols (
+         @DelayLoadHelper2, @GetTls, kernel32.dll, VirtualAlloc, ...)
+         starting around 0xBBF.
+
+[FACT]   User code symbols live at the very END of the file
+         (offsets 0x354F00+). Strings we see for hello:
+           $unwind$_ZN5Hello3AddEii         at 0x354F11
+           $pdata$_ZN5Hello3AddEii          at 0x354F34
+           Finalization                     at 0x354F56
+           hello                            at 0x354F79
+           $unwind$_ZN5Hello12FinalizationEv at 0x354F90
+           $pdata$_ZN5Hello12FinalizationEv at 0x354FBC
+           $unwind$_ZN5Hello14initializationEv at 0x354FE7
+           $pdata$_ZN5Hello14initializationEv  at 0x355015
+           TPoint                           at 0x3550D4
+           TColor                           at 0x35511F
+           clGreen                          at 0x35513D
+           clBlue                           at 0x355145
+         Then several unit-name strings, finally section names
+         (.itext .rdata .pdata .xdata) and source dir.
+
+[FACT]   Delphi x64 uses ITANIUM-STYLE NAME MANGLING (not the
+         legacy Borland mangling). Example:
+            _ZN5Hello3AddEii    =  Hello::Add(int, int)
+            _ZN5Hello14initializationEv = Hello::initialization()
+         Important implication: when we emit DWARF, the DW_AT_name
+         attribute should contain the DEMANGLED Pascal name
+         ("Hello.Add" or just "Add"), not the mangled form. We need
+         a small Itanium demangler (or use llvm::itaniumDemangle
+         from the LLVM Demangle lib we already linked).
+
+[FACT]   Win64 EH frames generate auxiliary symbols prefixed
+         "$pdata$" (RUNTIME_FUNCTION entries) and "$unwind$"
+         (UNWIND_INFO blobs). These are NOT user code; they're
+         the unwinder's metadata. We should likely skip emitting
+         DIEs for them (they have no source location to map to).
+
+[FACT]   Records near offset 0x354F00..0x355100 use a small
+         tag-length-string pattern:
+            27 18 "$unwind$_ZN5Hello3AddEii("    (0x18 = 24 chars)
+            27 17 "$pdata$_ZN5Hello3AddEii("     (0x17 = 23 chars)
+            28 0C "Finalization"                  (0x0C = 12 chars)
+            28 05 "hello"                         (0x05 = 5 chars)
+         The TAG byte (0x27, 0x28, ...) likely identifies a symbol
+         KIND. LENGTH is exactly 1 byte (so symbols are limited to
+         255 chars). Names are NOT null-terminated within this
+         record kind.
+
+         Around the records there are more bytes between them - these
+         must be the symbol's address / size / type-id / attributes.
+
+[FACT]   At offset 0x355100+ we see a TColor enum record. Pattern:
+            03 06 "TColor"
+            <some bytes>
+            05 "clRed" 07 "clGreen" 06 "clBlue"
+         The leading 0x03 might be the enum-type tag, 0x06 = name
+         length. The enumerator list uses raw length-prefix strings
+         (5/"clRed" 7/"clGreen" 6/"clBlue") - clean Pascal-shortstring
+         style.
+
+[FACT]   The byte sequence right after "hello" looks like ACTUAL X64
+         MACHINE CODE for Add():
+            55 48 83 EC 10  48 8B EC  89 4D 20  89 55 28
+            8B 45 20  03 45 28  89 45 08  ...  5D C3
+         Decodes to:
+            push rbp; sub rsp, 0x10; mov rbp, rsp;
+            mov [rbp+0x20], ecx; mov [rbp+0x28], edx;
+            mov eax, [rbp+0x20]; add eax, [rbp+0x28];
+            mov [rbp+0x08], eax; ... pop rbp; ret
+         This is Add()'s body. Why is it stored in the RSM?
+         Possible reasons:
+            a) Embedded for "edit & continue" / fix-up purposes.
+            b) Stored as part of a symbol's value for compile-time
+               constant inlining.
+            c) Coincidence - bytes happen to look like code.
+         To investigate.
+
+[FACT]   Address 0x00025900 (hello.Add per .map) appears in the file
+         right before the TColor record. Pattern:
+            02 01  59 02 00  02  00 00 00 08 ...
+         where 02 01 = uint16 0x0102 might be a "segment+kind" code
+         and 01 59 02 00 = uint32 0x00025901 might be Add's address.
+         Off by 1 from the .map's 0x25900 - could be (a) intentional
+         (skipping prologue) or (b) my byte-alignment guess is off
+         by 1.
+
+
+================================================================================
+  2026-05-22 (cont)  Hunt for line-number tables
+================================================================================
+
+[FACT]   Raw .map line-address tuples are NOT stored in .rsm as plain
+         4-byte uint32 values. Searched for every line address from
+         hello.map's line table:
+            line 24  0x00025900     "00 59 02 00"  -> found 8 times
+                                                       but all are
+                                                       other-symbol VAs
+            line 25  0x0002590E     "0e 59 02 00"  -> 0 hits
+            line 26  0x00025917     "17 59 02 00"  -> 0 hits
+            line 27  0x0002591D     "1d 59 02 00"  -> 0 hits
+            line 34  0x00025940     "40 59 02 00"  -> 0 hits
+            line 35  0x0002595F     "5f 59 02 00"  -> 0 hits
+            line 36  0x00025969     "69 59 02 00"  -> 0 hits
+            line 37  0x00025973     "73 59 02 00"  -> 0 hits
+            line 38  0x0002597A     "7a 59 02 00"  -> 1 false-positive hit
+            line 39  0x00025991     "91 59 02 00"  -> 0 hits
+            line 40  0x000259DE     "de 59 02 00"  -> 0 hits
+
+[FACT]   The 1 hit for "7a 59 02 00" at file offset 0x1B9AC4 is a
+         FALSE POSITIVE. Bytes around it show "ciexyzX/Y/Z" struct
+         field names - it's the CIEXYZ color triple from
+         Winapi.Windows GDI definitions. Address coincidence.
+
+[GUESS]  The .rsm line-table encoding is non-trivial. Most likely
+         candidates:
+            - LEB128 deltas like DWARF's line state machine
+            - run-length encoded (line_delta + addr_delta) byte pairs
+            - per-source-file header + offset list relative to a
+              function base
+            - state machine with opcodes (DW_LNS_*-like)
+         Reversing this would cost 3-5 days of careful work for
+         zero fidelity gain - the .map is authoritative linker output
+         covering exactly this.
+
+[D-016 RECORDED]  Decision: use .map for line numbers + public
+         symbols, .rsm for types + locals + params + source paths.
+         Both feed model::Module. The .rsm parser does NOT need to
+         decode line tables. Note this saves real time AND moves the
+         RSM RE focus to the parts we genuinely need it for.
+
+
+================================================================================
+  NEW HYPOTHESES TO TEST
+================================================================================
+
+H-001  The 4-byte uint at offset 0x04 (= 0x420) might be the start
+       of the "metadata" block, not a directory. Bytes 0x40..0x425
+       are reserved/padding; data starts at 0x426 with the search
+       path list block.
+
+H-002  The format is more "stream of typed records" than "table of
+       contents pointing to subsections". The 0x27/0x28/0x03 byte
+       tags appearing near user symbols hint at a tagged-record
+       encoding.
+
+H-003  Symbols are encoded as one record per symbol with the kind
+       byte indicating what kind of symbol it is:
+         0x27 = ?? (we saw both $unwind$ and $pdata$ aux symbols)
+         0x28 = ?? (we saw Finalization, "hello", and other names)
+         0x03 = enum-type definition
+         More to discover.
+
+H-004  Enum literals are encoded as length-prefixed strings with no
+       outer kind tag, packed tightly under the enum-type record.
+
+
+================================================================================
+  GLOSSARY (terms we keep using)
+================================================================================
+
+CSH7        the 4-byte ASCII magic at offset 0 of modern RSM files.
+            See [FACT] above.
+TD32        Borland's legacy debug-info container, magic "FB09" /
+            "FB0A". Documented by JCL JclTD32.pas / JclDebug.pas.
+            Probably not the same as RSM but likely an ancestor.
+TDS         Same family as TD32; the embedded-in-EXE form. Was
+            written into a PE section named ".tds" or similar.
+CodeView    Microsoft's pre-PDB debug-info format. CV4 / CV5
+            documents leaked in the 90s. TD32 borrows from it.
+RSM         Remote Symbol file. Modern Delphi sidecar debug-info
+            file. Generated automatically for Win64 builds.
+DIE         DWARF debug info entry. (DWARF side terminology;
+            unrelated to RSM internals.)

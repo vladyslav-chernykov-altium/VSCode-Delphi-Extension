@@ -1,0 +1,611 @@
+================================================================================
+  rsm2pdb - project todo
+================================================================================
+
+Goal: convert Delphi .rsm (Remote Symbol) debug-info files into DWARF (v1)
+and PDB (v2) so VSCode + gdb (and later cppvsdbg / WinDbg / x64dbg) can
+debug Delphi binaries.
+
+Scope locked for v1:
+  - Modern Delphi (XE / 10.x / 11+)
+  - x64 only
+  - Symbols + line numbers + basic types (primitives, records, enums,
+    pointers, arrays)
+  - DWARF output, injected as new sections into a copy of the EXE
+  - VSCode debugging via ms-vscode.cpptools cppdbg + mingw-w64 gdb
+
+Out of scope for v1 (deferred):
+  - 32-bit (x86)
+  - Sets, variants, dynamic arrays, interfaces, managed strings as
+    native structs
+  - PDB output
+  - In-place EXE editing
+  - CFI / unwind tables
+  - Inlined-subroutine DIEs
+
+================================================================================
+  DONE
+================================================================================
+
+[x] 0.1  Decided toolchain: C++20 / MSVC / LLVM 18.1.8 / CMake+Ninja /
+         doctest / mingw-w64 gdb / VSCode cppdbg
+         (alternative path "DWARF first, PDB later" agreed)
+
+[x] 0.2  Decided directory layout:
+           c:/Dev/Tools/        - build tools (msys64)
+           c:/Dev/Lib/          - libraries (LLVM-18)
+           c:/Dev/Src/rsm2pdb/  - workspace
+
+[x] 0.3  Wrote install script: scripts/install-deps.ps1
+         Installs MSYS2+gdb and builds LLVM 18.1.8 from source.
+         Discovers VS-bundled CMake+Ninja and adds to user PATH.
+
+[x] 0.4  Workspace scaffold:
+           CMakeLists.txt (top + src + test)
+           src/main.cpp                       CLI: dump / dwarf subcommands
+           src/rsm/rsm_reader.{h,cpp}         (stub)
+           src/model/model.{h,cpp}            full Type variant, Symbol,
+                                              LineEntry, CompileUnit, Module
+           src/dwarf/dwarf_emitter.{h,cpp}    (stub)
+           test/unit/test_main.cpp            doctest entry point
+           test/unit/test_model.cpp           smoke test for Module
+           test/fixtures/README.md
+           examples/01_hello/hello.dpr        Delphi sample (record+enum+fn)
+           examples/01_hello/build.cmd        dcc64 -B -V -VR wrapper
+           examples/README.md
+           .vscode/{settings,tasks,launch,c_cpp_properties,extensions}.json
+           .gitignore
+           README.md
+           docs/01-architecture.md
+           docs/02-rsm-format-notes.md
+           docs/03-dwarf-emission-notes.md
+           docs/04-validation-plan.md
+           scripts/check-vs.cmd               VS env diagnostic
+
+[x] 1    VS install verified (VS2026 Insiders 18 at
+         "C:\Program Files\Microsoft Visual Studio\18\Insiders\")
+         cl.exe 19.51.36243 x64; vcvars64.bat works.
+         CMake + Ninja bundled with VS - no separate install needed.
+         Install script updated with VS18 discovery fallback.
+
+[x] 2    MSYS2 + mingw-w64 toolchain installed.
+         Location:  C:\Dev\Tools\msys64\
+         gdb:       C:\Dev\Tools\msys64\mingw64\bin\gdb.exe       (GNU 17.2)
+         gcc:       C:\Dev\Tools\msys64\mingw64\bin\gcc.exe       (16.1.0)
+         objdump:   C:\Dev\Tools\msys64\mingw64\bin\objdump.exe   (binutils 2.46)
+         Packages installed via pacman:
+           mingw-w64-x86_64-gdb       (initial step 2 target)
+           mingw-w64-x86_64-gcc       (added later for the step 6a spike)
+           mingw-w64-x86_64-binutils  (pulled in by gcc; gives us objdump/objcopy)
+         Script fixes required en route:
+           - Force TLS 1.2/1.3 in [Net.ServicePointManager] for downloads
+             (default .NET protocol was rejected by GitHub).
+           - Switch from hardcoded MSYS2 release date to GitHub API lookup;
+             current asset name is msys2-x86_64-latest.exe under the
+             rolling "nightly-x86_64" tag (older releases used dated
+             names which no longer exist).
+         User PATH updated to include mingw64/bin.
+         NOTE: gcc requires the mingw64/bin PATH set up (assembler "as" and
+         linker "ld" are co-installed there). Invoke via the MSYS2 login
+         bash (`bash -lc "..."`) for reliable results from outside MSYS2.
+
+[x] 3    LLVM 18.1.8 built and installed (lean profile, D-010).
+         Source: C:\Dev\Src\llvm-project\
+         Install: C:\Dev\Lib\LLVM-18\  (491 MB - even smaller than predicted)
+         Verified: C:/Dev/Lib/LLVM-18/lib/cmake/llvm/LLVMConfig.cmake
+         Toolchain: cl 19.51.36243 (VS2026 Insiders MSVC 14.51.36231)
+         No build warnings on the lean config.
+
+[x] 6a   Spike control test: DWARF-in-PE -> gdb on Windows PASSING.
+         Built spike/hello.c with mingw gcc -gdwarf-5 -O0.
+         Confirmed via gdb 17.2 batch (see spike/README.md):
+           - break by source:line and by function name
+           - argument values (a=3, b=4) shown via DWARF
+           - stack trace traverses frames with line numbers
+           - single-step within a function
+           - local variable inspection (`print sum` -> 7)
+           - normal program completion
+         Section set produced by gcc matches our planned emit list
+         (.debug_info / _abbrev / _line / _str / _line_str / _aranges).
+         -> PE+DWARF+gdb on Windows is a sound foundation for v1.
+
+[x] 6b   Spike VSCode verification: cppdbg + gdb steps spike/hello.exe
+         PASSING (user-confirmed).
+         Verified interactively: breakpoints, step-in / step-over /
+         step-out, local variables visible in the Variables panel.
+         -> VSCode side of the consumption pipeline works as expected.
+
+[x] 7b   Multi-unit .map stress test (examples/02_two_units).
+         Project: main + Geometry.pas + App.Colors.pas (dotted unit
+         name to exercise namespace handling).
+         Produced and committed test/fixtures/two_units.{exe,rsm,map}.
+         two_units.exe at runtime prints "S=4 D=25 C=green".
+         Verified via integration tests (test_map_reader_fixtures.cpp):
+           - 3 line tables (Geometry / App.Colors / two_units), 10/8/10
+             entries respectively
+           - dotted unit name App.Colors parsed correctly in the
+             "Line numbers for App.Colors(App.Colors.pas)" section
+           - cross-unit call Geometry.Add resolved correctly
+           - adapter strips "App.Colors." prefix to yield "ColorName"
+           - 11 doctest cases / 91 assertions all green
+         No parser bugs found.
+         Minor cosmetic notes (not bugs):
+           - Anonymous compiler-internal symbols like "Geometry..1"
+             have a double dot; our prefix-strip yields ".1"
+           - Unit-init functions named after the unit (e.g.
+             "App.Colors.App.Colors") strip to the unit name -
+             correct behaviour.
+
+[x] M1 cleanup pass: production-ready (2026-05-22).
+         Goal of pass: consolidate after PoC, drop scaffolding, give
+         a coherent "production" surface for M1.
+         Changes:
+           - Ported spike/inject_files.c -> src/pe/pe_injector.{h,cpp}
+             (C++). injectDwarfSections() / injectDwarfFile().
+           - Added unified `rsm2pdb dwarf <map> <input.exe> <output.exe>`
+             CLI command: parse map -> populate model -> emit DWARF ->
+             inject. One step from .map to debuggable .exe.
+           - examples/02_two_units/build.cmd: replaced direct
+             inject_files.exe call with `rsm2pdb dwarf`.
+           - examples/01_hello/: switched from raw dcc64 to MSBuild
+             (added hello.dproj) + unified rsm2pdb dwarf pipeline.
+             Now harmonized with 02_two_units.
+           - Deleted spike/*.exe, spike/dwarf_*.bin, spike/*_stripped.exe,
+             spike/*_dwarf.exe, scripts/check-vs.cmd (all regenerable
+             or obsolete).
+           - spike/ now contains only README + the .c sources kept
+             as historical references.
+           - .vscode/launch.json: dropped obsolete configs (hello_dwarf,
+             plain-spike). Kept the two Delphi configs + rsm2pdb dump.
+           - README.md fully rewritten: current capabilities, how to
+             use on your own Delphi project, repo layout.
+           - docs/01-architecture.md refreshed with current layered
+             diagram including src/pe/.
+           - docs/04-validation-plan.md aligned with what M1 actually
+             ships and how it's validated.
+           - spike/README.md updated to reflect post-cleanup contents.
+         All tests still green: 16 cases / 137 assertions.
+         Integrated build + run verified on examples/02_two_units:
+         S=4 D=25 C=green.
+
+[x] PoC2 USABLE LINE DEBUGGING (2026-05-22, post-Defender-workaround).
+         Problem after the first PoC: Windows Defender / corporate
+         EDR blocks running PEs that were modified after the linker
+         produced them ("Access is denied"). User-level exclusions
+         insufficient on the corporate machine.
+         Fix: integrate injection INTO the build, so the .exe is born
+         with DWARF rather than patched post-hoc. Defender treats it
+         as a fresh build output.
+         What was changed:
+            - examples/02_two_units/build.cmd now runs:
+                msbuild ... -> two_units.exe (+ .rsm + .map)
+                rsm2pdb dwarf-emit ...     -> Win64/Debug/dwarf/
+                inject_files.exe (replaces two_units.exe with the
+                                  DWARF-enriched version)
+            - examples/02_two_units/two_units.dproj:
+                DCC_DebugInfoInExe = false (skip Delphi TD32 in EXE
+                                            so we have headroom)
+            - spike/inject_files.c: added header-area expansion logic
+              (when SizeOfHeaders too tight, expand by FileAlignment
+              and shift all existing section data forward by the
+              same amount; update PointerToRawData / SizeOfHeaders /
+              PointerToSymbolTable).
+            - .vscode/launch.json: added "Delphi two_units: line
+              debug via gdb (PoC)" launch config.
+         End-to-end gdb test on integrated-build binary:
+            - exe runs:                  S=4 D=25 C=green
+            - gdb info sources:           Geometry.pas, App.Colors.pas,
+                                          two_units.dpr
+            - gdb info line ...:          all resolve correctly
+            - gdb break Geometry.pas:19 + run:
+                Thread hit Breakpoint 1 at Geometry.pas:19
+                bt -> frame 0: Geometry.pas:19
+                      frame 1: two_units.dpr:26 (caller)
+                continue -> normal exit with S=4 D=25 C=green
+         RESULT: line debugging of Delphi code via gdb works
+         end-to-end on this corporate-controlled machine.
+         **User-confirmed in VSCode (2026-05-22):** gutter clicks
+         set breakpoints, F5 launches via cppdbg, breakpoints
+         actually hit, step-by-step navigation works.
+         Two VSCode-side gotchas were resolved en route:
+           - debug.allowBreakpointsEverywhere = true required
+             (cppdbg's default whitelist doesn't include Pascal).
+           - tasks.json "build" task now sources vcvars64.bat
+             before cmake so it works from VSCode (was failing
+             with "preLaunch task build failed" when invoked
+             without the VS Dev environment).
+         Remaining UX gap: function names in stack traces still
+         show as Delphi COFF "__dbk_fcall_wrapper+N" -> fix in D2.
+
+[x] PoC  END-TO-END LINE DEBUGGING WORKS  (2026-05-22).
+         Pipeline:
+            two_units.map  -->  src/map/  (parser)
+                           -->  model::Module
+                           -->  src/dwarf/ (emitter)
+                           -->  .debug_info / .debug_abbrev / .debug_line
+                           -->  spike/inject_files.exe (file-based injector)
+                           -->  two_units_dwarf.exe
+                           -->  gdb sees all 3 Pascal sources, lines map
+                                to correct addresses
+         Verified with gdb 'info line':
+            Geometry.pas:19  -> 0x426900 (Add prologue)
+            Geometry.pas:20  -> 0x42690e
+            two_units.dpr:21 -> 0x426a90 (program begin)
+         Limitations:
+            - Cannot run the injected exe under Windows Defender (corp
+              EDR blocks modified PEs); doesn't affect gdb's ability
+              to READ symbols.
+            - Stack-trace function names still come from PE COFF symtab
+              ("__dbk_fcall_wrapper+N"); will become "Hello.Add" once
+              D2 (subprograms) lands.
+         Bugfix found en route:
+            DWARF v5 line state machine's File register initializes
+            to 1, but our file table only has entry 0. Without
+            emitting DW_LNS_set_file 0 at the start of each line
+            program, every emitted row referenced file 1 (out of range)
+            and was silently dropped by gdb/LLVM. Regression-locked
+            by test_dwarf_emitter.cpp's "line program contains correct
+            addresses" sub-case.
+
+[x] 12   DWARF emitter D1 DONE.  (NOTE: numbered ahead of step 8-11 RSM
+         parser work, per milestone M1 sequencing.)
+         Layout: src/dwarf/dwarf_emitter.{h,cpp}  (~290 lines).
+         Hybrid LLVM use: only DWARF constants (llvm::dwarf::DW_*),
+         no llvm::MC machinery. Hand-rolled byte emission via local
+         BytesBuf helper (u8/u16/u32/u64/uleb128/sleb128/cstr +
+         reservedU32/patchU32 for backfilling unit_length fields).
+         Produces 5 DWARF v5 sections:
+            .debug_info     - one DW_TAG_compile_unit per CompileUnit
+                              with producer / language=Pascal83 /
+                              name / comp_dir / low_pc / high_pc /
+                              stmt_list
+            .debug_abbrev   - one shared abbrev (code 1) for compile_unit
+            .debug_line     - DWARF v5 line program per CU
+                              (set_address + advance_pc/line + copy +
+                              end_sequence; no special opcodes yet)
+            .debug_str      - EMPTY for D1 (strings inlined via FORM_string)
+            .debug_line_str - EMPTY for D1 (same)
+         CLI: rsm2pdb dwarf-emit <input.map> <out-dir>
+              Reads .map, populates model::Module, emits DWARF, writes
+              each section as a separate .debug_* file for inspection.
+         Real-fixture sanity:
+            two_units.map -> .debug_info 186 B / .debug_abbrev 20 B /
+                             .debug_line 344 B (2 CUs encoded).
+         Tests: 16 cases / 127 assertions all green (byte-level
+                assertions; see note on DWARFContext below).
+
+         FYI - DWARFContext testing path abandoned:
+           Initial plan was to verify our output by parsing it back
+           with llvm::DWARFContext::create(StringMap, AddrSize). It
+           produced "DWARF unit extends past section size" warnings
+           for clearly-valid bytes; the misread value (0x0f1c0005)
+           doesn't match anything in our buffer. Spent ~20 minutes;
+           switched to byte-level structural tests instead, which are
+           also more transparent. Final verification of correctness
+           is gdb on a real injected PE (after step 15).
+
+         Build-system fixes accumulated during this step:
+           - find_package(LLVM 18 ...) -> find_package(LLVM 18.1 ...)
+           - CMAKE_POLICY_VERSION_MINIMUM 3.5 set before doctest fetch
+           - CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreadedDLL" (FORCE in
+             cache, before project()) and cmake_policy CMP0091 NEW;
+             matches LLVM's Release-build /MD runtime.
+
+[x] 7    .map parser DONE.
+         Layout: src/map/map_reader.{h,cpp} (~330 lines).
+         Section-state-machine parser; recognizes:
+           - "Start  Length  Name  Class"  header   -> segments
+           - "Detailed map of segments"             -> module-segments
+           - "Address  Publics by Name"             -> publics
+           - "Address  Publics by Value"            -> skipped (dup)
+           - "Line numbers for X(file.pas) segment S" -> line tables
+           - "Bound resource files"                 -> skipped
+           - "Program entry point at SEG:OFF"       -> entry point
+         CLI: rsm2pdb dump <input.map> (auto-detected by extension).
+         Adapter populate(MapFile, model::Module) populates source
+         files, CompileUnits, Symbols, LineEntry. Absolutizes
+         addresses via the segment table.
+         Run on test/fixtures/hello.map produces:
+           5 segments, 58 module-segments, 2270 publics,
+           1 line table (hello.dpr, 11 entries), entry @ 0001:00025940
+         Tests: 8 doctest cases / 52 assertions all green.
+
+[x] 5    First Delphi fixture produced via MSBuild + Delphi 10.2 Tokyo.
+         Delphi install: C:\Dev\Tools\Embarcadero\Studio\19.0\
+         Approach: hello.dproj + examples/01_hello/build.cmd which
+                   calls rsvars.bat then MSBuild on the dproj.
+         Build outputs (in examples/01_hello/Win64/Debug/):
+            hello.exe     1.4 MB   (with embedded TD32 debug info)
+            hello.rsm     3.5 MB   <- THE FILE WE PARSE
+            hello.map     318 KB   (cross-check reference)
+            hello.drc      11 KB   (drc resource compiler, ignore)
+         Fixture committed:
+            test/fixtures/hello.exe / hello.rsm / hello.map
+         hello.exe runs and prints "Sum = 7, Color = 1" as expected.
+         Compiler banner: "Embarcadero Delphi for Win64 compiler v32.0".
+
+         IMPORTANT DISCOVERY (see docs/02-rsm-format-notes.md):
+         The modern Delphi RSM magic is "CSH7" (43 53 48 37) - NOT
+         the "FB09"/"FB0A" the legacy JCL JclTD32.pas reads. The format
+         has been replaced or substantially revised by Embarcadero.
+         JCL's TD32 reader may not apply; we'll be doing actual
+         reverse engineering.
+
+[x] 4    Scaffold builds against LLVM and tests pass.
+         Build: cmake -B build -G Ninja under vcvars64,
+                cmake --build build  ->  9/9 OK
+         Run:   ./build/src/rsm2pdb.exe (prints usage)
+                ./build/src/rsm2pdb.exe dump foo.rsm (stub runs)
+                ./build/test/rsm2pdb_tests.exe -> 4/4 assertions pass
+         Fixes applied to get here:
+           - find_package(LLVM 18 ...) -> find_package(LLVM 18.1 ...)
+             because LLVM's LLVMConfigVersion.cmake enforces an exact
+             major.minor match.
+           - set(CMAKE_POLICY_VERSION_MINIMUM 3.5) in test/CMakeLists.txt
+             before FetchContent_MakeAvailable(doctest), because
+             doctest 2.4.11's cmake_minimum_required is too old for
+             the bundled VS2026 CMake (>= 3.27).
+         Known warning: MSVC C5285 from doctest 2.4.11 (std::tuple
+         specialization). Cosmetic; tracked for doctest version bump.
+
+[x] 6c   Spike PE-section injection: PASSING.
+         Built spike/inject_dwarf.c (~330 lines of C). Pipeline:
+            objcopy --strip-debug hello.exe -> hello_stripped.exe
+            inject_dwarf hello.exe hello_stripped.exe hello_injected.exe
+         Verified on hello_injected.exe:
+           - still runs ("result = 7")
+           - objdump -h shows 15 sections incl. 5 .debug_* at indices 10-14
+           - gdb info sources finds hello.c
+           - gdb break add hits at line 16 with a=3, b=4
+           - gdb step + print sum -> 7
+           - gdb bt shows main -> add with line numbers
+         Long section names handled via COFF string-table "/N" convention.
+         Existing PE symbol table preserved, string table extended.
+         Limitations to address in production step 14:
+           - spike fits only because target had 232 bytes of header
+             headroom (5 new 40-byte headers). Production injector
+             must expand SizeOfHeaders + shift section data when
+             headroom is insufficient.
+           - Only injects 5 sections (info/abbrev/line/str/line_str);
+             skips aranges/frame/loclists/rnglists. May need to widen.
+         -> Architecture FULLY de-risked. All blockers for RSM parser
+         and DWARF emitter work are cleared on the technical side.
+
+================================================================================
+  TODO
+================================================================================
+
+----- (step 5 moved to DONE) -----
+
+----- MILESTONES -----
+
+M1   Source-level navigation, NO variables  -- DONE 2026-05-22.
+     Steps: 7 + 12 + 13 + 15(spike).
+     Delivers (user-verified in VSCode):
+       - breakpoint by clicking gutter on .pas/.dpr files
+       - step over/into/out works
+       - Call Stack shows source file + line + Pascal function name
+         (Geometry.Add at Geometry.pas:20)
+       - `break Geometry.Add` works by qualified name
+       - multi-unit projects supported (Geometry.pas, App.Colors.pas,
+         two_units.dpr in our fixture)
+     Step 15 fulfilled by spike/inject_files.c (production version
+     still pending - throwaway code we should retire eventually).
+
+M2   Full v1: variable / type inspection
+     Steps: 8 + 9 + 10 + 11 + 14
+     Delivers: Locals + params shown in Variables panel; record fields
+              + enum names rendered correctly. Requires full RSM parser.
+     Effort estimate: ~10-15 days additional.
+
+M3   PDB backend (deferred)
+     Step: 19.
+
+
+----- Methodology -----
+
+Two parsers feed the same model::Module:
+  src/map/  - Delphi .map text parser (lines, public symbols, segments)
+  src/rsm/  - Delphi .rsm binary parser (types, locals, params,
+              additional symbols, source paths)
+The .map and .rsm are produced from the same compiler IR so they
+agree by construction. We use .map for the parts that are awkward
+to extract from RSM (line tables - see D-016).
+
+
+----- .rsm parser (src/rsm/) -----
+
+[ ] 8    Milestone P1: header + library paths block
+         Parse "CSH7" header (32 bytes + zero padding to 0x426).
+         Parse library search paths block at 0x426 and unit aliases.
+         Effort: ~1-2 days.
+         Verify: dump matches our hex-inspection findings in
+                 rsm-format.txt.
+
+[ ] 9    Milestone P2: locate / parse symbol records
+         Identify the kind:length:name record pattern observed near
+         offset 0x354F00 and how it generalizes. Cross-check addresses
+         against .map ground truth.
+         Effort: ~3-5 days (heavy RE).
+         Verify: every public symbol from .map has a matching record
+                 in RSM with the same address.
+
+[ ] 10   Milestone P3: type records (basic kinds)
+         Parse type-definition records (primitives, pointers, arrays,
+         records, enums) into model::Type.
+         Effort: ~3-5 days.
+         Verify: TPoint -> X+Y Integer fields at offsets 0/4;
+                 TColor -> enumerators clRed/clGreen/clBlue 0/1/2.
+
+[ ] 11   Milestone P4: parameter and local locations
+         Decode location descriptors for params + locals.
+         Effort: ~3 days.
+         Verify: A,B locations inside Add() resolve to the right
+                 registers / stack slots.
+
+----- DWARF emitter (src/dwarf/) -----
+
+[ ] 12   (moved to DONE)
+
+[x] 13   Milestone D2: subprograms DONE.
+         Layout changes:
+            src/map/map_reader.cpp: adapter now keeps full qualified
+              Pascal name ("Geometry.Add") instead of stripping module
+              prefix. Filters out $pdata$/$unwind$ aux symbols and
+              anonymous compiler-internal ".N" symbols.
+            src/dwarf/dwarf_emitter.cpp:
+              - CU abbrev (code 1) gains DW_CHILDREN_yes
+              - New abbrev (code 2) for DW_TAG_subprogram with
+                name / low_pc / high_pc / external
+              - Per-CU subprogram DIEs emitted as children
+              - symbolEnd() computes high_pc as next-symbol-address
+                within CU (fallback: CU's high_pc)
+              - children list terminated with 0 byte
+         What it delivers (verified end-to-end on two_units fixture):
+            gdb info functions:
+              File App.Colors.pas:
+                procedure App.Colors.ColorName;
+                procedure App.Colors.Finalization; ...
+              File Geometry.pas:
+                procedure Geometry.Add;
+                procedure Geometry.DistanceSq; ...
+              File two_units.dpr:
+                procedure two_units.two_units;
+            gdb break Geometry.Add + run + bt:
+              Breakpoint 1, Geometry.Add () at Geometry.pas:20
+              #0  Geometry.Add () at Geometry.pas:20
+              #1  two_units.two_units () at two_units.dpr:26
+         Deferred to later D3:
+            - DW_TAG_base_type for primitives (no params yet, not needed)
+            - DW_AT_frame_base (no locals yet)
+            - DW_AT_decl_file / DW_AT_decl_line (gdb infers from line table)
+            - Itanium demangling (not used; we use Delphi-style names
+              instead, which are nicer for users).
+         Tests: 16 cases / 137 assertions all green.
+
+[ ] 14   Milestone D3: locals + records + enums
+         DW_TAG_formal_parameter / DW_TAG_variable + DW_AT_location.
+         DW_TAG_structure_type + DW_TAG_enumeration_type.
+         Effort: ~3 days.
+         Verify: gdb `print P` shows {X=3, Y=4};
+                 `print C` shows clGreen.
+
+----- PE injection (src/pe/) -----
+
+[ ] 15   PE section appender (production)
+         Parse input PE, append .debug_* sections, patch
+         NumberOfSections/SizeOfImage. Plus expand SizeOfHeaders when
+         target PE has no header headroom (spike's known limitation).
+         Effort: ~2 days.
+         Verify: gdb steps Delphi code via VSCode end-to-end.
+
+----- Validation -----
+
+[ ] 16   Integration test harness  (was 15, renumbered for new plan)
+         test/integration/ - runs gdb in batch mode (gdb -batch -ex ...)
+         against committed fixtures and asserts on stdout patterns.
+         Effort: ~1 day
+         Verify: ctest target `rsm2pdb_integration` runs in CI and
+                 catches regressions.
+
+[ ] 17   Add more fixtures
+         examples/02_arrays    static + dynamic arrays
+         examples/03_strings   ShortString / AnsiString / UnicodeString
+         examples/04_classes   class with methods + VMT
+         Effort: ~1 day each (mostly running dcc64 + writing assertions)
+
+----- Deferred -----
+
+[ ] 18   ShortString / AnsiString / UnicodeString as DWARF synthetic
+         structs (with hidden header), so the debugger shows them
+         correctly without natvis-style sidecars.
+
+[ ] 19   PDB backend (src/pdb/)
+         Reuses model::Module.  Targets LLVM DebugInfo/PDB and MSF.
+         Validates with cvdump.exe and WinDbg.
+         Effort: estimate after v1 ships.
+
+[ ] 20   Sets, variants, dynamic arrays, interfaces, classes.
+         Major design effort - revisit once core path is solid.
+
+================================================================================
+  KEY DECISIONS LOG
+================================================================================
+
+D-001  DWARF first, PDB later (smaller surface area; lets us reach a
+       working VSCode debug session faster).
+D-002  C++20 + MSVC + LLVM 18.1.8.
+D-003  x64 only for v1.
+D-004  Fidelity v1 = symbols + lines + basic types (records, enums).
+D-005  PE-section injection is the planned delivery mechanism for DWARF.
+       To be confirmed by step 6 spike.
+D-006  Intermediate model (src/model/) is debugger-agnostic; both DWARF
+       and PDB backends read the same Module.
+D-007  Use VS-bundled CMake + Ninja (no separate install).
+D-008  Build LLVM from source against MSVC (RTTI + EH on) - prebuilt
+       LLVM binaries are clang-built and ABI-incompatible with MSVC
+       in subtle ways.
+D-009  DWARF language code = DW_LANG_Pascal83 for now; revisit if gdb
+       behavior is surprising.
+D-010  LLVM build profile = "lean": drop BUILD_TOOLS / BUILD_UTILS /
+       dylibs / optional features (libxml2, zstd, zlib, libedit,
+       libpfm, terminfo, bindings, ocamldoc). Keep RTTI + EH on.
+       Target ~15-25 min build, ~1 GB installed instead of 30-60 min
+       and ~3 GB. We only use Support / Object / BinaryFormat / MC /
+       DebugInfoDWARF as static libs.
+D-011  Considered dropping LLVM entirely for v1 (DWARF-only). Decision:
+       keep LLVM. Trade-off accepted: 2-3 days coding saved vs. ~1 GB
+       disk + ABI sensitivity. PDB backend (deferred) genuinely needs
+       LLVM's DebugInfo/PDB, so dropping then re-adding is wasted
+       work.
+D-012  Architecture confirmed by spikes 6a/6b/6c. The five DWARF
+       sections .debug_info / _abbrev / _line / _str / _line_str are
+       sufficient for source-level debugging via gdb on Windows.
+       Long section names will use the COFF string-table "/N"
+       convention. Sections marked DISCARDABLE | READ |
+       CNT_INITIALIZED_DATA.
+D-013  Delphi fixture build via Delphi MSBuild (NOT direct dcc64).
+       examples/01_hello/hello.dproj + build.cmd that sources
+       rsvars.bat. Enables further per-example CI automation.
+D-014  Modern Delphi RSM format does NOT use TDS "FB09" magic;
+       it uses ASCII "CSH7". JCL is therefore primarily an
+       intellectual-history reference, not a direct translation
+       source. The parser will be largely reverse-engineered.
+D-015  Two complementary RSM-format docs:
+         - rsm-format.txt at project root: running lab notebook,
+           append-only, raw hex dumps + hypotheses + [FACT]/[GUESS]
+           tags. Lives next to todo.txt.
+         - docs/02-rsm-format-notes.md: polished design view of
+           what we believe the format IS, kept clean.
+D-016  Dual input: .map AND .rsm.
+       Empirically: line-address tuples from the .map are NOT stored
+       in the .rsm as raw uint32s. The line table uses a non-trivial
+       encoding (likely LEB128 deltas or state-machine like DWARF).
+       Reversing it would cost 3-5 days for zero fidelity gain - the
+       .map is authoritative linker output, generated from the same
+       compiler IR. Use:
+         .map -> line tables, public symbols, segments
+         .rsm -> types, locals, params, source paths, anything else
+       Both populate the same model::Module; rsm2pdb at runtime
+       expects hello.exe + hello.map + hello.rsm sitting together.
+
+================================================================================
+  OPEN QUESTIONS (to resolve from first fixture)
+================================================================================
+
+Q-001  RSM magic / version bytes in modern Delphi.
+       ANSWERED (D-013): magic is ASCII "CSH7" (43 53 48 37), NOT
+       Borland TDS-family "FB09"/"FB0A". The format has been
+       redesigned by Embarcadero. Implications:
+       - JCL JclTD32.pas/JclDebug.pas may be of limited use; we'll
+         need to reverse the new format from scratch.
+       - Approach pivot: heavy hex-dump + map-file cross-referencing
+         to identify record shapes.
+Q-002  Is the file always little-endian?
+Q-003  Are all address fields 64-bit, or 32+high-dword?
+Q-004  How are sets / variants / dynamic arrays / interfaces /
+       managed strings encoded in modern RSM?
+Q-005  Source-file table per-module or global?
+Q-006  Line table column info present?
+Q-007  Does Delphi's `register` convention on x64 always match MS x64?
+       (Verify with `dumpbin /disasm` on Add() prolog.)

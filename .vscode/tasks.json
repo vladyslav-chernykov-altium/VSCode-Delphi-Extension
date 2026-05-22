@@ -1,0 +1,37 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "configure",
+      "type": "shell",
+      "command": "cmd",
+      "args": [
+        "/c",
+        "call \"C:\\Program Files\\Microsoft Visual Studio\\18\\Insiders\\VC\\Auxiliary\\Build\\vcvars64.bat\" && cmake -S \"${workspaceFolder}\" -B \"${workspaceFolder}/build\" -G Ninja -DCMAKE_BUILD_TYPE=Debug -DLLVM_DIR=C:/Dev/Lib/LLVM-18/lib/cmake/llvm"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "cmd",
+      "args": [
+        "/c",
+        "call \"C:\\Program Files\\Microsoft Visual Studio\\18\\Insiders\\VC\\Auxiliary\\Build\\vcvars64.bat\" && cmake --build \"${workspaceFolder}/build\""
+      ],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "command": "cmd",
+      "args": [
+        "/c",
+        "call \"C:\\Program Files\\Microsoft Visual Studio\\18\\Insiders\\VC\\Auxiliary\\Build\\vcvars64.bat\" && ctest --test-dir \"${workspaceFolder}/build\" --output-on-failure"
+      ],
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    }
+  ]
+}
