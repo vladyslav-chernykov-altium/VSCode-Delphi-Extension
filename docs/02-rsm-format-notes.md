@@ -5,106 +5,247 @@ that ships alongside Win64 EXEs when Delphi is built with debug info on
 and Win64 platform. Generated automatically by the Delphi linker for
 Win64 targets.
 
-**Update after first fixture inspection (May 2026):** the format is
-NOT the legacy Borland TDS/TD32 layout. The magic is ASCII "CSH7", not
-"FB09"/"FB0A". The Embarcadero RSM format appears to be a redesign,
-not just a repackaging of TD32. JCL's `JclTD32.pas` is therefore an
-intellectual-history reference, not a translation source.
+The format is **not** the legacy Borland TDS/TD32 layout. The magic is
+ASCII `"CSH7"`, not `"FB09"`/`"FB0A"`. The Embarcadero RSM format is a
+redesign, not a repackaging. JCL's `JclTD32.pas` is therefore an
+intellectual-history reference, not a translation source. We reverse-
+engineer it from scratch using `.map` files as a Rosetta stone.
 
-## Primary public reference
+The messy lab notebook with raw hex evidence and dated entries lives
+in [../rsm-format.txt](../rsm-format.txt). This document is the
+polished current-best-understanding.
 
-- **JCL (Jedi Code Library)** - `JclTD32.pas`, `JclDebug.pas`, `JclPeImage.pas`
-  - Repo: github.com/project-jedi/jcl
-  - Read-only TD32 parser; covers headers, subsection directory, names
-    pool, modules, source files, line numbers, symbols, types.
-  - We translate the *knowledge*, not the code (license + language barrier).
+## Reference material (limited usefulness)
 
-## Secondary references
+- **JCL (Jedi Code Library)** — `JclTD32.pas`, `JclDebug.pas`,
+  `JclPeImage.pas`. Reads the legacy TD32 layout; record-kind ideas
+  may carry over but byte layouts do not.
+- Borland TASM / TD32 spec leaks (1990s) and Microsoft CodeView (CV4 /
+  CV5) docs. Same caveat.
 
-- Borland TASM / TD32 specification leaks circulated in the 1990s; usable
-  as cross-checks against JCL but not authoritative.
-- Microsoft CodeView documents (CV4 / CV5) - TD32 borrows record kinds
-  from CodeView but extends them. Useful to disambiguate type-record fields.
+## Fixtures
 
-## First-fixture findings (hello.rsm, 3.5 MB, Delphi 10.2 Tokyo Win64)
+| Path | Source | Size | Built |
+|---|---|---:|---|
+| `test/fixtures/hello.rsm`      | single-file `hello.dpr`                          | 3,516,365 | 2026-05-22 |
+| `test/fixtures/two_units.rsm`  | `Geometry` + `App.Colors` + dpr                  | 3,519,722 | 2026-05-22 |
+| `test/fixtures/primitives.rsm` | 13 user globals across 12 primitive types        | 3,514,463 | 2026-05-22 |
 
-Hex dump of bytes 0-63:
+Both produced by Delphi 10.2 Tokyo (`v32.0`), Win64, debug build,
+`DCC_DebugInfoInExe=false`. Each has its companion `.exe` and `.map`.
+
+## Header — bytes 0x00..0x1F
+
+Verified by byte-diffing both fixtures and cross-referencing the
+`.map`. All fields are little-endian uint32.
+
+| Offset | Field          | hello | two_units | Notes |
+|-------:|----------------|-------|-----------|-------|
+| 0x00 | `magic`          | `"CSH7"` | `"CSH7"` | ASCII; format constant. |
+| 0x04 | `metadata_start` | `0x00000420` | `0x00000420` | Format constant. Metadata stream itself begins at 0x426 (6-byte gap may be a small sub-header). |
+| 0x08 | `unit_count`     | **14** | **16** | Number of linked compilation units. Matches distinct `M=` modules in the .map's "Detailed map of segments". |
+| 0x0C | `version_minor?` | `1` | `1` | Always 1 in our samples. Possibly format-version sub-field. |
+| 0x10 | `timestamp?`     | `0x5CB65217` | `0x5CB656A4` | Unix timestamps in April 2019. *Not* the .rsm's own build time (both .rsm built May 2026). Hypothesis: some Delphi 10.2 compiler-build stamp. Low priority. |
+| 0x14 | `flags?`         | `0x2000234D` | `0x2000234D` | Format constant. |
+| 0x18 | `legacy_imagebase` | `0x00400000` | `0x00400000` | Format constant. Not the actual Win64 ImageBase; legacy 32-bit default carried over. |
+| 0x1C | padding          | `0` | `0` | |
+
+Past 0x1F: null-terminated ASCII path to the EXE this RSM describes
+(e.g. `.\Win64\Debug\hello.exe`), relative to the .dproj directory.
+The remainder of the 0x40..0x425 range is zero padding.
+
+## Metadata stream — starting at 0x426
+
+A `0x426` byte-position is constant across both fixtures. Contents
+known so far:
+
+- **0x426..~0xAD0:** library / unit / hpp / include / object / resource
+  search-paths block. The 6 standard Delphi search-path categories,
+  each emitted as a null-terminated path list, repeated for a small
+  fixed count (count byte `0x07 0x00` at 0x426). Bytes identical
+  between fixtures because both used the same Delphi install.
+- **~0xADE:** `DCC_UnitAliases` value (one big semicolon-delimited
+  string).
+- **~0xB90:** the EXE path string reappears (also present at 0x20).
+- **~0xBBF onward:** Delphi RTL unit names (`System`, `SysUtils`,
+  `Winapi.Windows`, …) and their imported symbols
+  (`@DelayLoadHelper2`, `kernel32.dll`, `VirtualAlloc`, …). Comprises
+  most of the file's 3.5 MB.
+
+## User-code records — near end of file (~0x355000+)
+
+User globals, functions, and types are encoded near the file tail.
+Records open with a one-byte **kind tag**, followed by a length-
+prefixed name and a kind-specific payload.
+
+Confirmed kind tags:
+
+| Tag | Kind | Notes |
+|-----|------|-------|
+| `0x20` | Variable | global variable record (the one we care about for M2-B-lite). |
+| `0x27` | Function aux | `$unwind$_ZN...` / `$pdata$_ZN...` SEH metadata. Skip. |
+| `0x28` | Function / unit | user function names like `Finalization`, `two_units`. |
+| `0x2A` | Primitive type | one record per built-in Delphi type. See below. |
+| `0x03` | Enum type | followed by enum-name then length-prefixed enumerator strings. |
+
+### Primitive-type record (tag `0x2A`)
+
+The full set of built-in Delphi types is enumerated near the start of
+the metadata stream — in our fixtures, records run from ~0x147F to
+~0x19BB (28 entries: `Boolean`, `AnsiChar`, `Char`, `WideChar`,
+`ShortInt`, `SmallInt`, `Integer`, `Byte`, `Word`, `Cardinal`,
+`Pointer`, `LongInt`, `LongWord`, `Int64`, `UInt64`, `NativeInt`,
+`NativeUInt`, `Single`, `Real48`, `Extended80`, `Extended`, `Double`,
+`Real`, `Comp`, `Currency`, `ByteBool`, `WordBool`, `LongBool`).
+
+Layout:
 
 ```
-offset  hex                                              ascii
-0000    43 53 48 37 20 04 00 00 0e 00 00 00 01 00 00 00  CSH7 ...........
-0010    17 52 b6 5c 4d 23 00 20 00 00 40 00 00 00 00 00  .R.\M#. ..@.....
-0020    2e 5c 57 69 6e 36 34 5c 44 65 62 75 67 5c 68 65  .\Win64\Debug\he
-0030    6c 6c 6f 2e 65 78 65 00 00 00 00 00 00 00 00 00  llo.exe.........
+0x2A  <namelen u8>  <pascal_name>  <subtag triple>
+      <hash u32?>   <attribute bytes>
+      0x9C 0x13  <type_id u16-LE>  <cpp_name_block>
+      0xFF
 ```
 
-Initial guesses (NOT YET VERIFIED - validate by parsing several fixtures):
+- The `0xFF` terminator also appears inside record payloads, so the
+  reliable way to find the record end is to scan forward for the next
+  `0x2A <printable namelen> <ASCII letter>` and take the byte just
+  before that as the terminator.
+- The 3-byte sub-tag right after the name takes one of three values
+  (`0xA8 00 00`, `0x88 00 00`, `0x80 00 00`); meaning still unclear.
+- The 2-byte type-id following `0x9C 0x13` is **stable across builds**
+  (verified by comparing hello.rsm and two_units.rsm) and **unique per
+  primitive**. Type-ids increment by 2 in a contiguous block (0x08E4
+  for `Boolean` through 0x08FE for `Int64`), then jump to 0x0201 and
+  continue with mostly-+4 increments.
 
-| Offset | Bytes        | Interpretation (guess)                       |
-|-------:|--------------|----------------------------------------------|
-| 0x00   | `43 53 48 37`| **Magic "CSH7"** (ASCII)                     |
-| 0x04   | `20 04 00 00`| uint32 = 0x420 = 1056. Header / directory offset? |
-| 0x08   | `0e 00 00 00`| uint32 = 14. Subsection count or major version? |
-| 0x0C   | `01 00 00 00`| uint32 = 1. Minor version / flags?           |
-| 0x10   | `17 52 b6 5c`| uint32 = 0x5CB65217 = Apr 17, 2019 (epoch). Build timestamp? |
-| 0x14   | `4d 23 00 20`| uint32 = 0x2000234D. Unclear. Maybe high half of something. |
-| 0x18   | `00 00 40 00`| uint32 = 0x00400000. Default 32-bit ImageBase value. Curious for a Win64 file. |
-| 0x1C   | `00 00 00 00`| padding |
-| 0x20   | `.\Win64\Debug\hello.exe\0` | Null-terminated path to target EXE this RSM describes. |
+Byte size and signedness are not independently stored in the record
+(or at least not in any field we've identified) — the parser maps the
+Pascal name to `(byte_size, model::PrimitiveKind)` via a hardcoded
+table. Delphi's primitive set is closed and well-known, so this is a
+safe approach.
 
-The "CSH" magic might stand for something like "Code Symbol Hierarchy"
-or be a build / repository codename. It is in modern (10.x+) RSM files
-and may not be in older ones.
+The 4-byte field immediately after the subtag triple looks like a
+hash or RTTI signature (unique per primitive); not currently used.
 
-### Cross-references we have for this fixture
+### Variable record (tag `0x20`)
 
-- `test/fixtures/hello.exe`  - the binary the RSM describes
-- `test/fixtures/hello.map`  - human-readable map file (best ground truth)
-- `test/fixtures/hello.rsm`  - the file we're parsing
+```
+0x20  <namelen u8>  <name bytes>  0x66  0x00  0x00  <payload>
+```
 
-We will validate the parser by checking that addresses / symbol names
-from RSM match what's in `hello.map`.
+Payload comes in **three** variants:
 
-## Structural model (provisional, TO VERIFY)
+| Form | Bytes | Layout |
+|---|---:|---|
+| Primitive, plain | **5** | `<type_marker u8> <shifted_va u32>` |
+| Primitive, extended | **12** | `<type_marker u8> <shifted_va u32> 0x9C 0x09 <hash u16> <trailer_type_id u16> 0xFF` |
+| Non-primitive | **6** | `<inline_type_id u16-LE> <shifted_va u32>` |
+
+The primitive plain form is used for RTL globals and the last user
+variable in a unit; the extended form is used for most user-code
+globals. The two are discriminated by looking for the `0x9C 0x09`
+trailer marker at payload[5..6]. The non-primitive form is selected
+when the first two bytes look like a valid type-id rather than a
+small even type marker (markers are 0x02, 0x04, 0x06, …).
+
+There is no record-terminator byte; the next record follows
+immediately after the variable's fixed-size payload.
+
+**VA encoding.** The 4-byte address-like field is stored as a little-
+endian uint32 **left-shifted by 4 bits** relative to the actual VA:
+
+```
+actual_va = stored_u32 >> 4
+```
+
+Verified against all user globals in both fixtures.
+
+**Type binding (non-primitive).** The `type_id u16` indexes into the
+RSM type table. Two `TPoint` globals (P1, P2 in two_units) share the
+same type_id; the `TColor` global gets a different one. Across units,
+identical structural types get different ids — e.g. the inline
+`TPoint` declared in `hello.dpr` (0x1A71) is a separate id from the
+`TPoint` imported from `System.Types` in `two_units.dpr` (0x064D).
+
+**Type binding (primitive).** The byte right after the `0x66 0x00 0x00`
+sub-tag is a **per-unit type marker** — variables of the same Pascal
+primitive type within one compilation unit share the same marker, and
+markers are assigned in declaration order in increments of 2 (Integer
+declared first → marker `0x02`; next new type → `0x04`; and so on).
+The 7-byte trailer's `trailer_type_id u16` field mirrors the same
+information with a +4 step.
+
+Markers are **not globally stable**: in a unit where `Byte` is declared
+before `Integer`, `Byte` would get marker `0x02`. To resolve a marker
+to a concrete Pascal type, the consumer needs to combine it with the
+size derived from the `.map` next-symbol gap (1 byte → `Byte`, 2 →
+`Word`, 4 → `Integer`, 8 → `Int64`). Variables sharing a marker share
+a type, so even one sized example resolves all others.
+
+### Scanner caveats
+
+The same `0x20 ... 0x66 0x00 0x00` byte pattern occurs inside
+procedure-local-variable records (different semantic — frame offsets
+rather than VAs), and in unrelated RTL data. Our scanner therefore
+finds ~800 candidates in each fixture; only ~40 land in the plausible
+PE-image VA range. The bogus ones drop out cleanly when we cross-
+reference against the `.map` segment table.
+
+## What we still don't know
+
+- **VA encoding inside variable-record payloads.** The four
+  "address-like" bytes don't decode as a plain little-endian uint32
+  matching the .map VA — they're stored as a value shifted *left* by
+  4 bits (i.e. `actual_va = stored_u32 >> 4`). Confirmed against
+  multiple globals; will be wired into the variable-record parser
+  in the next milestone step.
+- **Variable → primitive type-id bridging.** Variable records carry
+  a `0x9C 0x09 ?? ??` reference, distinct from the primitive table's
+  `0x9C 0x13 ?? ??` marker. Two distinct Integer-typed variables
+  also differ in the bytes after `0x9C 0x09`, so this cannot be a
+  plain type-id reference. Step 4 (variable→type binding) will
+  resolve this.
+- **Whether function records (tag `0x28`) carry type-of-return / param
+  list info.** Out of scope for B-lite; revisit at M2 phase A.
+- **Line-table encoding.** Deliberately not pursuing — `.map` is
+  authoritative (decision D-016).
+
+## Open questions
+
+1. Is the file always little-endian? (Presumed yes; consistent so far.)
+2. Are address fields stored as 64-bit anywhere, or only as 32-bit
+   offsets relative to a segment/ImageBase implied by header field
+   0x18?
+3. How are sets / variants / dynamic arrays / interfaces / managed
+   strings encoded? (Out of scope until M2 phase A.)
+4. Is the source-file table per-module or global?
+
+## Provisional structural model
 
 ```
 RSM file
-  Header
-    magic            "CSH7" (4 ASCII bytes)
-    ??? (8 fields, total 60 bytes including the EXE-path string)
-    EXE path         null-terminated, up to some bounded length
-  Directory ???      followed by subsections
-  Subsections
-    Modules          (per-CU info)
-    Source files
-    Public symbols
-    Local symbols
-    Line numbers
-    Types
-    Strings
-    Segments / address ranges
+  Header (0x00..0x1F)
+    magic "CSH7"
+    metadata_start = 0x420
+    unit_count
+    version_minor
+    timestamp
+    flags
+    legacy_imagebase (= 0x00400000)
+    padding
+  EXE path string (null-terminated, starting at 0x20)
+  Zero padding up to 0x420
+  Small sub-header (0x420..0x425, 6 bytes — possibly metadata-block magic)
+  Metadata stream (0x426..end)
+    Search paths block
+    DCC_UnitAliases
+    EXE path (repeated)
+    RTL unit table (~3.4 MB)
+    User-code records
+      Variable records (tag 0x20)
+      Function records (tag 0x28)
+      Function-aux records (tag 0x27 — SEH; skip)
+      Type-definition records (tag 0x03 enum; others TBD)
+    Trailing source-dir path
 ```
-
-This is still guesswork. Concrete steps to validate:
-1. Cross-reference offsets against the `.map` file to identify symbol
-   tables in the RSM.
-2. Compare RSM and EXE TD32 sections - the EXE has debug info embedded
-   too (we set DebugInfoInExe=true), and the same data presumably
-   appears in both. If the EXE TD32 section is more documented (CV4
-   leaks from the 90s), we can use it as a Rosetta stone.
-
-## Open questions for first sample inspection
-
-1. What's the magic / version in modern (Delphi 11+) RSM files?
-2. Is the file always little-endian? (TD32 historically yes.)
-3. Are 64-bit address fields used everywhere, or are there still 32-bit
-   leftover fields with a separate "high dword" stored elsewhere?
-4. How are Delphi-specific types (sets, variants, dynamic arrays,
-   interfaces, managed strings) encoded? Do they use CodeView extension
-   kinds Embarcadero added?
-5. Is the source-file table per-module or global?
-6. Are line numbers paired with start-of-statement only, or do we also
-   get column info?
-
-We answer these by hex-dumping `test/fixtures/hello.rsm` once it's
-available.

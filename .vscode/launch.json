@@ -17,7 +17,33 @@
         "Geometry.pas":   "${workspaceFolder}/examples/02_two_units/Geometry.pas",
         "App.Colors.pas": "${workspaceFolder}/examples/02_two_units/App.Colors.pas",
         "two_units.dpr":  "${workspaceFolder}/examples/02_two_units/two_units.dpr"
-      }
+      },
+      "setupCommands": [
+        { "description": "Pascal case-insensitive name lookup",
+          "text": "-gdb-set case-sensitive off",
+          "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "Delphi primitives: line debug via gdb",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/03_primitives/Win64/Debug/primitives.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/examples/03_primitives/Win64/Debug",
+      "environment": [],
+      "externalConsole": true,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/Dev/Tools/msys64/mingw64/bin/gdb.exe",
+      "sourceFileMap": {
+        "primitives.dpr": "${workspaceFolder}/examples/03_primitives/primitives.dpr"
+      },
+      "setupCommands": [
+        { "description": "Pascal case-insensitive name lookup",
+          "text": "-gdb-set case-sensitive off",
+          "ignoreFailures": true }
+      ]
     },
     {
       "name": "Delphi hello: line debug via gdb",
@@ -33,7 +59,12 @@
       "miDebuggerPath": "C:/Dev/Tools/msys64/mingw64/bin/gdb.exe",
       "sourceFileMap": {
         "hello.dpr": "${workspaceFolder}/examples/01_hello/hello.dpr"
-      }
+      },
+      "setupCommands": [
+        { "description": "Pascal case-insensitive name lookup",
+          "text": "-gdb-set case-sensitive off",
+          "ignoreFailures": true }
+      ]
     },
     {
       "name": "rsm2pdb: dump (gdb)",

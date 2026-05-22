@@ -27,6 +27,67 @@ Out of scope for v1 (deferred):
   DONE
 ================================================================================
 
+[x] M2 phase B-lite: typed globals via primitives only (2026-05-22).
+         Goal: Delphi globals like `S: Integer` show as Integer in
+         VSCode (instead of `int`), and records/enums show as
+         `byte[N]` arrays so users at least see the underlying bytes
+         in the right width.
+
+         Pipeline added end-to-end:
+           - RSM header parser (8 fields + EXE-path string).
+           - RSM primitive-table decoder (28 built-in Delphi types,
+             stable IDs across builds).
+           - RSM variable-record scanner: three sub-forms
+             (5-byte plain primitive, 12-byte extended, 6-byte
+             non-primitive). Captures per-unit type_marker and
+             trailer_type_id. VA decoded as stored_u32 >> 4.
+           - decorateTypes() adapter: groups primitives by per-unit
+             marker, computes MIN(next-symbol-gap) per group, maps
+             1/2/4/8 -> Byte/Word/Integer/Int64, falls back to
+             byte[N] for non-standard sizes and all non-primitives.
+           - DWARF emitter: 4 new abbrevs (typed_variable, base_type,
+             array_type, subrange_type). Type DIEs emitted before
+             vars; DW_AT_type via DW_FORM_ref_addr.
+           - rsm2pdb dwarf auto-discovers sibling .rsm and decorates
+             if present.
+
+         New fixture committed:
+           test/fixtures/primitives.{exe,rsm,map}
+           (13 user globals across 12 distinct primitive types)
+         New example committed:
+           examples/03_primitives/ (full build.cmd + .dproj + .dpr)
+         New VSCode launch config:
+           "Delphi primitives: line debug via gdb"
+         All 3 Delphi launch configs gained
+           setupCommands: -gdb-set case-sensitive off
+         so Pascal-style case-insensitive Watch expressions work
+         (typing `gd`, `GD`, `Gd` all resolve to `gD`).
+
+         User-verified in VSCode (2026-05-22):
+           two_units: S=4 (Integer), D=25 (Integer),
+                      P1=Byte[8]={0,..}, P2=Byte[8]={3,0,0,0,4,0,0,0},
+                      C=Byte[4]={1,0,0,0}.
+           primitives: typed display works for Integer/Int64/Word/etc.
+                       Size-merged primitives (Cardinal/Single/Double/
+                       UInt64/Boolean) display under their best-fit
+                       same-size sibling -- documented D-017 trade-off.
+
+         D-017 limits accepted (deliberate scope cut):
+           - Cardinal mistyped as Integer (same size, sign merged).
+           - UInt64/Double mistyped as Int64.
+           - Single (4-byte float) padded to 8, mistyped as Int64.
+           - 1-byte types (Byte/ShortInt/Boolean) padded to 2 by
+             alignment, displayed as Word.
+           - Char defaults to Integer when it's the last symbol in
+             a unit (no next-gap to measure).
+         Bytes shown are always correct; only the type-name display
+         is best-effort. To remove these limits we'd need a precise
+         marker -> primitive-table-id bridge (per-unit type table
+         not yet decoded) or RTTI parsing from the EXE -- both
+         deferred as separate milestones.
+
+         Tests: 25 cases / 370 assertions all green.
+
 [x] 0.1  Decided toolchain: C++20 / MSVC / LLVM 18.1.8 / CMake+Ninja /
          doctest / mingw-w64 gdb / VSCode cppdbg
          (alternative path "DWARF first, PDB later" agreed)
@@ -490,35 +551,39 @@ agree by construction. We use .map for the parts that are awkward
 to extract from RSM (line tables - see D-016).
 
 
------ .rsm parser (src/rsm/) -----
+----- .rsm parser (src/rsm/) + DWARF wire-up -----
 
-[ ] 8    Milestone P1: header + library paths block
-         Parse "CSH7" header (32 bytes + zero padding to 0x426).
-         Parse library search paths block at 0x426 and unit aliases.
-         Effort: ~1-2 days.
-         Verify: dump matches our hex-inspection findings in
-                 rsm-format.txt.
+Phase B-lite completed 2026-05-22 (see DONE section). Steps 8-10
+delivered together. Remaining sub-milestones below are deferred.
 
-[ ] 9    Milestone P2: locate / parse symbol records
-         Identify the kind:length:name record pattern observed near
-         offset 0x354F00 and how it generalizes. Cross-check addresses
-         against .map ground truth.
-         Effort: ~3-5 days (heavy RE).
-         Verify: every public symbol from .map has a matching record
-                 in RSM with the same address.
+[x] 8    P1-lite: RSM header + primitive type table -- DONE.
+[x] 9    P2-lite: bind .map globals to RSM type IDs   -- DONE.
+[x] 10   D-globals-typed: DW_AT_type on variables    -- DONE.
 
-[ ] 10   Milestone P3: type records (basic kinds)
-         Parse type-definition records (primitives, pointers, arrays,
-         records, enums) into model::Type.
-         Effort: ~3-5 days.
-         Verify: TPoint -> X+Y Integer fields at offsets 0/4;
-                 TColor -> enumerators clRed/clGreen/clBlue 0/1/2.
+[ ] 10.5 (deferred) Precise primitive typing -- remove D-017 limits.
+         Currently same-size primitives (Cardinal vs Integer,
+         Single vs Cardinal, UInt64 vs Int64, Double vs Int64) are
+         merged in the displayed type because the bridge from per-unit
+         marker to primitive-table-id isn't decoded yet. Two paths:
+           a) Mine the unit-context block immediately before user
+              variable records (hex evidence in rsm-format.txt suggests
+              a per-unit type-binding table lives there).
+           b) Parse Delphi RTTI from the EXE's .rdata (authoritative,
+              independent of RSM).
+         Effort: ~1-2 days for either path.
 
-[ ] 11   Milestone P4: parameter and local locations
-         Decode location descriptors for params + locals.
-         Effort: ~3 days.
-         Verify: A,B locations inside Add() resolve to the right
-                 registers / stack slots.
+[ ] 11   (deferred) Full type records: records, enums, classes
+         Decode RSM type-definition records for non-primitives. Emit
+         DW_TAG_structure_type / DW_TAG_enumeration_type / DW_TAG_member.
+         Replaces the byte[N] fallback used by step 10 with proper
+         types. Probably ~3-5 days when we get there.
+
+[ ] 11.5 (deferred) Locals + parameters from RSM
+         Decode procedure records: param names + types + frame
+         offsets, local names + types + frame offsets. Emit
+         DW_TAG_formal_parameter and DW_TAG_variable as children
+         of DW_TAG_subprogram with DW_AT_location expressions.
+         Probably ~1 week.
 
 ----- DWARF emitter (src/dwarf/) -----
 
@@ -654,6 +719,21 @@ D-015  Two complementary RSM-format docs:
            tags. Lives next to todo.txt.
          - docs/02-rsm-format-notes.md: polished design view of
            what we believe the format IS, kept clean.
+D-017  M2 phase B-lite: typed globals via PRIMITIVES ONLY.
+       Don't try to decode RSM records / enums / classes in this
+       milestone. Globals whose RSM type_id resolves to a primitive
+       (Integer, Byte, Double, ...) get a proper DW_TAG_base_type.
+       Everything else (records, enums) falls back to a byte[N] array
+       sized by next-symbol gap. Rationale:
+         - delivers visible value fast (Integer globals show real
+           values, not "int" coincidence);
+         - validates the RSM-decoding approach with the simplest
+           record class;
+         - leaves the harder record/enum decoding for a focused later
+           milestone (step 11) where we replace the byte[N] fallbacks.
+       Order: P1-lite (header + primitive types) -> P2-lite (bind
+       globals to type IDs) -> D-globals-typed (DWARF wire-up).
+
 D-016  Dual input: .map AND .rsm.
        Empirically: line-address tuples from the .map are NOT stored
        in the .rsm as raw uint32s. The line table uses a non-trivial

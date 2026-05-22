@@ -335,6 +335,410 @@ H-004  Enum literals are encoded as length-prefixed strings with no
 
 
 ================================================================================
+  2026-05-22 (cont)  Step 1 differential: hello.rsm vs two_units.rsm
+================================================================================
+
+Method: byte-diff both fixtures, cross-reference differing fields against
+known facts from the .map files (segment table, module list, public
+addresses). Goal: separate format constants from per-build data, and
+discover the structure of user-global records.
+
+----- Header bytes 0x00..0x1F differential -----
+
+  off  hello.rsm     two_units.rsm  interpretation
+  ---  ------------  -------------  --------------------------------------
+  00   43 53 48 37   43 53 48 37    "CSH7" magic                  IDENTICAL
+  04   20 04 00 00   20 04 00 00    uint32 = 0x00000420           IDENTICAL
+  08   0e 00 00 00   10 00 00 00    uint32 = 14 vs 16             DIFFERS
+  0C   01 00 00 00   01 00 00 00    uint32 = 1                    IDENTICAL
+  10   17 52 b6 5c   a4 56 b6 5c    uint32 timestamps             DIFFERS
+  14   4d 23 00 20   4d 23 00 20    uint32 = 0x2000234D           IDENTICAL
+  18   00 00 40 00   00 00 40 00    uint32 = 0x00400000           IDENTICAL
+  1C   00 00 00 00   00 00 00 00    uint32 = 0                    IDENTICAL
+
+[FACT]   off 0x08 is a UNIT COUNT. Cross-checked with .map:
+              hello.map     distinct M= modules in segment-detail = 14  ✓
+              two_units.map distinct M= modules in segment-detail = 16  ✓
+         two_units adds Geometry + App.Colors -> exactly +2.
+
+[FACT]   off 0x14 (0x2000234D) is a FORMAT CONSTANT (identical across both
+         fixtures generated months apart). Earlier marked as [QUESTION] -
+         now upgraded. Likely feature/flags or compiler-build code.
+
+[FACT]   off 0x18 (0x00400000) is a FORMAT CONSTANT (identical across
+         both fixtures). NOT the actual ImageBase: two_units.exe runs
+         from a different ImageBase. Earlier marked [GUESS] - now
+         upgraded. Probably a legacy field carried over from the
+         32-bit era.
+
+[FACT]   off 0x04 (0x00000420) is a FORMAT CONSTANT (identical across
+         both fixtures). It denotes the start of the metadata stream
+         (which begins at 0x426 in BOTH files; the 6-byte gap between
+         0x420 and 0x426 may itself be a small fixed sub-header).
+         Earlier marked [GUESS] - now upgraded.
+
+[GUESS]  off 0x0C (= 1) likely a format-version sub-field or
+         always-1 flag. Identical across both fixtures - low signal.
+
+[GUESS]  off 0x10 is a TIMESTAMP that varies between the two .rsm files
+         despite both being generated in May 2026:
+           hello.rsm:     0x5CB65217 = 2019-04-17 13:51:35 UTC
+           two_units.rsm: 0x5CB656A4 = 2019-04-17 14:02:28 UTC
+         ~11 minutes apart, both in April 2019. NOT the .rsm build
+         timestamp. Hypothesis: timestamp of some Delphi 10.2 Tokyo
+         build-config snapshot or compiler-internal stamp. Low priority.
+
+----- Lib-paths block: identical -----
+
+[FACT]   Bytes 0x426 onward (the search-paths block documented earlier)
+         are byte-identical between the two fixtures. Same Delphi
+         install -> same paths. The "07 00 55 01 00 00 00" prefix at
+         0x426 is therefore also a format constant when the paths are
+         the same.
+
+----- User-global symbol records (located at ~0x355b00) -----
+
+[FACT]   User globals (S, D, C, P1, P2) are encoded near the end of the
+         .rsm with a record shape:
+
+            0x20 <namelen u8> <name bytes> 0x66 0x00 0x00 <payload>
+
+         Concrete bytes from two_units.rsm:
+
+            20 02 50 31 66 00 00 4d 06 87 75 3a 04           (P1)
+            20 02 50 32 66 00 00 4d 06 07 76 3a 04           (P2)
+            20 01 43    66 00 00 51 06 87 76 3a 04           (C)
+            20 01 44    66 00 00 02 c7 76 3a 04 9c 09 99 1b f5 03 ff  (D)
+            20 01 53    66 00 00 02 07 77 3a 04 9c 09 9d 1b f5 03 ff  (S)
+
+         Cross-referenced with two_units.map .bss VAs (segment 0003,
+         base 0x430000):
+            P1 0003:A758  P2 0003:A760
+            C  0003:A768  D  0003:A76C  S  0003:A770
+
+[FACT]   The leading tag is 0x20 (record-kind = VARIABLE).
+         The name-length byte is 1-byte unsigned (P1 has len=2; S has
+         len=1).
+
+[FACT]   The trailing `66 00 00` byte triple is constant across all
+         five records. Probably a fixed delimiter or sub-tag (compare
+         the 0x27/0x28 tags seen earlier near function-like records).
+
+[GUESS]  Payload shape correlates with TYPE KIND, not symbol identity:
+             P1, P2 (TPoint record)         -> 6-byte payload
+             C      (TColor enum)            -> 6-byte payload
+             D, S   (Integer primitive)      -> 12-byte payload
+         The shorter form likely encodes (type_id_u16, VA_or_offset)
+         only; the longer form may carry an inline type descriptor
+         or extra primitive metadata.
+
+[GUESS]  Inside the 6-byte form, bytes split as <u16_LE> + <u32_LE>:
+             P1: typeId=0x064D  payload32=0x043A7587
+             P2: typeId=0x064D  payload32=0x043A7607
+             C : typeId=0x0651  payload32=0x043A7687
+         P1 and P2 share typeId (both TPoint) - strong signal.
+         BUT the payload32 doesn't match the .map VAs (P1 expected
+         0x0043A758). The payloads ARE 8 bytes apart between P1 and P2
+         which matches the .map spacing, just with an offset/encoding
+         transform we haven't decoded yet (the high nibble pattern
+         suggests possibly nibble-shifted or BCD-style encoding).
+         Will revisit when we cross-reference more globals.
+
+[QUESTION] What does the 12-byte primitive-typed payload encode? S and D
+         share the first 5 bytes' SHAPE (02 ?? ?? 3a 04) and the trailer
+         pattern (9c 09 ?? 1b f5 03 ff). The differing nibble in the
+         trailer (99 for D vs 9d for S) may be the actual primitive
+         type-id index.
+
+----- Step-1 actionable summary -----
+
+Header is fully understood structurally (1 dynamic count + 1 timestamp;
+everything else is format constants or zero padding). Lib-paths block
+shape known. User-global record opening byte (0x20), name-length, and
+the role of the `66 00 00` trio confirmed.
+
+Next: write a quick parser for the header + a record-iterator that
+locates every 0x20-prefixed variable record near the file tail, and
+cross-checks names against .map publics. Once we can iterate records
+reliably, the payload schemas become testable.
+
+
+================================================================================
+  2026-05-22 (cont)  Step 3: primitive type table located + decoded
+================================================================================
+
+Method: grep both fixtures for primitive names (Integer, Byte, Double, ...)
+near the metadata stream. They cluster between offset 0x147F and 0x19BB in
+hello.rsm. Each entry follows the record shape:
+
+    0x2A <namelen u8> <name bytes> 0xA8 0x00 0x00 <hash u32?> <attrs> ...
+        0x9C 0x13 <type_id_lo u8> <type_id_hi u8> <cpp_name_block> 0xFF
+
+[FACT]   Primitive-record kind tag is 0x2A. Records are terminated by
+         0xFF — BUT 0xFF also occurs inside record payloads (e.g.
+         Cardinal's body contains `f6 ff 81 02`). The robust way to
+         find the true terminator is to look forward for the NEXT
+         record's start signature (0x2A <printable_namelen> <ASCII
+         letter>) and treat the byte just before that as the
+         terminator. The src/rsm/rsm_reader.cpp scanner does this.
+
+[FACT]   The 3-byte sub-tag immediately after the name varies between
+         primitives:
+            0xA8 0x00 0x00  - most primitives (Boolean, Integer, Byte,
+                              Word, Cardinal, Pointer, UInt64, ...)
+            0x80 0x00 0x00  - WideChar, LongInt, LongWord
+            0x88 0x00 0x00  - ShortInt, SmallInt, Single, Real48,
+                              Extended80, Double, Real, Comp, Currency
+         Pattern unclear. Possibly a "linkage flavour" or "cpp-mapping
+         category". Not needed for our purposes.
+
+[FACT]   The 0x9C 0x13 marker delimits the type-id field. The 2 bytes
+         immediately following it are a u16-LE that uniquely identifies
+         the primitive type ACROSS BUILDS — verified: same values appear
+         in hello.rsm and two_units.rsm.
+
+[FACT]   Type-id values observed in our Delphi 10.2 Tokyo fixtures
+         (full primitive table, 28 entries):
+            Boolean    0x08E4    AnsiChar   0x08E6    Char       0x08E8
+            WideChar   0x08EA    ShortInt   0x08EC    SmallInt   0x08EE
+            Integer    0x08F0    Byte       0x08F2    Word       0x08F4
+            Cardinal   0x08F6    Pointer    0x08F8    LongInt    0x08FA
+            LongWord   0x08FC    Int64      0x08FE    UInt64     0x0201
+            NativeInt  0x0205    NativeUInt 0x0209    Single     0x020D
+            Real48     0x0211    Extended80 0x0215    Extended   0x0219
+            Double     0x021D    Real       0x0221    Comp       0x0225
+            Currency   0x0229    ByteBool   0x024D    WordBool   0x0251
+            LongBool   0x0255
+
+[FACT]   Type-ids increment by 2 in the contiguous block 0x08E4..0x08FE.
+         Then a 16-bit wrap or kind-switch causes the jump to 0x0201,
+         after which increments are typically +4 (with gaps to 0x024D
+         for the BoolN family). The exact ID-encoding rule is not yet
+         understood but the values are stable per primitive — that's
+         what we need for cross-referencing with variable records.
+
+[FACT]   ByteBool / WordBool / LongBool sit in a SEPARATE 0x2A-record
+         cluster after a gap (~0x195F in hello.rsm). They share the
+         same 0xA8 sub-tag flavour and the 0x9C 0x13 marker convention.
+
+[FACT]   Byte SIZE and SIGNEDNESS are NOT independently stored in the
+         record (at least not in a place we've identified). We map
+         name -> (size, kind) via a hardcoded table in
+         src/rsm/rsm_reader.cpp — Delphi's primitive set is closed and
+         well-known.
+
+[QUESTION] Variable records carry a `9C 09 ?? ??` reference, not
+         `9C 13 ?? ??`. Two distinct Integer-typed variables (S, D)
+         also differ in the bytes after `9C 09` — so this 4-byte
+         construct cannot be a plain type-id reference. To investigate
+         in step 4 (variable -> type binding).
+
+[QUESTION] What does the 4-byte field immediately after `0xA8 0x00 0x00`
+         encode? Each primitive has a unique-looking 4-byte value
+         (Boolean: 38 81 bc 62; Integer: a0 ce 73 b5; Byte: ea 26 ee 04).
+         Plausibly a hash or RTTI signature. Not needed for B-lite.
+
+
+================================================================================
+  2026-05-22 (cont)  Step 4a: variable-record iterator + VA decoding
+================================================================================
+
+Method: scan whole metadata stream for variable-record signature
+    0x20 <namelen 1..64> <printable ASCII name> 0x66 0x00 0x00 <payload>
+Decode the payload according to its first byte.
+
+[FACT]   Variable-record byte layout (verified against P1 / P2 / C / D / S
+         in two_units.rsm and P / C / S in hello.rsm):
+
+           0x20 <namelen u8> <pascal_name> 0x66 0x00 0x00 <payload>
+
+         The payload form is selected by its first byte:
+
+           if payload[0] == 0x02:                  -- PRIMITIVE form
+              0x02 <shifted_va u32> <7 trailing bytes ending in 0xFF>
+              total payload size = 12 bytes
+
+           otherwise:                              -- NON-PRIMITIVE form
+              <type_id u16-LE> <shifted_va u32>
+              total payload size = 6 bytes
+
+         There is no record-terminator byte; the record ends after the
+         fixed-size payload and the next record's 0x20 tag follows
+         immediately.
+
+[FACT]   VA encoding for global variables: stored as a little-endian
+         uint32 left-shifted by 4 bits relative to the actual
+         virtual address. To decode:  actual_va = stored_u32 >> 4.
+
+         Verified against all five user globals in two_units.rsm and
+         all three in hello.rsm against the .map .bss addresses.
+
+[FACT]   For non-primitive globals (records, enums, classes) the
+         inline type_id is the same u16 you find in the primitive
+         table's `9C 13 ?? ??` marker for primitives — i.e. a
+         direct index into the RSM type table. Verified:
+            P1 and P2 (both TPoint)  -> same type_id   0x064D
+            C  (TColor enum)         -> different     0x0651
+            FLanguages, LanguageArray -> their own RTL type_ids
+         Hello has different per-unit type_ids for its TPoint/TColor
+         (0x1A71 / 0x1A6D) because the types are declared inline in
+         the .dpr unit rather than imported from System.Types.
+
+[FACT]   For primitive-typed globals (Integer, Byte, ...) the
+         variable record carries NO recognisable primitive-table
+         type-id. The trailing `9C 09 <u16>` differs even between
+         two Integer-typed variables (S = 0x1B9D, D = 0x1B99 in
+         two_units), so this field is NOT a type reference -- likely
+         a source-location hash or per-variable instance id.
+         The primitive -> variable binding has to come from somewhere
+         else; investigating in step 4b.
+
+[FACT]   Same scan pattern hits a long tail of false positives
+         (806 candidates in two_units.rsm; only ~44 land in the
+         plausible PE-image VA range). The bogus ones likely come
+         from procedure-LOCAL variables that share the 0x20 tag
+         but encode frame offsets (not VAs) in their payload -
+         the `>> 4` decode produces multi-GB junk for those.
+         Filtering by .map cross-reference (next step) cleanly
+         eliminates them.
+
+
+================================================================================
+  2026-05-22 (cont)  Step 4b: per-unit type marker decoded
+================================================================================
+
+New fixture: test/fixtures/primitives.{exe,rsm,map}. Single .dpr with
+13 user globals across 12 distinct primitive types (gI / gI2 both
+Integer to test same-type sharing).
+
+[FACT]   The PRIMITIVE-form variable record has THREE sub-forms, not
+         two. The previous "fixed 12-byte payload" assumption was
+         wrong. New layout:
+
+           0x20 <namelen u8> <pascal_name> 0x66 0x00 0x00
+                <type_marker u8> <shifted_va u32>
+                [ 0x9C 0x09 <hash u16> <trailer_type_id u16> 0xFF ]
+
+         The 7-byte trailer in [...] is OPTIONAL. RTL globals
+         (MediumBlocksLocked, LargeBlocksLocked, ...) emit the
+         minimum 5-byte payload. User-code globals emit the full
+         12-byte form. One edge case: the LAST user variable record
+         in a unit can also use the 5-byte form (verified with gH
+         in primitives.rsm).
+
+[FACT]   The byte right after `0x66 0x00 0x00` is a PER-UNIT TYPE
+         MARKER. Across all 13 globals in primitives.rsm:
+
+           gI   Integer    -> 0x02       gSm  SmallInt -> 0x0c
+           gI2  Integer    -> 0x02  ***  gL   Int64    -> 0x0e
+           gC   Cardinal   -> 0x04       gU   UInt64   -> 0x10
+           gB   Byte       -> 0x06       gF   Single   -> 0x12
+           gW   Word       -> 0x08       gD   Double   -> 0x14
+           gSh  ShortInt   -> 0x0a       gO   Boolean  -> 0x16
+                                          gH   Char     -> 0x18
+
+         Rules:
+            - Variables of the same Pascal type in the same unit
+              share the same marker (gI and gI2 both 0x02).
+            - Each new primitive type introduced in declaration order
+              gets the next even number.
+            - Markers are UNIT-LOCAL: a unit where Byte is declared
+              first would give Byte = 0x02.
+
+[FACT]   The `trailer_type_id u16` in the 7-byte trailer mirrors the
+         marker byte but with a +4 step (0x03ED for Integer in our
+         primitives unit, 0x03F1 for Cardinal, 0x03F5 for Byte, ...).
+         Same uniqueness rule: same Pascal type -> same trailer id
+         within a unit; cross-unit the values shift.
+
+[FACT]   Across-unit comparison shows the marker is stable for
+         common patterns. Three different units, each with Integer
+         as their FIRST declared primitive global:
+            hello.S       -> marker 0x02
+            two_units.S/D -> marker 0x02
+            primitives.gI -> marker 0x02
+         Not a coincidence; the marker is the per-unit index of the
+         primitive type in declaration order, and Integer happens
+         to be the first primitive declared in all three fixtures.
+
+[FACT]   Empirically, .map next-symbol-gap is an UPPER BOUND on a
+         global's size, NOT exact. Compiler padding for alignment
+         shows up:
+            gB (Byte, 1 byte) at 0xA75C, next gW at 0xA75E -> gap 2
+            gSh (ShortInt, 1 byte) at 0xA760, next gSm at 0xA762 -> gap 2
+            gO (Boolean, 1 byte) at 0xA788, next gH at 0xA78A -> gap 2
+         The MIN gap across all variables sharing a marker is a
+         tighter estimate (compiler doesn't typically pad between
+         same-type adjacent globals).
+
+----- Implication for step 5 (DWARF type emission) -----
+
+Per-unit local markers + .map size gap gives us "good enough" typing
+for the common case. Strategy:
+   1. Group user-globals by their CompileUnit (from .map).
+   2. For each unique marker in a unit, compute MIN(next-symbol-gap).
+   3. Map (min_gap) -> primitive:
+        1 -> Byte, 2 -> Word, 4 -> Integer, 8 -> Int64
+   4. Two markers with the same MIN gap are different types but we
+      can only pick one name; lowest marker wins the "popular" name.
+
+Loses precision (Cardinal vs Integer indistinguishable; Single vs
+Cardinal indistinguishable) but ships precise display for the
+overwhelming majority of Delphi globals.
+
+[QUESTION] u16-A (the hash u16 in the 7-byte trailer) increments
+         by ~4 between adjacent globals in declaration order:
+            gI=0x1B6D, gI2=0x1B71, gC=0x1B75, gB=0x1B79, gW=0x1B7D,
+            gSh=0x1B81, gSm=0x1B85, ...
+         Plausibly a sequential ID assigned by the compiler. Not
+         needed for B-lite.
+
+
+================================================================================
+  2026-05-22 (cont)  Step 5: DWARF type wire-up shipped
+================================================================================
+
+Implementation:
+
+[FACT]   src/rsm/rsm_reader.cpp gains decorateTypes(reader, mod) which:
+            - Groups variable symbols by per-unit type_marker.
+            - Computes MIN(next-symbol-gap) per marker group.
+            - Maps that size to a primitive kind (1->Byte, 2->Word,
+              4->Integer, 8->Int64) via primitiveKindForSize().
+            - Falls back to byte[N] arrays for non-standard sizes
+              (e.g. 6-byte padded SmallInt) and for all non-primitive
+              variables.
+
+[FACT]   src/dwarf/dwarf_emitter.cpp gains 4 new abbrev codes:
+            4 = typed variable (DW_AT_type via DW_FORM_ref_addr)
+            5 = DW_TAG_base_type (name + byte_size + encoding)
+            6 = DW_TAG_array_type (with subrange child)
+            7 = DW_TAG_subrange_type (upper_bound only)
+         Type DIEs are emitted before variables within each CU so
+         DW_AT_type ref_addr offsets are resolvable.
+
+[FACT]   gdb's Pascal mode treats DW_AT_lower_bound as 1 by default.
+         Emitting upper_bound = N (not N-1) makes [1..N] cover all N
+         elements - that's the "array [1..N] of Byte" Delphi syntax.
+
+[FACT]   End-to-end verified on examples/02_two_units (the main test
+         case): S and D show as `Integer`; P1/P2 show as `Byte [8]`;
+         C shows as `Byte [4]`. Stepping through gdb shows correct
+         runtime values: S=4, D=25, P2={3,0,0,0,4,0,0,0}.
+
+[FACT]   Heuristic limits as expected per D-017:
+            - Cardinal mistyped as Integer (same size, different sign).
+            - UInt64/Double mistyped as Int64.
+            - Single mistyped as Int64 (4-byte primitive padded to 8).
+            - 1-byte types (Byte/ShortInt/Boolean) often padded to 2,
+              displayed as Word.
+            - Char defaults to Integer when it's the last symbol
+              (no next-gap to measure).
+         All limits are size+sign confusion; bytes shown are always
+         correct, just with extra alignment padding visible.
+
+
+================================================================================
   GLOSSARY (terms we keep using)
 ================================================================================
 

@@ -83,27 +83,64 @@ DW_LNE_end_sequence
 LLVM's `MCDwarfLineTable` builder takes care of state-machine encoding;
 we feed it `(file, line, address)` tuples.
 
-## Type mapping (v1 scope)
+## Type mapping (current scope: M2 phase B-lite)
 
-| Delphi          | DWARF                                          |
-|-----------------|------------------------------------------------|
-| Boolean         | `DW_TAG_base_type` enc=`DW_ATE_boolean` size=1 |
-| Char            | `DW_TAG_base_type` enc=`DW_ATE_UTF` size=1     |
-| WideChar        | `DW_TAG_base_type` enc=`DW_ATE_UTF` size=2     |
-| Byte / ShortInt | `DW_TAG_base_type` enc=`DW_ATE_unsigned/signed`|
-| Word / SmallInt | ditto, size=2                                  |
-| Cardinal / Integer | ditto, size=4                               |
-| UInt64 / Int64  | ditto, size=8                                  |
-| Single          | `DW_ATE_float` size=4                          |
-| Double          | `DW_ATE_float` size=8                          |
-| Extended        | `DW_ATE_float` size=10 (only on win32; check)  |
-| Pointer         | `DW_TAG_pointer_type`                          |
-| Static array    | `DW_TAG_array_type` + `DW_TAG_subrange_type`   |
-| Record          | `DW_TAG_structure_type` + members              |
-| Enum            | `DW_TAG_enumeration_type` + enumerators        |
+The emitter currently handles `DW_TAG_base_type`, `DW_TAG_array_type`,
+and `DW_TAG_subrange_type`. `DW_TAG_pointer_type`, `DW_TAG_structure_type`
+and `DW_TAG_enumeration_type` are not yet emitted.
 
-Deferred to v2: sets, variants, dynamic arrays, ShortString, AnsiString,
-UnicodeString, interfaces, classes.
+| Delphi             | DWARF                                          |
+|--------------------|------------------------------------------------|
+| Boolean            | `DW_TAG_base_type` enc=`DW_ATE_boolean` size=1 |
+| AnsiChar           | `DW_TAG_base_type` enc=`DW_ATE_unsigned_char` size=1 |
+| Char / WideChar    | `DW_TAG_base_type` enc=`DW_ATE_UTF` size=2     |
+| Byte / ShortInt    | `DW_TAG_base_type` enc=`DW_ATE_unsigned/signed` size=1 |
+| Word / SmallInt    | ditto, size=2                                  |
+| Cardinal / Integer | ditto, size=4                                  |
+| UInt64 / Int64     | ditto, size=8                                  |
+| Single             | `DW_ATE_float` size=4                          |
+| Double             | `DW_ATE_float` size=8                          |
+| Extended           | `DW_ATE_float` size=10                         |
+| Static array       | `DW_TAG_array_type` + `DW_TAG_subrange_type`   |
+| Record             | (B-lite) fallback `byte[N]` array              |
+| Enum               | (B-lite) fallback `byte[N]` array              |
+| Pointer            | (B-lite) fallback `byte[8]` array              |
+
+### Variable typing (M2 phase B-lite)
+
+For global variables we cross-reference the `.map` (segment + address)
+against the RSM's variable-record stream. The RSM tells us whether a
+global is primitive-typed or non-primitive (records/enums/classes);
+the primitive form additionally carries a *per-unit type marker* that
+groups variables of the same Pascal type together.
+
+The exact Pascal primitive is inferred from the variable's byte size,
+computed as the next-symbol-gap in the `.map`:
+
+| Byte size | Inferred type |
+|----------:|---------------|
+| 1         | `Byte`        |
+| 2         | `Word`        |
+| 4         | `Integer`     |
+| 8         | `Int64`       |
+| other     | `byte[N]`     |
+
+The heuristic loses signed/unsigned and float-vs-integer distinctions
+at the same size (Cardinal shown as Integer, Single shown as Int64,
+etc.) — accepted per D-017. Sub-byte primitives (`Byte`, `ShortInt`,
+`Boolean`) padded for alignment in the `.map` show as the padded size
+(`Word` or wider). The bytes are always correct; only the displayed
+type name and unit may be inflated by alignment.
+
+### Subrange bounds
+
+gdb's Pascal mode treats `DW_AT_lower_bound` as 1 by default. To make
+`byte[N]` cover all N elements as the natural `array [1..N] of Byte`,
+the emitter writes `DW_AT_upper_bound = N` (not N − 1).
+
+Deferred (later milestones): sets, variants, dynamic arrays,
+ShortString, AnsiString, UnicodeString, interfaces, classes, pointer
+types, precise record/enum decoding.
 
 ## LLVM APIs to use
 

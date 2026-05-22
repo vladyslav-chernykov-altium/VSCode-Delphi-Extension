@@ -55,7 +55,7 @@ static int cmdDump(const std::string& path) {
     if (ext == "rsm") {
         rsm2pdb::rsm::Reader reader;
         if (!reader.open(path)) {
-            std::fprintf(stderr, "error: cannot open %s\n", path.c_str());
+            std::fprintf(stderr, "error: %s\n", reader.error().c_str());
             return 1;
         }
         reader.dump(stdout);
@@ -136,7 +136,23 @@ int main(int argc, char** argv) {
         rsm2pdb::model::Module mod;
         rsm2pdb::map::populate(reader.file(), mod);
 
-        // 3. Emit DWARF sections
+        // 3. If a sibling .rsm exists, decorate variables with types.
+        std::filesystem::path rsm_path = map_path;
+        rsm_path.replace_extension(".rsm");
+        if (std::filesystem::exists(rsm_path)) {
+            rsm2pdb::rsm::Reader rsm;
+            if (rsm.open(rsm_path.string())) {
+                rsm2pdb::rsm::decorateTypes(rsm, mod);
+                std::fprintf(stdout, "loaded type info from %s\n",
+                             rsm_path.string().c_str());
+            } else {
+                std::fprintf(stderr,
+                    "warning: failed to read %s (%s); variables will be untyped\n",
+                    rsm_path.string().c_str(), rsm.error().c_str());
+            }
+        }
+
+        // 4. Emit DWARF sections
         rsm2pdb::dwarf::DwarfSections sections;
         std::string err;
         if (!rsm2pdb::dwarf::emit(mod, {}, sections, err)) {
@@ -144,7 +160,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // 4. Inject into PE and write output
+        // 5. Inject into PE and write output
         if (!rsm2pdb::pe::injectDwarfFile(input_exe, sections,
                                           output_exe, err)) {
             std::fprintf(stderr, "error: PE injection failed: %s\n",

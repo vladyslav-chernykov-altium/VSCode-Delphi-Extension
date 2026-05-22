@@ -16,6 +16,7 @@ add_executable(rsm2pdb_tests
   unit/test_map_reader.cpp
   unit/test_map_reader_fixtures.cpp
   unit/test_dwarf_emitter.cpp
+  unit/test_rsm_reader.cpp
 )
 target_link_libraries(rsm2pdb_tests PRIVATE rsm2pdb_core doctest::doctest)
 target_compile_definitions(rsm2pdb_tests PRIVATE

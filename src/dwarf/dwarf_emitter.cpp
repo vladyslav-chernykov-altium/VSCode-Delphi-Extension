@@ -20,8 +20,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <sstream>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace rsm2pdb::dwarf {
@@ -113,9 +115,13 @@ PathSplit splitPath(const std::string& path) {
 // ---------------------------------------------------------------------
 // Abbreviation codes.
 // ---------------------------------------------------------------------
-constexpr std::uint64_t kAbbrevCu         = 1;
-constexpr std::uint64_t kAbbrevSubprogram = 2;
-constexpr std::uint64_t kAbbrevVariable   = 3;
+constexpr std::uint64_t kAbbrevCu             = 1;
+constexpr std::uint64_t kAbbrevSubprogram     = 2;
+constexpr std::uint64_t kAbbrevVariable       = 3;
+constexpr std::uint64_t kAbbrevTypedVariable  = 4;
+constexpr std::uint64_t kAbbrevBaseType       = 5;
+constexpr std::uint64_t kAbbrevArrayType      = 6;
+constexpr std::uint64_t kAbbrevSubrangeType   = 7;
 
 void writeAbbrevTable(BytesBuf& abbrev) {
     using namespace llvm::dwarf;
@@ -143,10 +149,8 @@ void writeAbbrevTable(BytesBuf& abbrev) {
     abbrev.uleb128(DW_AT_external);  abbrev.uleb128(DW_FORM_flag);
     abbrev.uleb128(0);               abbrev.uleb128(0);
 
-    // Abbrev 3: DW_TAG_variable, no children.
-    // No DW_AT_type yet: M2-phase-C is intentionally untyped. gdb
-    // shows the variable name + address; the value is rendered as
-    // raw memory in the Variables panel.
+    // Abbrev 3: DW_TAG_variable, no children, untyped fallback.
+    // Used when we couldn't resolve a Pascal type for the variable.
     abbrev.uleb128(kAbbrevVariable);
     abbrev.uleb128(DW_TAG_variable);
     abbrev.u8(DW_CHILDREN_no);
@@ -154,6 +158,39 @@ void writeAbbrevTable(BytesBuf& abbrev) {
     abbrev.uleb128(DW_AT_location);  abbrev.uleb128(DW_FORM_exprloc);
     abbrev.uleb128(DW_AT_external);  abbrev.uleb128(DW_FORM_flag);
     abbrev.uleb128(0);               abbrev.uleb128(0);
+
+    // Abbrev 4: DW_TAG_variable with DW_AT_type (ref_addr -> type DIE).
+    abbrev.uleb128(kAbbrevTypedVariable);
+    abbrev.uleb128(DW_TAG_variable);
+    abbrev.u8(DW_CHILDREN_no);
+    abbrev.uleb128(DW_AT_name);      abbrev.uleb128(DW_FORM_string);
+    abbrev.uleb128(DW_AT_location);  abbrev.uleb128(DW_FORM_exprloc);
+    abbrev.uleb128(DW_AT_type);      abbrev.uleb128(DW_FORM_ref_addr);
+    abbrev.uleb128(DW_AT_external);  abbrev.uleb128(DW_FORM_flag);
+    abbrev.uleb128(0);               abbrev.uleb128(0);
+
+    // Abbrev 5: DW_TAG_base_type, no children.
+    abbrev.uleb128(kAbbrevBaseType);
+    abbrev.uleb128(DW_TAG_base_type);
+    abbrev.u8(DW_CHILDREN_no);
+    abbrev.uleb128(DW_AT_name);       abbrev.uleb128(DW_FORM_string);
+    abbrev.uleb128(DW_AT_byte_size);  abbrev.uleb128(DW_FORM_data1);
+    abbrev.uleb128(DW_AT_encoding);   abbrev.uleb128(DW_FORM_data1);
+    abbrev.uleb128(0);                abbrev.uleb128(0);
+
+    // Abbrev 6: DW_TAG_array_type with one subrange child.
+    abbrev.uleb128(kAbbrevArrayType);
+    abbrev.uleb128(DW_TAG_array_type);
+    abbrev.u8(DW_CHILDREN_yes);
+    abbrev.uleb128(DW_AT_type);       abbrev.uleb128(DW_FORM_ref_addr);
+    abbrev.uleb128(0);                abbrev.uleb128(0);
+
+    // Abbrev 7: DW_TAG_subrange_type, no children.
+    abbrev.uleb128(kAbbrevSubrangeType);
+    abbrev.uleb128(DW_TAG_subrange_type);
+    abbrev.u8(DW_CHILDREN_no);
+    abbrev.uleb128(DW_AT_upper_bound); abbrev.uleb128(DW_FORM_udata);
+    abbrev.uleb128(0);                 abbrev.uleb128(0);
 
     // End-of-table marker.
     abbrev.uleb128(0);
@@ -365,9 +402,69 @@ std::uint64_t symbolEnd(const model::CompileUnit& cu,
 }
 
 // ---------------------------------------------------------------------
+// Pascal-friendly display name for a PrimitiveKind. Pairs with the
+// DWARF encoding so debuggers render values correctly.
+// ---------------------------------------------------------------------
+struct PrimitiveDescriptor {
+    const char*   name;
+    std::uint8_t  byte_size;
+    std::uint8_t  encoding;   // llvm::dwarf::DW_ATE_*
+};
+PrimitiveDescriptor describePrimitive(model::PrimitiveKind k) {
+    using namespace llvm::dwarf;
+    switch (k) {
+    case model::PrimitiveKind::Bool:    return {"Boolean", 1, DW_ATE_boolean};
+    case model::PrimitiveKind::Char:    return {"AnsiChar", 1, DW_ATE_unsigned_char};
+    case model::PrimitiveKind::WChar:   return {"Char", 2, DW_ATE_UTF};
+    case model::PrimitiveKind::Int8:    return {"ShortInt", 1, DW_ATE_signed};
+    case model::PrimitiveKind::Int16:   return {"SmallInt", 2, DW_ATE_signed};
+    case model::PrimitiveKind::Int32:   return {"Integer",  4, DW_ATE_signed};
+    case model::PrimitiveKind::Int64:   return {"Int64",    8, DW_ATE_signed};
+    case model::PrimitiveKind::UInt8:   return {"Byte",     1, DW_ATE_unsigned};
+    case model::PrimitiveKind::UInt16:  return {"Word",     2, DW_ATE_unsigned};
+    case model::PrimitiveKind::UInt32:  return {"Cardinal", 4, DW_ATE_unsigned};
+    case model::PrimitiveKind::UInt64:  return {"UInt64",   8, DW_ATE_unsigned};
+    case model::PrimitiveKind::Float32: return {"Single",   4, DW_ATE_float};
+    case model::PrimitiveKind::Float64: return {"Double",   8, DW_ATE_float};
+    case model::PrimitiveKind::Float80: return {"Extended", 10, DW_ATE_float};
+    }
+    return {"unknown", 1, DW_ATE_unsigned};
+}
+
+// ---------------------------------------------------------------------
+// Emit a single type DIE; returns the absolute byte offset within
+// .debug_info where the DIE begins (used for DW_AT_type refs).
+// ---------------------------------------------------------------------
+std::uint32_t emitBaseTypeDIE(BytesBuf& info, model::PrimitiveKind k) {
+    const auto off = static_cast<std::uint32_t>(info.size());
+    const auto desc = describePrimitive(k);
+    info.uleb128(kAbbrevBaseType);
+    info.cstr(desc.name);
+    info.u8(desc.byte_size);
+    info.u8(desc.encoding);
+    return off;
+}
+
+std::uint32_t emitArrayTypeDIE(BytesBuf& info,
+                               std::uint32_t element_offset,
+                               std::uint64_t length) {
+    const auto off = static_cast<std::uint32_t>(info.size());
+    info.uleb128(kAbbrevArrayType);
+    info.u32(element_offset);
+    // Single subrange child. gdb's Pascal mode defaults the lower
+    // bound to 1, so emit upper_bound = length to cover all N elements
+    // as the Pascal range [1..N].
+    info.uleb128(kAbbrevSubrangeType);
+    info.uleb128(length);                          // DW_AT_upper_bound
+    info.u8(0);                                    // children-end marker
+    return off;
+}
+
+// ---------------------------------------------------------------------
 // Compile-unit DIE for .debug_info.
 // ---------------------------------------------------------------------
 void writeCompileUnit(BytesBuf& info,
+                      const model::Module& mod,
                       const model::CompileUnit& cu,
                       const std::string& producer,
                       std::uint32_t stmt_list_offset,
@@ -402,6 +499,55 @@ void writeCompileUnit(BytesBuf& info,
     info.u64(rng.hi + 1);                 // DW_AT_high_pc         (addr, exclusive)
     info.u32(stmt_list_offset);           // DW_AT_stmt_list       (sec_offset)
 
+    // ---- Type DIEs first ----
+    // Walk this CU's variable symbols and emit unique base-types and
+    // array-types up front so subsequent DW_AT_type references can
+    // point at them. The offsets recorded here are absolute byte
+    // positions within .debug_info (DW_FORM_ref_addr semantics).
+    std::map<model::TypeId, std::uint32_t> type_offsets;
+    auto ensureType = [&](model::TypeId tid) -> std::uint32_t {
+        if (tid == model::kNoType) return 0;
+        auto it = type_offsets.find(tid);
+        if (it != type_offsets.end()) return it->second;
+        const auto& t = mod.getType(tid);
+        std::uint32_t off = 0;
+        if (std::holds_alternative<model::PrimitiveType>(t.kind)) {
+            const auto& p = std::get<model::PrimitiveType>(t.kind);
+            off = emitBaseTypeDIE(info, p.kind);
+        } else if (std::holds_alternative<model::ArrayType>(t.kind)) {
+            const auto& a = std::get<model::ArrayType>(t.kind);
+            // Element type was emitted in the prepass below.
+            std::uint32_t element_off = 0;
+            if (a.element != model::kNoType) {
+                auto eit = type_offsets.find(a.element);
+                if (eit != type_offsets.end()) element_off = eit->second;
+            }
+            off = emitArrayTypeDIE(info, element_off, a.length);
+        } else {
+            // RecordType / EnumType / PointerType: not supported in
+            // B-lite. Caller falls back to the untyped abbrev.
+            return 0;
+        }
+        type_offsets[tid] = off;
+        return off;
+    };
+
+    // Two-pass emission so array elements are always emitted before
+    // their containing arrays.
+    for (const auto& sym : cu.symbols) {
+        if (sym.kind != model::SymbolKind::Variable) continue;
+        if (sym.type == model::kNoType) continue;
+        const auto& t = mod.getType(sym.type);
+        if (std::holds_alternative<model::ArrayType>(t.kind)) {
+            const auto& a = std::get<model::ArrayType>(t.kind);
+            if (a.element != model::kNoType) ensureType(a.element);
+        }
+    }
+    for (const auto& sym : cu.symbols) {
+        if (sym.kind != model::SymbolKind::Variable) continue;
+        ensureType(sym.type);
+    }
+
     // ---- Child DIEs: subprograms (functions) + variables (data) ----
     // Function symbols must fall within the CU's code address range
     // (computed from line entries); variables are in data segments
@@ -420,17 +566,29 @@ void writeCompileUnit(BytesBuf& info,
             break;
         }
         case model::SymbolKind::Variable: {
-            info.uleb128(kAbbrevVariable);
-            info.cstr(sym.name);
-
-            // DW_AT_location: exprloc = ULEB128 length + bytes.
-            // Expression: DW_OP_addr <8-byte address>.
-            // Total expression length = 1 + 8 = 9 bytes.
-            info.uleb128(1 + 8);
-            info.u8(DW_OP_addr);
-            info.u64(sym.address);
-
-            info.u8(1);  // external
+            // Choose typed-variable abbrev (4) when we have a resolved
+            // type DIE; otherwise fall back to the untyped abbrev (3).
+            std::uint32_t type_off = 0;
+            if (sym.type != model::kNoType) {
+                auto it = type_offsets.find(sym.type);
+                if (it != type_offsets.end()) type_off = it->second;
+            }
+            if (type_off != 0) {
+                info.uleb128(kAbbrevTypedVariable);
+                info.cstr(sym.name);
+                info.uleb128(1 + 8);
+                info.u8(DW_OP_addr);
+                info.u64(sym.address);
+                info.u32(type_off);
+                info.u8(1);  // external
+            } else {
+                info.uleb128(kAbbrevVariable);
+                info.cstr(sym.name);
+                info.uleb128(1 + 8);
+                info.u8(DW_OP_addr);
+                info.u64(sym.address);
+                info.u8(1);  // external
+            }
             break;
         }
         case model::SymbolKind::Unknown:
@@ -470,7 +628,7 @@ bool emit(const model::Module& mod,
     for (const auto& cu : mod.units) {
         if (cu.lines.empty()) continue;       // skip CUs with no line info
         const std::uint32_t stmt_list_off = writeLineProgram(line, cu);
-        writeCompileUnit(info, cu, opts.producer, stmt_list_off, abbrev_offset);
+        writeCompileUnit(info, mod, cu, opts.producer, stmt_list_off, abbrev_offset);
     }
 
     out.debug_info     = std::move(info).take();
