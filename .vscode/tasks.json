@@ -32,6 +32,30 @@
       ],
       "group": { "kind": "test", "isDefault": true },
       "problemMatcher": []
+    },
+    {
+      "label": "delphi-debug-build (two_units)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", "${workspaceFolder}\\scripts\\delphi-debug.ps1",
+        "-Dproj", "${workspaceFolder}\\examples\\02_two_units\\two_units.dproj"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "delphi-debug-build (hello)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", "${workspaceFolder}\\scripts\\delphi-debug.ps1",
+        "-Dproj", "${workspaceFolder}\\examples\\01_hello\\hello.dproj"
+      ],
+      "problemMatcher": []
     }
   ]
 }

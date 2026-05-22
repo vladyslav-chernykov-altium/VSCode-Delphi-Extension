@@ -1,0 +1,70 @@
+{
+  "name": "rsm2pdb-vscode",
+  "displayName": "rsm2pdb: Delphi debug via DWARF",
+  "description": "Build a Delphi (Win64) project and debug it in VSCode by injecting DWARF debug info from the .map file.",
+  "version": "0.0.1",
+  "publisher": "internal",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Debuggers", "Other"],
+  "activationEvents": [
+    "workspaceContains:**/*.dproj"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "rsm2pdb.buildAndDebug",
+        "title": "rsm2pdb: Build Delphi project and start debugging",
+        "category": "rsm2pdb"
+      },
+      {
+        "command": "rsm2pdb.build",
+        "title": "rsm2pdb: Build Delphi project (no launch)",
+        "category": "rsm2pdb"
+      },
+      {
+        "command": "rsm2pdb.pickProject",
+        "title": "rsm2pdb: Pick the active .dproj",
+        "category": "rsm2pdb"
+      }
+    ],
+    "configuration": {
+      "title": "rsm2pdb",
+      "properties": {
+        "rsm2pdb.bdsPath": {
+          "type": "string",
+          "default": "C:\\Dev\\Tools\\Embarcadero\\Studio\\19.0",
+          "description": "Embarcadero Studio install path (BDS)."
+        },
+        "rsm2pdb.executable": {
+          "type": "string",
+          "default": "${workspaceFolder}/build/src/rsm2pdb.exe",
+          "description": "Path to rsm2pdb.exe."
+        },
+        "rsm2pdb.gdbPath": {
+          "type": "string",
+          "default": "C:/Dev/Tools/msys64/mingw64/bin/gdb.exe",
+          "description": "mingw-w64 gdb used by the cppdbg launch."
+        },
+        "rsm2pdb.defaultPlatform": {
+          "type": "string",
+          "enum": ["Win64", "Win32"],
+          "default": "Win64",
+          "description": "Target Delphi platform. Only Win64 is supported by the rsm2pdb pipeline today."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

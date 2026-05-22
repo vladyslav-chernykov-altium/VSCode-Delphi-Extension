@@ -136,6 +136,44 @@ Out of scope for v1 (deferred):
              "App.Colors.App.Colors") strip to the unit name -
              correct behaviour.
 
+[x] M2 phase C+wrappers: tooling skeleton  (2026-05-22).
+         Built two thin wrappers around the rsm2pdb pipeline so we
+         can dogfood / iterate without retyping the build+inject
+         command:
+
+         B - PowerShell helper + VSCode tasks (working today)
+             scripts/delphi-debug.ps1
+                 - finds .dproj (arg or first in cwd)
+                 - calls rsvars.bat + msbuild
+                 - calls rsm2pdb dwarf to inject DWARF
+                 - prints the path of the debuggable exe
+             .vscode/tasks.json adds:
+                 - delphi-debug-build (two_units)
+                 - delphi-debug-build (hello)
+             Smoke-tested on examples/02_two_units -> S=4 D=25 C=1
+             still reads correctly post-injection.
+
+         A - vscode-ext/ TypeScript extension SKELETON (not wired)
+             vscode-ext/package.json
+                 - manifest with commands:
+                   rsm2pdb.buildAndDebug, .build, .pickProject
+                 - settings: bdsPath, executable, gdbPath,
+                   defaultPlatform
+                 - activationEvents: workspaceContains **/*.dproj
+             vscode-ext/src/extension.ts
+                 - findDelphiProjects() implemented
+                 - runBuild(), writeLaunchEntry() stubbed; print
+                   what they would do
+                 - vscode.debug.startDebugging() not yet called
+             vscode-ext/tsconfig.json, README.md, .vscodeignore,
+             .gitignore
+             No npm install needed today; future contributor runs
+                 cd vscode-ext && npm install && npm run compile
+             Then F5 in vscode-ext/ to host the extension.
+         Rationale: extension UX is most compelling once M2 shows
+         records / classes / strings properly. Skeleton claims the
+         structure so we can fill it in incrementally.
+
 [x] M2 phase C: opaque globals support  (2026-05-22).
          Cheapest variable-inspection PoC: emit DW_TAG_variable per
          .map public symbol whose segment is data (.data/.bss/.tls),
