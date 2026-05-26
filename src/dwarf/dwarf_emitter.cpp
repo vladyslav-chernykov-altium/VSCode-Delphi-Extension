@@ -404,16 +404,36 @@ std::uint32_t writeLineProgram(BytesBuf& line, const model::CompileUnit& cu) {
 
 // ---------------------------------------------------------------------
 // Compute (low, high) address range covered by a CU.
+//
+// Includes BOTH line-entry addresses AND function-symbol addresses.
+// Why both:
+//   - Line entries cover the source-mapped instructions.
+//   - Function symbols cover whole-function ranges, including
+//     compiler-generated entries (e.g. Delphi's <Unit>.<Unit> unit-init
+//     for the .dpr's `begin..end` block) that may have only sparse or
+//     missing line entries.
+// gdb consults a CU's line program only for addresses within
+// [low_pc, high_pc). If a function falls outside the line-derived
+// range, breaks in that function show as "no source" -- which is the
+// exact symptom that map2pdb avoids by emitting per-function ranges
+// in CodeView. We get the equivalent by widening the CU range to
+// cover every function symbol attributed to this CU.
 // ---------------------------------------------------------------------
 struct AddressRange { std::uint64_t lo, hi; };
 AddressRange cuRange(const model::CompileUnit& cu) {
     AddressRange r{0, 0};
-    if (cu.lines.empty()) return r;
-    r.lo = cu.lines.front().address;
-    r.hi = cu.lines.front().address;
-    for (const auto& le : cu.lines) {
-        if (le.address < r.lo) r.lo = le.address;
-        if (le.address > r.hi) r.hi = le.address;
+    bool first = true;
+    auto absorb = [&](std::uint64_t a) {
+        if (a == 0) return;
+        if (first) { r.lo = r.hi = a; first = false; }
+        else {
+            if (a < r.lo) r.lo = a;
+            if (a > r.hi) r.hi = a;
+        }
+    };
+    for (const auto& le : cu.lines) absorb(le.address);
+    for (const auto& sym : cu.symbols) {
+        if (sym.kind == model::SymbolKind::Function) absorb(sym.address);
     }
     return r;
 }
