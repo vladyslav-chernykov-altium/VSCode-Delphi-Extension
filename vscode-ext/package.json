@@ -17,18 +17,65 @@
     "commands": [
       {
         "command": "rsm2pdb.buildAndDebug",
-        "title": "rsm2pdb: Build Delphi project and start debugging",
+        "title": "rsm2pdb: Make + Run (incremental build + debug)",
         "category": "rsm2pdb"
       },
       {
         "command": "rsm2pdb.build",
-        "title": "rsm2pdb: Build Delphi project (no launch)",
+        "title": "rsm2pdb: Make (incremental build, no launch)",
+        "category": "rsm2pdb"
+      },
+      {
+        "command": "rsm2pdb.rebuild",
+        "title": "rsm2pdb: Rebuild (full clean build, no launch)",
         "category": "rsm2pdb"
       },
       {
         "command": "rsm2pdb.pickProject",
         "title": "rsm2pdb: Pick the active .dproj",
         "category": "rsm2pdb"
+      },
+      {
+        "command": "rsm2pdb.inspectProject",
+        "title": "rsm2pdb: Inspect project (parse .dproj, list configs)",
+        "category": "rsm2pdb"
+      },
+      {
+        "command": "rsm2pdb.cancelBuild",
+        "title": "rsm2pdb: Cancel current build",
+        "category": "rsm2pdb"
+      },
+      {
+        "command": "rsm2pdb.debugLast",
+        "title": "rsm2pdb: Debug last build (no rebuild)",
+        "category": "rsm2pdb"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "rsm2pdb.build",
+        "key": "ctrl+b",
+        "when": "workspaceFolderCount > 0 && !inputFocus"
+      },
+      {
+        "command": "rsm2pdb.rebuild",
+        "key": "ctrl+shift+b",
+        "when": "workspaceFolderCount > 0"
+      },
+      {
+        "command": "rsm2pdb.buildAndDebug",
+        "key": "ctrl+f9",
+        "when": "workspaceFolderCount > 0"
+      },
+      {
+        "command": "rsm2pdb.cancelBuild",
+        "key": "ctrl+shift+c",
+        "when": "workspaceFolderCount > 0"
+      },
+      {
+        "command": "rsm2pdb.debugLast",
+        "key": "ctrl+shift+f9",
+        "when": "workspaceFolderCount > 0"
       }
     ],
     "configuration": {

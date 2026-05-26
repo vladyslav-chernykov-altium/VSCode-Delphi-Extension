@@ -60,6 +60,20 @@ export interface DprojSettings {
 
   /** Raw conditional defines combined across the chain. */
   define: string;
+
+  /** Resolved unit search paths (DCC_UnitSearchPath, semicolon-split,
+   *  env-vars expanded, made absolute relative to the .dproj dir).
+   *  Includes the .dproj's own directory at index 0 since that's where
+   *  the MainSource and most siblings live. */
+  unitSearchPaths: string[];
+
+  /** Resolved include search paths (DCC_IncludePath). */
+  includeSearchPaths: string[];
+
+  /** Project-explicit sources from <DCCReference Include="..."/> items.
+   *  Each entry is resolved to an absolute path against the .dproj
+   *  dir. Useful for sources outside the unit search path. */
+  dccReferences: string[];
 }
 
 /** Returns all (Config, Platform) tuples advertised by a .dproj. */
@@ -159,6 +173,25 @@ export function resolveSettings(
     appType === 'Library' ? '.dll' :
     appType === 'Package' ? '.bpl' : '.exe';
 
+  // -------- Unit / include search paths --------
+  const splitPaths = (raw: string): string[] => {
+    if (!raw) return [];
+    // Delphi semicolon-separated path list. Drop empties and the
+    // $(DCC_UnitSearchPath) self-reference left behind by the merge.
+    return raw.split(';')
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0 && !p.includes('$(DCC_'))
+      .map((p) => path.isAbsolute(p) ? p : path.resolve(dprojDir, p));
+  };
+  const unitSearchPaths = [
+    dprojDir,
+    ...splitPaths(resolve(merged.DCC_UnitSearchPath)),
+  ];
+  const includeSearchPaths = splitPaths(resolve(merged.DCC_IncludePath));
+
+  // -------- DCCReference items (project-explicit source list) --------
+  const dccReferences = extractDccReferences(xml, dprojDir);
+
   return {
     appType,
     mainSource,
@@ -188,7 +221,23 @@ export function resolveSettings(
     useMSBuildExternally: merged.DCC_UseMSBuildExternally === 'true',
 
     define: resolve(merged.DCC_Define),
+    unitSearchPaths,
+    includeSearchPaths,
+    dccReferences,
   };
+}
+
+/** Extract every <DCCReference Include="..."> path from the .dproj
+ *  and resolve each one against the project directory. */
+function extractDccReferences(xml: string, dprojDir: string): string[] {
+  const out: string[] = [];
+  const re = /<DCCReference\s+Include\s*=\s*"([^"]+)"/g;
+  for (let m: RegExpExecArray | null; (m = re.exec(xml)); ) {
+    const p = m[1].trim();
+    if (!p) continue;
+    out.push(path.isAbsolute(p) ? p : path.resolve(dprojDir, p));
+  }
+  return out;
 }
 
 // ----------------------- internal helpers -----------------------

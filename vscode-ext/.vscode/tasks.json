@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "compile",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "compile"],
+      "presentation": { "reveal": "silent" },
+      "problemMatcher": "$tsc"
+    },
+    {
+      "label": "watch",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "watch"],
+      "isBackground": true,
+      "problemMatcher": "$tsc-watch"
+    }
+  ]
+}

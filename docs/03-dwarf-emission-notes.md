@@ -67,6 +67,38 @@ standard MS x64 register set.
 (Verify on first real sample. If we see params spilled to home space
 mid-prolog, we need DW_AT_location list expressions, not single regs.)
 
+## CU address range (`low_pc` / `high_pc`)
+
+Each compile unit's `[low_pc, high_pc)` is computed from BOTH:
+
+1. The MIN/MAX address of its **line entries** (covers all executable
+   statements that Delphi mapped to source lines).
+2. The MIN/MAX address of its **function symbols** (covers whole
+   functions including compiler-generated ones like the unit-init
+   `<Unit>.<Unit>` for the `.dpr`'s `begin..end` block).
+
+**Why both:** gdb consults a CU's line program only when an address
+falls inside that CU's `[low_pc, high_pc)`. If we derived the range
+from line entries alone, addresses inside compiler-generated functions
+(which may have sparse / no line entries) would fall outside any CU's
+range, and gdb would report "no source" for breakpoints there — even
+when the line table contained valid nearby entries.
+
+This was the symptom that map2pdb on the same `.map` did not exhibit;
+it emits per-function ranges in CodeView, so every function's address
+maps to a module entry. We get the equivalent in DWARF by widening
+the CU range.
+
+Implemented in `src/dwarf/dwarf_emitter.cpp cuRange()`. The function
+walks both `cu.lines` and `cu.symbols` (kind=Function) and absorbs
+their addresses into a single `[lo, hi]` pair.
+
+Remaining gap: bare `begin`/`end` lines without any executable
+statement still lack line-table entries — Delphi doesn't emit them.
+Breakpoints on such lines hit but don't navigate to source. Workaround
+is to set the breakpoint on any actual statement; future work is to
+synthesise line entries at function boundaries to match map2pdb.
+
 ## Line table
 
 DWARF's line state machine matches RSM's line table conceptually. We

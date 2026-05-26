@@ -27,6 +27,155 @@ Out of scope for v1 (deferred):
   DONE
 ================================================================================
 
+[x] DWARF emit: extend CU range to cover function symbols (2026-05-26).
+         Commit d6d6abf.
+
+         Symptom: on Altium AdvPCB, breakpoints in the .dpr's
+         `begin..end` block (= the compiler-generated unit-init
+         function AdvPCB.AdvPCB) hit correctly but VSCode silently
+         failed to navigate to the source. gdb's `info source`
+         returned "No current source file." Comparable third-party
+         tool map2pdb worked on the same .map, pointing at DWARF
+         emission as the gap.
+
+         Root cause: src/dwarf/dwarf_emitter.cpp cuRange() derived
+         [low_pc, high_pc) only from line-entry addresses. Delphi's
+         compiler-generated unit-init function often has sparse / no
+         line entries -- so its code range fell outside any CU's
+         [low_pc, high_pc). gdb never consulted that CU's line
+         program for those addresses, and returned no source.
+
+         Fix: also absorb every function-symbol address attributed to
+         the CU into its low_pc/high_pc. Now any address inside a
+         function known to be part of this unit triggers the line-
+         program lookup -- which surfaces the file:line mapping
+         whenever line entries exist nearby. Cosmetic gap remains for
+         bare `begin`/`end` lines (Delphi doesn't emit per-line
+         entries for them); deferred behind "synthesise line entries
+         at function boundaries" follow-up.
+
+         Verified on AdvPCB.dll: breakpoint in
+            library AdvPCB;
+            begin
+              WriteLn(...);   <-- breakpoint here, source displays
+            end.
+         now shows source. Tests: 27 / 2021, all green.
+
+[x] Real-project scale: 120 MB DLLs (Altium AdvPCB) (2026-05-26).
+         Commits d9fbe67 (perf), 088a11d (proc-scanner robustness),
+         d6d6abf (CU range fix).
+
+         Smoke-tested the whole pipeline on the Altium PCB engine:
+            DLL   120 MB     .map   267 MB     .rsm  543 MB
+            946,961 publics   38,062 line tables   3,937 unique units
+
+         Before fixes: process killed at 4 minutes with no output.
+         After fixes:  full parse + populate + decorate + DWARF emit
+                      + PE inject in 52 seconds.
+
+         Phase breakdown (post-fix):
+            23.1s   parse .map
+             1.2s   populate model       (was 80s with O(N*M) walk)
+            26.8s   parse .rsm
+             0.0s   decorateTypes        (was infinite without lookup index)
+             0.6s   DWARF emit           (info=31MB, line=9MB)
+             0.7s   PE inject            (158 MB output DLL)
+
+         Algorithmic fixes:
+           1. rsm::Reader gained unordered_map<VA, idx> for variables
+              and procedures. findVariableAt / findProcedureAt go
+              from O(N) to O(1). Without this, decorateTypes on
+              1.9M publics x 478k variables would have been ~9e11 ops.
+           2. map::populate bucketed publics by LONGEST matching
+              unit-name prefix, eliminating ~57x duplication; then
+              merged line tables per module into ONE CompileUnit
+              instead of one-CU-per-segment.
+           3. Variable-scan dump filter widened from 8 MB to 1 GB so
+              big DLLs' user-VA-range procedures are visible.
+           4. Procedure-record sub-scanner validates Pascal-identifier
+              names, skipping records like compiler-generated hidden
+              `Self` parameters whose name bytes contain NUL (these
+              would corrupt our DWARF byte stream via DW_FORM_string
+              truncation -- the 6 abbrev-misread CUs that gdb
+              reported are all fixed).
+
+         Verified end-to-end: gdb resolves Pascal-qualified symbols
+         (System.SysUtils.Abort, JclAnsiStrings.CharIsLower) and
+         maps to source:line cleanly. Output DLL loadable, breakpoint
+         resolves.
+
+[x] VSCode extension: production-grade build/debug pipeline (2026-05-26).
+         Commit d9fbe67 introduced the dproj parser; subsequent edits
+         (uncommitted at time of writing) wired up build runner,
+         cancellation, PROBLEMS-tab integration, source navigation,
+         and keybindings.
+
+         Capabilities delivered:
+           - Discover .dproj files in workspace.
+           - Parse .dproj configs (all (Config, Platform) tuples,
+             cascading through CfgParent inheritance, expanding
+             env vars like $(ALTIUM64_HOME)).
+           - rsm2pdb: Inspect project -- dump resolved settings.
+           - rsm2pdb: Make (incremental) -> /t:Make
+           - rsm2pdb: Rebuild (full)     -> /t:Rebuild
+           - rsm2pdb: Make + Run         -> incremental + launch cppdbg
+           - rsm2pdb: Debug Last         -> launch without rebuild
+           - rsm2pdb: Cancel Build       -> taskkill /T /F whole tree
+           - PROBLEMS tab populated from streamed dcc64 output
+             (Hint warning / Warning / Error / Fatal Error).
+           - cppdbg launch composed dynamically from .dproj:
+                program = Debugger_HostApplication (for DLLs) or
+                          DCC_ExeOutput/<name>.exe
+                cwd     = Debugger_CWD
+                source search = DCC_UnitSearchPath + DCC_IncludePath
+                                + dproj dir + DCCReference dirs
+                                (emitted via -environment-directory)
+                case-insensitive Pascal lookup pre-set
+
+         Keybindings (in vscode-ext/package.json):
+           Ctrl+B          rsm2pdb.build
+           Ctrl+Shift+B    rsm2pdb.rebuild
+           Ctrl+F9         rsm2pdb.buildAndDebug
+           Ctrl+Shift+F9   rsm2pdb.debugLast
+           Ctrl+Shift+C    rsm2pdb.cancelBuild
+
+         Architecture documented in docs/05-vscode-extension.md.
+         User-facing in vscode-ext/README.md.
+
+         Tested on Altium AdvPCB: full Make/Rebuild + Debug cycle
+         works; source navigation works for executable lines.
+
+[x] M2 phase A: function parameters + locals (2026-05-22).
+         Commit dfe98ca.
+
+         Pipeline now decodes RSM procedure records (tag 0x28):
+           name + VA + hash + return-type-marker
+           param sub-records (tag 0x21)
+           local sub-records (tag 0x20)
+           end marker (0x63)
+
+         Each param/local carries (name, type_marker, stack_offset).
+         The stack offset is encoded in 2-byte stride units relative
+         to a frame anchor at rbp+16. Conversion:
+            real_byte_offset = (rsm_offset_signed / 2) + 16
+         Discovered by cross-checking RSM offsets against asm
+         spill addresses in Geometry.Add (preferred VAs 0x20/0x30
+         in RSM correspond to asm [rbp+0x20]/[rbp+0x28]).
+
+         DWARF emission:
+           DW_TAG_subprogram WITH children + DW_AT_frame_base = rbp+16
+           DW_TAG_formal_parameter children with DW_OP_fbreg location
+           DW_TAG_variable children (typed locals) with same shape
+
+         Verified on Geometry.Add(0, 4):
+            info args: A=0, B=4
+            info locals: Result, Tmp (both Integer)
+            values correct at line 21 entry.
+
+         Verified on Geometry.DistanceSq with TPoint params:
+            P1 = {0,0,0,0,0,0,0,0}, P2 = {3,0,0,0,4,0,0,0}
+            Dx = -3, Dy = -4
+
 [x] M2 phase B-lite: typed globals via primitives only (2026-05-22).
          Goal: Delphi globals like `S: Integer` show as Integer in
          VSCode (instead of `int`), and records/enums show as

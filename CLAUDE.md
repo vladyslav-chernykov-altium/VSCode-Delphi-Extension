@@ -7,18 +7,24 @@ first**, then `todo.txt`, then `rsm-format.txt`. Everything else follows.
 
 ## Project at a glance
 
-**rsm2pdb** converts Delphi's `.map` (and eventually `.rsm`) debug-info
-files into DWARF and injects the DWARF into the matching PE, so VSCode +
-gdb can debug Delphi Win64 binaries.
+**rsm2pdb** converts Delphi's `.map` + `.rsm` debug-info into DWARF and
+injects the DWARF into the matching PE, so VSCode + gdb can debug Delphi
+Win64 binaries. Comes with a turnkey VSCode extension that drives the
+whole pipeline.
 
 Status snapshot (auto-rotting; verify against the latest commit):
 
 | Milestone | State |
 |---|---|
-| M1 — source-level line debugging | ✅ done, user-verified in VSCode |
-| M2 phase C — opaque global variables (no types yet) | ✅ done |
-| M2 phase B — type records from RSM | ⏳ not started; first concrete next step |
-| M2 phase A — locals / parameters / classes / strings | ⏳ later |
+| M1 — source-level line debugging | ✅ done, user-verified |
+| M2 phase C — opaque global variables | ✅ done |
+| M2 phase B-lite — typed globals (Integer + byte[N] fallback) | ✅ done |
+| M2 phase A — function parameters + locals | ✅ done |
+| Real-project scale (Altium AdvPCB: 120 MB DLL / 543 MB RSM) | ✅ verified, ~52s pipeline |
+| VSCode extension (build / debug / source nav, keybindings) | ✅ working end-to-end |
+| Step 10.5 — precise primitive typing (Cardinal vs Integer, Double vs Int64, ...) | ⏳ deferred |
+| Step 11 — full records / enums / classes | ⏳ deferred |
+| Synthesise line entries at begin/end (begin/end-line source nav) | ⏳ deferred |
 | M3 — PDB backend | ⏳ deferred |
 
 Most current commit on `main` should explain the latest delta in its
@@ -34,22 +40,24 @@ body. `git log --oneline` for the recent history.
 | `rsm-format.txt` | **Reverse-engineering lab notebook for the RSM format.** Append-only, plain text. Tags entries `[FACT]` / `[GUESS]` / `[DISPROVEN]` / `[QUESTION]`. Hex dumps + hypotheses. |
 | `docs/01-architecture.md` | Polished design view of the current layered architecture. |
 | `docs/02-rsm-format-notes.md` | Polished view of what we believe the RSM format IS. The notebook is the messy ancestor of this doc. |
-| `docs/03-dwarf-emission-notes.md` | DIE shapes, type map, PE-injection mechanics. |
+| `docs/03-dwarf-emission-notes.md` | DIE shapes, type map, PE-injection mechanics, CU range conventions. |
 | `docs/04-validation-plan.md` | What each milestone validates and how. |
+| `docs/05-vscode-extension.md` | VSCode extension architecture (module layout, parser, build runner, debug launch composition). |
 | `README.md` | User-facing capabilities + "how to use on your own Delphi project". |
-| `src/map/` | Delphi .map text parser. |
-| `src/dwarf/` | DWARF v5 emitter (hand-rolled, LLVM for constants only). |
-| `src/pe/` | PE section injector. |
+| `src/map/` | Delphi .map text parser + populate() adapter. Has pre-bucketed publics for scale. |
+| `src/rsm/` | Delphi .rsm binary parser. Header + primitive table + variable records + procedure records (params/locals). |
 | `src/model/` | Debugger-agnostic intermediate IR. |
-| `src/rsm/` | **Stub.** This is M2-phase-B work — parse the binary `.rsm` to get types. |
-| `examples/01_hello/` | Single-file Delphi sample. `build.cmd` runs Delphi MSBuild + `rsm2pdb dwarf`. |
-| `examples/02_two_units/` | Multi-unit (Geometry + App.Colors + dpr). Same build pattern. |
-| `test/fixtures/` | Committed .exe/.rsm/.map sample inputs. Both fixtures included. |
-| `spike/` | History of the de-risking spikes (6a / 6b / 6c). Not compiled. See `spike/README.md`. |
+| `src/dwarf/` | DWARF v5 emitter (hand-rolled, LLVM for constants only). Includes subprogram-with-kids, base_type, array_type, formal_parameter. |
+| `src/pe/` | PE section injector. |
+| `examples/01_hello/` | Single-file Delphi sample. |
+| `examples/02_two_units/` | Multi-unit (Geometry + App.Colors + dpr). Primary local-debug fixture. |
+| `examples/03_primitives/` | 13 user globals across 12 distinct primitive types. Used to RE the type-marker encoding. |
+| `test/fixtures/` | Committed .exe/.rsm/.map sample inputs (all three example projects). |
+| `spike/` | History of the de-risking spikes. Not compiled. See `spike/README.md`. |
 | `scripts/install-deps.ps1` | One-time installer for MSYS2 + LLVM. |
-| `scripts/delphi-debug.ps1` | Convenience wrapper: build + inject for a given .dproj. |
-| `vscode-ext/` | TypeScript extension SKELETON. Not wired today. |
-| `.vscode/` | tasks.json + launch.json + settings.json for VSCode workflow. |
+| `scripts/delphi-debug.ps1` | Convenience PowerShell wrapper; superseded by vscode-ext for interactive use. |
+| `vscode-ext/` | TypeScript extension — **production-grade**. Build/Make/Rebuild/Debug/Cancel commands with keybindings. See `docs/05-vscode-extension.md`. |
+| `.vscode/` | tasks.json + launch.json + settings.json for the rsm2pdb workspace itself. |
 
 ---
 
@@ -71,24 +79,28 @@ body. `git log --oneline` for the recent history.
 5. **Two-doc system for the project as a whole:**
    - `todo.txt` (running log + roadmap)
    - `docs/` (polished design docs)
-6. **Tests-first style is welcome but pragmatic.** doctest unit
+6. **Two-doc system for the VSCode extension:**
+   - `vscode-ext/README.md` (user-facing: commands, keybindings, settings)
+   - `docs/05-vscode-extension.md` (architecture-level design notes)
+7. **Tests-first style is welcome but pragmatic.** doctest unit
    tests for parsers; byte-level structural tests for the DWARF
    emitter (LLVM's DWARFContext as a reader proved finicky for in-
    memory sections — gave up after ~20 min, switched to byte-level
    asserts).
-7. **Verbosity preference:** show what's happening at key phase
-   boundaries; don't dump every compile command. Long-running
+8. **Verbosity preference:** show what's happening at key phase
+   boundaries; don't dump every compile command. `rsm2pdb dwarf`
+   prints per-phase timings (`[ N.NNs] phase: ...`). Long-running
    commands belong in `run_in_background` with notification on
    completion.
-8. **The user auto-approves obvious read-only operations**
+9. **The user auto-approves obvious read-only operations**
    (`ls`, `grep`, `od`, hex dumps, gdb in batch mode). Don't ask
    permission for these. Do ask before writing files outside the
    workspace, deleting things, or running long builds.
-9. **Bash on Windows uses Unix syntax** but the workspace is at
-   `c:/Dev/Src/rsm2pdb/` with forward slashes. Bash is fine for
-   simple stuff; for CMake builds we go through `cmd.exe /C` with
-   `vcvars64.bat` because that's how MSVC's environment works.
-10. **`scripts/check-vs.cmd` was deleted** — don't recreate it.
+10. **Bash on Windows uses Unix syntax** but the workspace is at
+    `c:/Dev/Src/rsm2pdb/` with forward slashes. Bash is fine for
+    simple stuff; for CMake builds we go through `cmd.exe /C` with
+    `vcvars64.bat` because that's how MSVC's environment works.
+11. **`scripts/check-vs.cmd` was deleted** — don't recreate it.
 
 ---
 
@@ -100,7 +112,7 @@ body. `git log --oneline` for the recent history.
    overridden by corporate EDR on this machine. **Fix:** integrate
    DWARF injection into the build pipeline so the .exe is "born" with
    DWARF instead of being patched post-hoc. See
-   `examples/*/build.cmd` for the pattern.
+   `examples/*/build.cmd` and `vscode-ext/`'s buildRunner.
 
 2. **gdb's Pascal expression parser treats `.` as field access.**
    So a watch on `two_units.S` fails with `-var-create: unable to
@@ -149,14 +161,46 @@ body. `git log --oneline` for the recent history.
 
 10. **Delphi RSM format magic is "CSH7" (not "FB09"/"FB0A").** JCL's
     `JclTD32.pas` reads the legacy TD32 format which is similar in
-    spirit but not directly applicable. The RSM parser will be largely
+    spirit but not directly applicable. The RSM parser was largely
     reverse-engineered from scratch. See `rsm-format.txt`.
 
 11. **`rsm2pdb dwarf` requires Delphi to NOT embed TD32 in the EXE**
     (set `DCC_DebugInfoInExe=false`). Otherwise the EXE has a 1+ MB
     `.debug` section that uses up PE header slots, and the injector
     fails with "not enough header space". `examples/*/two_units.dproj`
-    has this set correctly.
+    has this set correctly. AdvPCB.dproj does NOT set it explicitly
+    (defaults on); the in-place injection still worked because the
+    DLL had enough header headroom — fortunate, not guaranteed.
+
+12. **CU `low_pc`/`high_pc` MUST include function symbol addresses,
+    not just line-entry addresses.** Delphi's compiler-generated
+    unit-init function `<Unit>.<Unit>` (the .dpr's `begin..end`
+    block) often has sparse / no line entries. If we derive CU
+    range only from line entries, that function falls outside the
+    range -> gdb returns "no source" for any address in it ->
+    VSCode can't navigate. Fixed in `src/dwarf/dwarf_emitter.cpp
+    cuRange()` by absorbing function symbol addresses too. Commit
+    d6d6abf.
+
+13. **gdb's MI `-environment-directory` accepts a quoted path arg
+    as a single C-string and preserves spaces.** The console-syntax
+    `directory <path>` does NOT — it splits on whitespace, so
+    `C:/Source code` becomes two paths (`C:/Source` and `code`).
+    Always use the MI form when emitting source-search dirs from
+    the extension. See `vscode-ext/src/extension.ts`.
+
+14. **VSCode cppdbg `sourceFileMap` does prefix substitution, not
+    file-equality.** Bare-filename keys like `"AdvPCB.dpr"` only
+    work as exact-match prefixes for paths that gdb reports
+    unqualified — which depends on whether gdb resolved the path
+    or not. Prefer `-environment-directory` so gdb returns
+    fullname; sourceFileMap is a useful belt-and-braces but not
+    a primary mechanism.
+
+15. **VSCode `DiagnosticSeverity.Hint` does NOT show as a PROBLEMS
+    row** — only as inline editor decorations. Delphi compiler
+    "Hint" diagnostics must be mapped to `Information` instead to
+    surface in the panel. See `vscode-ext/src/buildRunner.ts`.
 
 ---
 
@@ -190,40 +234,32 @@ body. `git log --oneline` for the recent history.
 
 **Last commit:** see `git log --oneline | head -3`.
 
-**Next step:** RSM P1 — header + early structural blocks of the
-`.rsm` file.
+**Three candidate next steps:**
 
-Concrete starting move:
+1. **Step 11 — full records / enums / classes** (~2-3 days). Most
+   visible user UX win. Replaces `byte[N]` fallback for TPoint /
+   TColor / classes with proper field display. RSM has the data
+   (we saw the patterns); just needs decoding work.
 
-```bash
-cd test/fixtures
-/c/Dev/Tools/msys64/usr/bin/od -An -tx1 -v -N 256 hello.rsm     > /tmp/h.hex
-/c/Dev/Tools/msys64/usr/bin/od -An -tx1 -v -N 256 two_units.rsm > /tmp/t.hex
-diff /tmp/h.hex /tmp/t.hex
-```
+2. **Step 10.5 — precise primitive typing** (~1-2 days). Lifts the
+   D-017 same-size-merge limit (Cardinal/Single/Double distinguishable
+   from Integer/Int64). Smaller win but unblocks step 11's type-ID
+   reasoning.
 
-Identical bytes are structural (format constants); differing ones are
-data. Cross-reference findings with the `[FACT]`/`[GUESS]` entries
-already in `rsm-format.txt` (see lines about offsets 0x04, 0x08, 0x0C,
-0x10, 0x14, 0x18, 0x20).
+3. **Synthesise line entries for begin/end** (~few hours). Closes
+   the cosmetic gap where bare `begin`/`end` lines have no source
+   mapping. `map2pdb` does this; we don't yet.
 
-After the differential analysis:
-1. Write `src/rsm/rsm_reader.{h,cpp}` to parse the header proper
-   (magic + the 7 uint32 fields after, EXE path string).
-2. Parse the library-search-paths block at offset ~0x426 (we know
-   its rough shape but not exact field layout).
-3. Update `rsm2pdb dump <foo.rsm>` to show what we parsed.
-4. Add doctests.
-5. Append findings to `rsm-format.txt` as you go.
+If working on RSM RE, recall the offsets and conventions are
+documented in `docs/02-rsm-format-notes.md` and `rsm-format.txt`.
 
 **Don't:**
-- Try to parse the WHOLE .rsm in P1. P1 = header + early blocks only.
-- Reverse the line tables — we already established (D-016) that
-  `.map` is authoritative for those. RSM is only for types and
-  variable locations.
-- Use DWARFContext for testing — see gotcha #2-ish in our session
-  history. Byte-level structural tests work fine.
+- Reverse the line tables — D-016 established `.map` is authoritative.
+- Use DWARFContext for testing — see workflow rule #7.
+- Broaden allowlisting beyond read-only commands in
+  `.claude/settings.json`.
 
 ---
 
-*Last updated: end of session that produced commit 434f6ea.*
+*Last updated: after commit d6d6abf (extend CU range to cover function
+symbols, so AdvPCB.AdvPCB's begin..end becomes navigable).*
