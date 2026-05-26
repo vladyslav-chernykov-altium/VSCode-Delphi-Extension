@@ -115,13 +115,16 @@ PathSplit splitPath(const std::string& path) {
 // ---------------------------------------------------------------------
 // Abbreviation codes.
 // ---------------------------------------------------------------------
-constexpr std::uint64_t kAbbrevCu             = 1;
-constexpr std::uint64_t kAbbrevSubprogram     = 2;
-constexpr std::uint64_t kAbbrevVariable       = 3;
-constexpr std::uint64_t kAbbrevTypedVariable  = 4;
-constexpr std::uint64_t kAbbrevBaseType       = 5;
-constexpr std::uint64_t kAbbrevArrayType      = 6;
-constexpr std::uint64_t kAbbrevSubrangeType   = 7;
+constexpr std::uint64_t kAbbrevCu               = 1;
+constexpr std::uint64_t kAbbrevSubprogram       = 2;
+constexpr std::uint64_t kAbbrevVariable         = 3;
+constexpr std::uint64_t kAbbrevTypedVariable    = 4;
+constexpr std::uint64_t kAbbrevBaseType         = 5;
+constexpr std::uint64_t kAbbrevArrayType        = 6;
+constexpr std::uint64_t kAbbrevSubrangeType     = 7;
+constexpr std::uint64_t kAbbrevSubprogramWithKids = 8;   // children + frame_base
+constexpr std::uint64_t kAbbrevFormalParameter  = 9;
+constexpr std::uint64_t kAbbrevLocalVariable    = 10;
 
 void writeAbbrevTable(BytesBuf& abbrev) {
     using namespace llvm::dwarf;
@@ -190,6 +193,36 @@ void writeAbbrevTable(BytesBuf& abbrev) {
     abbrev.uleb128(DW_TAG_subrange_type);
     abbrev.u8(DW_CHILDREN_no);
     abbrev.uleb128(DW_AT_upper_bound); abbrev.uleb128(DW_FORM_udata);
+    abbrev.uleb128(0);                 abbrev.uleb128(0);
+
+    // Abbrev 8: DW_TAG_subprogram WITH children + DW_AT_frame_base.
+    // Used when we have params and/or locals to emit as children.
+    abbrev.uleb128(kAbbrevSubprogramWithKids);
+    abbrev.uleb128(DW_TAG_subprogram);
+    abbrev.u8(DW_CHILDREN_yes);
+    abbrev.uleb128(DW_AT_name);        abbrev.uleb128(DW_FORM_string);
+    abbrev.uleb128(DW_AT_low_pc);      abbrev.uleb128(DW_FORM_addr);
+    abbrev.uleb128(DW_AT_high_pc);     abbrev.uleb128(DW_FORM_addr);
+    abbrev.uleb128(DW_AT_external);    abbrev.uleb128(DW_FORM_flag);
+    abbrev.uleb128(DW_AT_frame_base);  abbrev.uleb128(DW_FORM_exprloc);
+    abbrev.uleb128(0);                 abbrev.uleb128(0);
+
+    // Abbrev 9: DW_TAG_formal_parameter with location + type.
+    abbrev.uleb128(kAbbrevFormalParameter);
+    abbrev.uleb128(DW_TAG_formal_parameter);
+    abbrev.u8(DW_CHILDREN_no);
+    abbrev.uleb128(DW_AT_name);        abbrev.uleb128(DW_FORM_string);
+    abbrev.uleb128(DW_AT_type);        abbrev.uleb128(DW_FORM_ref_addr);
+    abbrev.uleb128(DW_AT_location);    abbrev.uleb128(DW_FORM_exprloc);
+    abbrev.uleb128(0);                 abbrev.uleb128(0);
+
+    // Abbrev 10: DW_TAG_variable (local) with location + type, no external.
+    abbrev.uleb128(kAbbrevLocalVariable);
+    abbrev.uleb128(DW_TAG_variable);
+    abbrev.u8(DW_CHILDREN_no);
+    abbrev.uleb128(DW_AT_name);        abbrev.uleb128(DW_FORM_string);
+    abbrev.uleb128(DW_AT_type);        abbrev.uleb128(DW_FORM_ref_addr);
+    abbrev.uleb128(DW_AT_location);    abbrev.uleb128(DW_FORM_exprloc);
     abbrev.uleb128(0);                 abbrev.uleb128(0);
 
     // End-of-table marker.
@@ -533,19 +566,28 @@ void writeCompileUnit(BytesBuf& info,
     };
 
     // Two-pass emission so array elements are always emitted before
-    // their containing arrays.
-    for (const auto& sym : cu.symbols) {
-        if (sym.kind != model::SymbolKind::Variable) continue;
-        if (sym.type == model::kNoType) continue;
-        const auto& t = mod.getType(sym.type);
+    // their containing arrays. Walk variables, params, and locals.
+    auto preEnsureArrayElement = [&](model::TypeId tid) {
+        if (tid == model::kNoType) return;
+        const auto& t = mod.getType(tid);
         if (std::holds_alternative<model::ArrayType>(t.kind)) {
             const auto& a = std::get<model::ArrayType>(t.kind);
             if (a.element != model::kNoType) ensureType(a.element);
         }
+    };
+    for (const auto& sym : cu.symbols) {
+        if (sym.kind == model::SymbolKind::Variable) preEnsureArrayElement(sym.type);
+        if (sym.kind == model::SymbolKind::Function) {
+            for (const auto& p : sym.params) preEnsureArrayElement(p.type);
+            for (const auto& l : sym.locals) preEnsureArrayElement(l.type);
+        }
     }
     for (const auto& sym : cu.symbols) {
-        if (sym.kind != model::SymbolKind::Variable) continue;
-        ensureType(sym.type);
+        if (sym.kind == model::SymbolKind::Variable) ensureType(sym.type);
+        if (sym.kind == model::SymbolKind::Function) {
+            for (const auto& p : sym.params) ensureType(p.type);
+            for (const auto& l : sym.locals) ensureType(l.type);
+        }
     }
 
     // ---- Child DIEs: subprograms (functions) + variables (data) ----
@@ -553,16 +595,92 @@ void writeCompileUnit(BytesBuf& info,
     // (computed from line entries); variables are in data segments
     // and have no such range constraint - they just belong to the
     // CU because they share the module name.
+    // Helper: serialize a signed integer as SLEB128. We need the byte
+    // count up front to fill in the exprloc length prefix, so encode
+    // into a temporary then splice.
+    auto sleb128Bytes = [](std::int64_t v) {
+        std::vector<std::uint8_t> out;
+        bool more = true;
+        while (more) {
+            std::uint8_t b = static_cast<std::uint8_t>(v & 0x7F);
+            v >>= 7;
+            const bool sign = (b & 0x40) != 0;
+            if ((v == 0 && !sign) || (v == -1 && sign)) more = false;
+            else b |= 0x80;
+            out.push_back(b);
+        }
+        return out;
+    };
+
     for (const auto& sym : cu.symbols) {
         switch (sym.kind) {
         case model::SymbolKind::Function: {
             if (sym.address < rng.lo || sym.address > rng.hi) break;
             std::uint64_t end = symbolEnd(cu, sym, rng.hi + 1);
-            info.uleb128(kAbbrevSubprogram);
-            info.cstr(sym.name);
-            info.u64(sym.address);
-            info.u64(end);
-            info.u8(1);  // external
+            const bool has_kids = !sym.params.empty() || !sym.locals.empty();
+
+            if (!has_kids) {
+                info.uleb128(kAbbrevSubprogram);
+                info.cstr(sym.name);
+                info.u64(sym.address);
+                info.u64(end);
+                info.u8(1);  // external
+            } else {
+                // Subprogram with children + frame_base.
+                //
+                // Delphi Win64 debug prologue:
+                //     push rbp
+                //     sub  rsp, 0x10
+                //     mov  rbp, rsp
+                // The new rbp points at the bottom of the local-area
+                // allocation. The natural "frame pointer" expected by
+                // RSM's offset encoding is rbp+16 (= old saved rbp).
+                //
+                // RSM encodes stack offsets in 2-byte units relative to
+                // a frame anchor 16 bytes above the actual rbp:
+                //     real_byte_offset = (rsm_offset / 2) + 16
+                //
+                // We emit DW_AT_frame_base = (rbp + 16) and then per-var
+                // DW_OP_fbreg (rsm_offset / 2). gdb resolves the address
+                // as (rbp+16) + (rsm/2) = real_byte_offset ✓.
+                info.uleb128(kAbbrevSubprogramWithKids);
+                info.cstr(sym.name);
+                info.u64(sym.address);
+                info.u64(end);
+                info.u8(1);                       // external
+                // frame_base exprloc: DW_OP_breg6 sleb128(+16)
+                {
+                    auto leb = sleb128Bytes(16);
+                    info.uleb128(1 + leb.size());
+                    info.u8(DW_OP_breg6);
+                    info.raw(leb.data(), leb.size());
+                }
+
+                auto emitParamOrLocal = [&](const model::LocalVar& v,
+                                            std::uint64_t abbrev_code) {
+                    std::uint32_t type_off = 0;
+                    if (v.type != model::kNoType) {
+                        auto it = type_offsets.find(v.type);
+                        if (it != type_offsets.end()) type_off = it->second;
+                    }
+                    info.uleb128(abbrev_code);
+                    info.cstr(v.name);
+                    info.u32(type_off);
+                    // Location: DW_OP_fbreg sleb128(rsm_offset / 2)
+                    const std::int64_t fbreg = v.stack_offset / 2;
+                    auto leb = sleb128Bytes(fbreg);
+                    info.uleb128(1 + leb.size());
+                    info.u8(DW_OP_fbreg);
+                    info.raw(leb.data(), leb.size());
+                };
+
+                for (const auto& p : sym.params)
+                    emitParamOrLocal(p, kAbbrevFormalParameter);
+                for (const auto& l : sym.locals)
+                    emitParamOrLocal(l, kAbbrevLocalVariable);
+
+                info.u8(0);                       // children-end marker
+            }
             break;
         }
         case model::SymbolKind::Variable: {

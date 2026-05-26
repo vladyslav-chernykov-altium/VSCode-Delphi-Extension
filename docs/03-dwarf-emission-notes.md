@@ -142,6 +142,71 @@ Deferred (later milestones): sets, variants, dynamic arrays,
 ShortString, AnsiString, UnicodeString, interfaces, classes, pointer
 types, precise record/enum decoding.
 
+### Workarounds for type-display ambiguity (gdb)
+
+Because the size-based heuristic merges same-size primitives, end
+users hit display mismatches like `gD: Double` showing as
+`Int64 = 4612811918334230528` (the IEEE-754 bytes of 2.5
+reinterpreted as a 64-bit integer). Three workarounds, all verified:
+
+**1. Debug Console, gdb format specifiers.** Works in either
+language mode without any setup:
+
+```
+-exec print/f gD          # 2.5  (8-byte float view; only useful
+                          #       when our DWARF type is also 8 bytes)
+-exec print/u gC          # 2    (unsigned view of a Cardinal we
+                          #       mis-typed as Integer)
+-exec print/x gD          # 0x4004000000000000  (raw bytes)
+```
+
+`/f` won't help for `Single` (we emit it as Int64 = 8 bytes, so `/f`
+treats all 8 bytes as `double` and returns nonsense). Use
+workaround 2 for `Single`.
+
+**2. VSCode Watch panel, C-style reinterpret cast.** gdb's Pascal
+expression evaluator rejects C pointer-cast syntax with "syntax
+error in expression". Switch the evaluator language once per
+session via Debug Console:
+
+```
+-exec set language c
+```
+
+Then in Watch:
+
+```
+*(double*)&gD   ⇒ 2.5
+*(float*)&gF    ⇒ 1.5
+(unsigned)gC    ⇒ 2
+```
+
+gdb prints a one-line "language does not match frame" warning
+on switch — cosmetic, can be ignored. Watch entries update live
+as you step.
+
+**3. (Doesn't work) `gD,f` comma-format suffix.** That's a
+Visual Studio cppvsdbg feature; the gdb-backed cppdbg adapter does
+not translate it and passes `gD,f` to gdb as a C expression (the
+comma operator), which evaluates to `f` and fails as an undefined
+symbol.
+
+### Why Pascal-mode Watch can't do reinterpret casts
+
+gdb's Pascal expression evaluator only recognises types that
+appear in DWARF DIEs for the current CU. Our emitter doesn't emit
+`Double`, `Single`, `Cardinal`, or `UInt64` for our fixtures
+(those primitives are merged into `Int64` / `Integer` by the
+size heuristic), so a Watch expression like `Double(@gD)^` fails
+with "No symbol Double in current context".
+
+Enabling Pascal-style casts would require always emitting a
+baseline set of primitive DIEs even when no variable uses them
+(~20 lines of emitter change), then verifying that gdb's Pascal
+grammar accepts the `PType(@v)^` reinterpret form. Untested;
+deferred until/unless the typing heuristic is replaced by the
+precise bridge (step 10.5).
+
 ## LLVM APIs to use
 
 - `llvm::MCContext`             - shared MC context

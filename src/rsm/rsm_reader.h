@@ -70,13 +70,40 @@ struct Primitive {
 // marker with the byte-size derived from the .map next-symbol gap.
 struct Variable {
     std::string   name;
-    std::uint64_t address;            // decoded absolute VA
+    std::uint64_t address;            // decoded absolute VA; or 0 for params/locals
+    std::int32_t  stack_offset;       // signed byte offset; only meaningful inside a procedure
     std::uint16_t inline_type_id;     // 0 unless non-primitive
     std::uint16_t trailer_type_id;    // 0 unless primitive-extended; per-unit id
     std::uint8_t  type_marker;        // 0 unless primitive; per-unit type discriminator
     bool          is_primitive;
     bool          has_trailer;        // true for the 12-byte primitive-extended form
     std::uint64_t file_offset;
+};
+
+// A function / procedure record (tag 0x28) with its parameter and
+// local-variable sub-records (tags 0x21 / 0x20) decoded.
+//
+// Layout per rsm-format.txt (M2 phase A entry):
+//   0x28 <namelen> <name>
+//   0xA0 0x00 0x00                    -- function-flavour sub-tag
+//   <hash u32> <shifted_va u32>       -- VA decodes as actual = stored >> 4
+//   <u16 X> <0x04 ret_type_marker_u16>
+//   sub-records ...
+//   0x63                              -- record-end marker
+//
+// Param sub-record:  0x21 <namelen> <name> <sub_tag_triple>
+//                    <type_marker u8> <stack_offset i8>
+// Local sub-record:  0x20 <namelen> <name> <sub_tag_triple>
+//                    <type_marker u8> <stack_offset i8>
+// Sub-tag triple:    0x66 0x00 0x00 for primitive types, 0x62 0x00 0x00 for
+//                    non-primitive (record / class / enum).
+struct ProcedureRecord {
+    std::string             name;          // unqualified Pascal name
+    std::uint64_t           address;       // decoded VA
+    std::vector<Variable>   params;
+    std::vector<Variable>   locals;        // includes Result for functions
+    std::uint64_t           file_offset;
+    std::uint64_t           file_offset_end;  // one past the 0x63 end marker
 };
 
 struct Header {
@@ -100,10 +127,11 @@ class Reader {
 public:
     bool open(const std::string& path);
 
-    const Header&                  header()     const { return header_; }
-    const std::vector<Primitive>&  primitives() const { return primitives_; }
-    const std::vector<Variable>&   variables()  const { return variables_; }
-    const std::string&             error()      const { return error_; }
+    const Header&                       header()     const { return header_; }
+    const std::vector<Primitive>&       primitives() const { return primitives_; }
+    const std::vector<Variable>&        variables()  const { return variables_; }
+    const std::vector<ProcedureRecord>& procedures() const { return procedures_; }
+    const std::string&                  error()      const { return error_; }
 
     // Lookup a primitive by its Pascal name (case-sensitive). Returns
     // nullptr when no such primitive was located in the RSM type table.
@@ -112,14 +140,18 @@ public:
     // Lookup a variable by its absolute VA (the .map cross-reference key).
     const Variable* findVariableAt(std::uint64_t address) const;
 
+    // Lookup a procedure record by its function entry VA.
+    const ProcedureRecord* findProcedureAt(std::uint64_t address) const;
+
     void dump(std::FILE* out) const;
 
 private:
-    std::string             path_;
-    Header                  header_;
-    std::vector<Primitive>  primitives_;
-    std::vector<Variable>   variables_;
-    std::string             error_;
+    std::string                  path_;
+    Header                       header_;
+    std::vector<Primitive>       primitives_;
+    std::vector<Variable>        variables_;
+    std::vector<ProcedureRecord> procedures_;
+    std::string                  error_;
 };
 
 // Decorate a populated model::Module with type information derived

@@ -4,7 +4,7 @@ Debug **Delphi** Win64 binaries in **VSCode** (or any gdb front-end) by
 converting Delphi's debug-info output into DWARF and injecting it back
 into the executable.
 
-## What works today (Milestone M1)
+## What works today (Milestone M2 phase B-lite)
 
 | Capability | Status |
 |---|---|
@@ -14,11 +14,60 @@ into the executable.
 | `break Geometry.Add` works at the gdb prompt | ✅ |
 | Multi-unit projects (`uses` across multiple `.pas` files) | ✅ |
 | Dotted unit names (`App.Colors`) | ✅ |
-| **Variable inspection (locals / params / record fields)** | ⏳ Not yet (needs M2) |
+| Global variables shown as their Pascal primitive type (`S: Integer`) | ✅ |
+| Records / enums / classes shown as `byte[N]` arrays (fallback) | ✅ |
+| **Locals / parameters / record fields** | ⏳ M2 phase A |
+| Precise typing for same-size primitives (Cardinal vs Integer, Double vs Int64) | ⏳ see below |
 
-The remaining gap — variable inspection — needs the `.rsm` parser
-(reverse engineering, planned). Lines + symbols already give a usable
-debug experience.
+### Known display quirks
+
+Because the per-unit type-binding table inside the modern `.rsm` is not
+yet fully decoded (work in progress — see `rsm-format.txt`), some
+primitive globals display under their best-fit same-size sibling:
+
+| You declared | Debugger shows | Why |
+|---|---|---|
+| `Cardinal`        | `Integer` | both 4 bytes, sign info merged |
+| `Single`          | `Int64`   | 4-byte float padded to 8, lands on the 8-byte slot |
+| `Double` / `UInt64` | `Int64` | both 8 bytes, no sign / float-vs-int signal |
+| `Byte` / `ShortInt` / `Boolean` | `Word` | 1-byte types padded to 2 by alignment |
+
+**The bytes are always correct;** only the type *name* is best-effort.
+Two practical workarounds:
+
+**A. One-off check in VSCode Debug Console** (no setup needed):
+
+```
+-exec print/f gD          ⇒  2.5         (Double — 8-byte float view)
+-exec print/u gC          ⇒  2           (Cardinal — unsigned view)
+-exec print/x gD          ⇒  0x4004000000000000   (raw bytes)
+```
+
+Available gdb format specifiers: `/f` float, `/d` signed dec, `/u`
+unsigned dec, `/x` hex, `/o` octal, `/t` binary.
+
+**B. Persistent Watch entries** (one-time setup per session). gdb's
+default Pascal mode rejects C pointer-cast syntax, so first switch
+the expression language in Debug Console:
+
+```
+-exec set language c
+```
+
+Then in the VSCode Watch panel, add:
+
+```
+*(double*)&gD        ⇒  2.5
+*(float*)&gF         ⇒  1.5
+(unsigned)gC         ⇒  2
+```
+
+These update live as you step. gdb prints one "language does not
+match frame" warning on language switch — cosmetic, ignore.
+
+*Why the comma-format syntax (`gD,f`) doesn't work:* that's a
+Visual Studio cppvsdbg feature; the gdb-backed cppdbg adapter
+doesn't translate it.
 
 ## How it works
 

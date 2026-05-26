@@ -739,6 +739,159 @@ Implementation:
 
 
 ================================================================================
+  2026-05-26  M2 phase A: procedure / param / local record layout
+================================================================================
+
+Hex-RE of Geometry.Add and Geometry.DistanceSq in two_units.rsm.
+Add(a, b: Integer): Integer  with  var Tmp: Integer;
+DistanceSq(P1, P2: TPoint): Integer  with  var Dx, Dy: Integer;
+
+----- Geometry.Add at file offset 0x34bc12 -----
+
+Raw bytes:
+  28 03 41 64 64                       <- 0x28 tag + len(3) + "Add"
+  a0 00 00                             <- sub-tag triple (function variant)
+  f6 55 8b 4f                          <- 4-byte hash (per-function unique)
+  07 90 26 04                          <- shifted_va, >>4 = 0x0426900 (.map ✓)
+  4c 04                                <- u16 (purpose TBD; differs per func)
+  04 02 00                             <- 3 bytes (return-type-marker u16?)
+  21 01 41 66 00 00 02 20              <- param A: Integer at [rbp+0x20]
+  21 01 42 66 00 00 02 30              <- param B: Integer at [rbp+0x30]
+  20 06 52 65 73 75 6c 74 66 00 00 02 f8  <- local Result: Integer at [rbp-8]
+  20 03 54 6d 70 66 00 00 02 f0        <- local Tmp: Integer at [rbp-16]
+  63                                   <- record-end marker
+
+----- Geometry.DistanceSq -----
+
+  28 0a "DistanceSq"
+  a0 00 00
+  0a 64 c4 80                          <- hash
+  07 93 26 04                          <- VA: 0x0426930 ✓
+  7c 04                                <- u16 (differs from Add's 0x044C)
+  04 02 00                             <- same constant (return Integer)
+  21 02 50 31 62 00 00 04 20           <- param P1: TPoint at [rbp+0x20]
+  21 02 50 32 62 00 00 04 30           <- param P2: TPoint at [rbp+0x30]
+  20 06 "Result" 66 00 00 02 f8        <- local Result: Integer at [rbp-8]
+  20 02 44 78 66 00 00 02 f0           <- local Dx: Integer at [rbp-16]
+  20 02 44 79 66 00 00 02 e8           <- local Dy: Integer at [rbp-24]
+  63                                   <- end
+
+----- Decoded structure -----
+
+[FACT]   PROCEDURE/FUNCTION record (tag 0x28):
+            0x28 <namelen u8> <pascal_name>
+            <sub_tag = 0xA0 0x00 0x00>      (vs vars 0x66; SEH 0x27)
+            <hash u32>                      (probably mangled-name hash;
+                                             unique per function)
+            <shifted_va u32>                (actual_va = stored >> 4;
+                                             same encoding as variables)
+            <u16 X>                         (purpose unknown; differs by
+                                             function. Possibly source-line
+                                             or function-table index)
+            <return_type_marker u8 = 0x04> <return_type_id u16-LE>
+                                            (for Integer-returning fns,
+                                             value is 0x04 0x02 0x00 i.e.
+                                             type-id = 0x0002 = primitive
+                                             marker for Integer in this unit;
+                                             procedures may differ -- TBD)
+            <param / local sub-records ...>
+            0x63                            (record-end marker)
+
+[FACT]   PARAMETER sub-record (tag 0x21):
+            0x21 <namelen u8> <pascal_name>
+            <sub_tag triple>                (0x66 0x00 0x00 for primitive,
+                                             0x62 0x00 0x00 for non-primitive
+                                             - records, classes, etc.)
+            <type_marker u8>                (per-unit marker, same as globals:
+                                             0x02 = Integer, 0x04 = TPoint
+                                             in two_units' unit-local table)
+            <stack_offset i8>               (signed byte; positive for
+                                             home-spilled register params,
+                                             negative for stack-passed
+                                             arguments and locals)
+
+[FACT]   LOCAL-VARIABLE sub-record (tag 0x20):
+            Same shape as parameter, just tag 0x20 instead of 0x21:
+              0x20 <namelen u8> <pascal_name>
+              <sub_tag triple>              (0x66 / 0x62 by type kind)
+              <type_marker u8>
+              <stack_offset i8>             (typically negative for locals)
+
+         This is identical to the GLOBAL variable record shape we already
+         parse, EXCEPT:
+           - context: nested inside the 0x28 function record
+           - location: 1-byte stack offset (vs. globals' 4-byte VA)
+           - no trailer (no `0x9C 0x09 ... 0xFF`)
+
+[FACT]   The Result pseudo-variable (return value) is encoded as a normal
+         0x20 local at a fixed slot (offset 0xF8 = -8 for the two functions
+         we've seen). Delphi materialises Result as a stack local and
+         loads it into RAX at function exit.
+
+[FACT]   Sub-tag triple semantic (now consistent across globals + params
+         + locals):
+            0x66 0x00 0x00  -- primitive type (Integer, Byte, Double, ...)
+            0x62 0x00 0x00  -- non-primitive type (record, class, enum)
+         The byte AFTER the triple is the per-unit type marker (same
+         numbering system as global vars).
+
+[FACT]   Stack offsets observed for Add(a, b: Integer):
+         RSM stores 1-byte signed offsets that are NOT direct byte
+         offsets relative to rbp. After disassembling Geometry.Add:
+
+           push rbp
+           sub  rsp, 0x10            ; allocate 16 bytes of locals
+           mov  rbp, rsp             ; rbp now points to BOTTOM of locals
+
+         Actual asm spill / load offsets vs RSM-stored offsets:
+
+           var     RSM offset   asm [rbp+...]
+           ------  -----------  -------------
+           A       +0x20        +0x20
+           B       +0x30        +0x28        (RSM stride 0x10, asm 0x08)
+           Result  -0x08        +0x0c
+           Tmp     -0x10        +0x08
+
+         The conversion formula is:
+            asm_byte_offset = (rsm_offset_signed / 2) + 16
+         Equivalently: the natural Delphi "frame anchor" is rbp+16
+         (= the saved old-rbp slot), and RSM stores offsets in
+         2-byte stride units from THAT anchor.
+
+         DWARF emission:
+            DW_AT_frame_base = exprloc{ DW_OP_breg6 +16 }   (= rbp+16)
+            DW_AT_location   = exprloc{ DW_OP_fbreg (rsm/2) }
+         Verified end-to-end against gdb: at a breakpoint inside
+         Geometry.Add(0, 4), `info args` returns A=0 B=4, and inside
+         DistanceSq the TPoint params and Dx/Dy locals all display
+         correct values.
+
+[QUESTION] What is the u16 at offset +13 of the function record (0x044C
+         for Add, 0x047C for DistanceSq, ...)? Differs per function.
+         Plausibly a cross-reference index (line-number table position,
+         scope-id, or hash bucket). Not needed for param/local emission;
+         deferred.
+
+[QUESTION] Procedures (no return value) likely encode the return-type
+         field differently. Test with a procedure once we extend the
+         fixture set.
+
+----- Mapping to DWARF -----
+
+  DW_TAG_subprogram                 (existing, but CHILDREN_yes when
+                                     params or locals are present)
+    DW_AT_frame_base = exprloc{ DW_OP_breg6 +16 }   (= rbp+16)
+    DW_TAG_formal_parameter
+      DW_AT_name      <pascal_name>
+      DW_AT_type      <ref to base_type>
+      DW_AT_location  exprloc{ DW_OP_fbreg (rsm_offset / 2) }
+    DW_TAG_variable                 (per local sub-record)
+      DW_AT_name      <pascal_name>
+      DW_AT_type      <ref to base_type>
+      DW_AT_location  exprloc{ DW_OP_fbreg (rsm_offset / 2) }
+
+
+================================================================================
   GLOSSARY (terms we keep using)
 ================================================================================
 

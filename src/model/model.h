@@ -71,12 +71,24 @@ enum class SymbolKind {
     Variable     // data (e.g. .data / .bss / .tls segments)
 };
 
+// One formal parameter or local variable belonging to a function.
+// `stack_offset` is byte-signed relative to the subprogram's frame base
+// (DW_AT_frame_base). The DWARF emitter wraps it as DW_OP_fbreg.
+struct LocalVar {
+    std::string  name;
+    TypeId       type = kNoType;
+    std::int32_t stack_offset = 0;
+};
+
 struct Symbol {
     std::string name;
     std::uint64_t address;
     std::uint64_t size;
     TypeId type;
     SymbolKind kind = SymbolKind::Unknown;
+    // Populated for kind == Function. Empty otherwise.
+    std::vector<LocalVar> params;
+    std::vector<LocalVar> locals;     // includes Result for functions
 };
 
 struct CompileUnit {

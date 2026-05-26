@@ -247,6 +247,72 @@ TEST_CASE("rsm::Reader captures per-unit type markers from primitives.rsm") {
     CHECK_FALSE(gH->has_trailer);
 }
 
+TEST_CASE("rsm::Reader decodes procedure params and locals") {
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kTwoUnits));
+
+    // Geometry.Add at .map seg 0001:00025900 -> absolute VA 0x426900
+    const auto* add = r.findProcedureAt(0x00426900);
+    REQUIRE(add != nullptr);
+    CHECK(add->name == "Add");
+    REQUIRE(add->params.size() == 2);
+    REQUIRE(add->locals.size() == 2);
+
+    CHECK(add->params[0].name == "A");
+    CHECK(add->params[0].is_primitive);
+    CHECK(add->params[0].stack_offset == 0x20);
+    CHECK(add->params[1].name == "B");
+    CHECK(add->params[1].stack_offset == 0x30);
+
+    // Both params share marker 0x02 (Integer in Geometry's unit-local table).
+    CHECK(add->params[0].type_marker == add->params[1].type_marker);
+    CHECK(add->params[0].type_marker == 0x02);
+
+    CHECK(add->locals[0].name == "Result");
+    CHECK(add->locals[0].stack_offset == -8);
+    CHECK(add->locals[0].is_primitive);
+    CHECK(add->locals[1].name == "Tmp");
+    CHECK(add->locals[1].stack_offset == -16);
+
+    // Geometry.DistanceSq: TPoint params + Integer locals (Result, Dx, Dy).
+    const auto* dsq = r.findProcedureAt(0x00426930);
+    REQUIRE(dsq != nullptr);
+    CHECK(dsq->name == "DistanceSq");
+    REQUIRE(dsq->params.size() == 2);
+    REQUIRE(dsq->locals.size() == 3);
+    CHECK(dsq->params[0].name == "P1");
+    CHECK_FALSE(dsq->params[0].is_primitive);   // TPoint is non-primitive
+    CHECK(dsq->params[0].stack_offset == 0x20);
+    CHECK(dsq->params[1].name == "P2");
+    CHECK(dsq->locals[0].name == "Result");
+    CHECK(dsq->locals[1].name == "Dx");
+    CHECK(dsq->locals[2].name == "Dy");
+    CHECK(dsq->locals[1].stack_offset == -16);
+    CHECK(dsq->locals[2].stack_offset == -24);
+}
+
+TEST_CASE("rsm::Reader procedure scan does not double-count locals as globals") {
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kTwoUnits));
+
+    // No variable's file_offset should fall inside a procedure record's
+    // [file_offset, file_offset_end) byte range. (The variable scanner
+    // explicitly skips those regions via isInsideProcedure().)
+    //
+    // Caveat: locals belonging to procedures the scanner FAILED to parse
+    // (e.g. compiler-generated unit-init / Finalization with a different
+    // body layout) may still surface as globals -- that's a scanner gap,
+    // not a dedup bug. This test only asserts the dedup contract for
+    // procedures we successfully recognised.
+    for (const auto& v : r.variables()) {
+        for (const auto& p : r.procedures()) {
+            const bool inside = (v.file_offset >= p.file_offset &&
+                                 v.file_offset <  p.file_offset_end);
+            CHECK_FALSE(inside);
+        }
+    }
+}
+
 TEST_CASE("rsm::Reader rejects bad magic") {
     // Synthesize an in-memory bad file via a temp on disk would be
     // overkill; the helper code path is exercised by the strict

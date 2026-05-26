@@ -16,14 +16,19 @@ namespace rsm2pdb::rsm {
 
 namespace {
 
-constexpr std::uint8_t kRecordTagPrimitive = 0x2A;
-constexpr std::uint8_t kRecordTagVariable  = 0x20;
-constexpr std::uint8_t kRecordTerminator   = 0xFF;
-constexpr std::uint8_t kTypeIdMarker0      = 0x9C;
-constexpr std::uint8_t kTypeIdMarker1      = 0x13;
-constexpr std::uint8_t kVarPayloadSubTag0  = 0x66;
-constexpr std::uint8_t kVarTrailerMarker0  = 0x9C;
-constexpr std::uint8_t kVarTrailerMarker1  = 0x09;
+constexpr std::uint8_t kRecordTagPrimitive  = 0x2A;
+constexpr std::uint8_t kRecordTagVariable   = 0x20;
+constexpr std::uint8_t kRecordTagParam      = 0x21;
+constexpr std::uint8_t kRecordTagFunction   = 0x28;
+constexpr std::uint8_t kFunctionEndMarker   = 0x63;
+constexpr std::uint8_t kFunctionSubTag0     = 0xA0;   // vs vars' 0x66
+constexpr std::uint8_t kRecordTerminator    = 0xFF;
+constexpr std::uint8_t kTypeIdMarker0       = 0x9C;
+constexpr std::uint8_t kTypeIdMarker1       = 0x13;
+constexpr std::uint8_t kVarPayloadSubTag0   = 0x66;
+constexpr std::uint8_t kVarPayloadSubTagNP  = 0x62;   // non-primitive variant
+constexpr std::uint8_t kVarTrailerMarker0   = 0x9C;
+constexpr std::uint8_t kVarTrailerMarker1   = 0x09;
 
 std::uint32_t readU32LE(const char* p) {
     return  static_cast<std::uint8_t>(p[0])
@@ -242,6 +247,13 @@ bool Reader::open(const std::string& path) {
     // hits on the bare 0x20 byte are very common, so we anchor on
     // the full 7+ byte signature plus a printable-ASCII name to
     // keep the false-positive rate negligible.
+    //
+    // Tag 0x20 ALSO denotes local-variable sub-records inside function
+    // records. To avoid double-counting them as globals, we skip any
+    // offsets that fall inside a procedure record's body (procedures_
+    // is populated by the scan below, which we run FIRST -- see the
+    // re-entry note at the bottom of open()). Until that runs, this
+    // skip list is empty and the var scan picks up everything.
     auto isPrintableName = [](const char* p, std::size_t n) {
         for (std::size_t i = 0; i < n; ++i) {
             const auto c = static_cast<unsigned char>(p[i]);
@@ -253,6 +265,109 @@ bool Reader::open(const std::string& path) {
         return true;
     };
 
+    // Step 1: scan procedures FIRST so we can skip their inner bytes.
+    // (Body code lives below the variable-scan loop; we duplicate the
+    //  proc-scan logic here to keep flow linear.)
+    auto scanProcedures = [&]() {
+        const std::size_t pscanStart = std::min<std::size_t>(0x426, buf.size());
+        std::size_t pi = pscanStart;
+        while (pi + 16 < buf.size()) {
+            if (static_cast<std::uint8_t>(buf[pi]) != kRecordTagFunction) {
+                ++pi;
+                continue;
+            }
+            const auto fnameLen = static_cast<std::uint8_t>(buf[pi + 1]);
+            if (fnameLen == 0 || fnameLen > 64) { ++pi; continue; }
+            const std::size_t fnameStart = pi + 2;
+            const std::size_t headEnd    = fnameStart + fnameLen;
+            if (headEnd + 14 >= buf.size()) { ++pi; continue; }
+            if (static_cast<std::uint8_t>(buf[headEnd])     != kFunctionSubTag0 ||
+                static_cast<std::uint8_t>(buf[headEnd + 1]) != 0x00 ||
+                static_cast<std::uint8_t>(buf[headEnd + 2]) != 0x00) {
+                ++pi;
+                continue;
+            }
+            if (!isPrintableName(buf.data() + fnameStart, fnameLen)) {
+                ++pi;
+                continue;
+            }
+
+            const std::uint32_t shifted = readU32LE(buf.data() + headEnd + 7);
+            const std::uint64_t va = static_cast<std::uint64_t>(shifted) >> 4;
+
+            ProcedureRecord proc;
+            proc.name        = std::string(buf.data() + fnameStart, fnameLen);
+            proc.address     = va;
+            proc.file_offset = pi;
+
+            std::size_t s = headEnd + 16;
+            bool ok = true;
+            while (s < buf.size()) {
+                const auto tag = static_cast<std::uint8_t>(buf[s]);
+                if (tag == kFunctionEndMarker) { ++s; break; }
+                if (tag != kRecordTagParam && tag != kRecordTagVariable) {
+                    ok = false;
+                    break;
+                }
+                if (s + 4 >= buf.size()) { ok = false; break; }
+                const auto nlen = static_cast<std::uint8_t>(buf[s + 1]);
+                if (nlen == 0 || nlen > 32) { ok = false; break; }
+                if (s + 2 + nlen + 5 >= buf.size()) { ok = false; break; }
+
+                const std::size_t bodyAt = s + 2 + nlen;
+                const auto t0 = static_cast<std::uint8_t>(buf[bodyAt]);
+                if (t0 != kVarPayloadSubTag0 && t0 != kVarPayloadSubTagNP) {
+                    ok = false; break;
+                }
+                if (static_cast<std::uint8_t>(buf[bodyAt + 1]) != 0 ||
+                    static_cast<std::uint8_t>(buf[bodyAt + 2]) != 0) {
+                    ok = false; break;
+                }
+                const auto marker = static_cast<std::uint8_t>(buf[bodyAt + 3]);
+                const auto offRaw = static_cast<std::int8_t>(buf[bodyAt + 4]);
+
+                Variable sv{};
+                sv.name           = std::string(buf.data() + s + 2, nlen);
+                sv.address        = 0;
+                sv.stack_offset   = static_cast<std::int32_t>(offRaw);
+                sv.type_marker    = marker;
+                sv.is_primitive   = (t0 == kVarPayloadSubTag0);
+                sv.has_trailer    = false;
+                sv.inline_type_id = sv.is_primitive ? 0 : marker;
+                sv.trailer_type_id = 0;
+                sv.file_offset    = s;
+
+                if (tag == kRecordTagParam) {
+                    proc.params.push_back(std::move(sv));
+                } else {
+                    proc.locals.push_back(std::move(sv));
+                }
+                s = bodyAt + 5;
+            }
+
+            if (ok) {
+                proc.file_offset_end = s;
+                procedures_.push_back(std::move(proc));
+                pi = s;
+            } else {
+                ++pi;
+            }
+        }
+    };
+    scanProcedures();
+
+    // Quick predicate: does the given file offset fall inside any
+    // procedure record we just parsed?  procedures_ is in increasing
+    // file_offset order by construction.
+    auto isInsideProcedure = [&](std::size_t off) {
+        for (const auto& p : procedures_) {
+            if (off >= p.file_offset && off < p.file_offset_end)
+                return true;
+            if (p.file_offset > off) break;
+        }
+        return false;
+    };
+
     const std::size_t vscanStart = std::min<std::size_t>(0x426, buf.size());
     std::size_t i = vscanStart;
     while (i + 8 < buf.size()) {
@@ -260,6 +375,7 @@ bool Reader::open(const std::string& path) {
             ++i;
             continue;
         }
+        if (isInsideProcedure(i)) { ++i; continue; }
         const auto nameLen = static_cast<std::uint8_t>(buf[i + 1]);
         if (nameLen == 0 || nameLen > 64) { ++i; continue; }
         const std::size_t nameStart = i + 2;
@@ -305,6 +421,7 @@ bool Reader::open(const std::string& path) {
             const std::uint32_t shifted = readU32LE(buf.data() + payloadAt + 1);
             v.type_marker = b0;
             v.address     = static_cast<std::uint64_t>(shifted) >> 4;
+            v.stack_offset = 0;
             v.is_primitive = true;
             v.inline_type_id = 0;
 
@@ -331,6 +448,7 @@ bool Reader::open(const std::string& path) {
                               | (static_cast<std::uint8_t>(buf[payloadAt + 1]) << 8);
             const std::uint32_t shifted = readU32LE(buf.data() + payloadAt + 2);
             v.address       = static_cast<std::uint64_t>(shifted) >> 4;
+            v.stack_offset  = 0;
             v.is_primitive  = false;
             v.has_trailer   = false;
             v.type_marker   = 0;
@@ -353,6 +471,13 @@ const Primitive* Reader::findPrimitive(const std::string& name) const {
 const Variable* Reader::findVariableAt(std::uint64_t address) const {
     for (const auto& v : variables_) {
         if (v.address == address) return &v;
+    }
+    return nullptr;
+}
+
+const ProcedureRecord* Reader::findProcedureAt(std::uint64_t address) const {
+    for (const auto& p : procedures_) {
+        if (p.address == address) return &p;
     }
     return nullptr;
 }
@@ -449,8 +574,40 @@ void Reader::dump(std::FILE* out) const {
                          static_cast<unsigned long long>(v.file_offset));
         }
     }
+    // ---- Procedures ---------------------------------------------------
+    std::size_t pshown = 0;
+    for (const auto& p : procedures_) {
+        if (p.address >= kVaLo && p.address < kVaHi) ++pshown;
+    }
+    std::fprintf(out, "Procedures: %zu found (%zu in plausible VA range)\n",
+                 procedures_.size(), pshown);
+    if (pshown > 0) {
+        std::fprintf(out, "  %-32s %-16s %-6s %-6s @offset\n",
+                     "name", "address", "params", "locals");
+        for (const auto& p : procedures_) {
+            if (p.address < kVaLo || p.address >= kVaHi) continue;
+            std::fprintf(out, "  %-32s 0x%014llx %-6zu %-6zu @0x%llx\n",
+                         p.name.c_str(),
+                         static_cast<unsigned long long>(p.address),
+                         p.params.size(), p.locals.size(),
+                         static_cast<unsigned long long>(p.file_offset));
+            for (const auto& v : p.params) {
+                std::fprintf(out, "    param %-20s marker=0x%02x off=%+d %s\n",
+                             v.name.c_str(), v.type_marker,
+                             v.stack_offset,
+                             v.is_primitive ? "(primitive)" : "(byref)");
+            }
+            for (const auto& v : p.locals) {
+                std::fprintf(out, "    local %-20s marker=0x%02x off=%+d %s\n",
+                             v.name.c_str(), v.type_marker,
+                             v.stack_offset,
+                             v.is_primitive ? "(primitive)" : "(byref)");
+            }
+        }
+    }
+
     std::fprintf(out,
-                 "(metadata stream at 0x%08x: header + primitives + variables parsed)\n",
+                 "(metadata stream at 0x%08x: header + primitives + variables + procedures parsed)\n",
                  header_.metadata_start);
 }
 
@@ -567,6 +724,67 @@ void decorateTypes(const Reader& reader, model::Module& mod) {
             std::uint64_t n = (next > s->address) ? (next - s->address) : 1;
             if (n == 0) n = 1;
             s->type = byteArrayOfSize(n);
+        }
+
+        // -- Procedure params + locals -------------------------------------
+        //
+        // For each function Symbol in this CU, look up its procedure
+        // record in the RSM by VA. Then map each param/local's per-unit
+        // type_marker -> TypeId, reusing the same marker->type table we
+        // built for globals where available. For markers not seen among
+        // globals (e.g. Geometry has only procedures, no globals at all)
+        // fall back to Integer (4-byte signed) for primitives and
+        // byte[8] for non-primitives.
+        //
+        // Build a marker->TypeId map from the just-processed globals.
+        std::map<std::uint8_t, model::TypeId> marker_to_type;
+        for (const auto& [marker, syms] : by_marker) {
+            if (!syms.empty()) marker_to_type[marker] = syms.front()->type;
+        }
+        model::TypeId default_primitive_id = model::kNoType;
+        auto integerType = [&]() {
+            if (default_primitive_id == model::kNoType) {
+                default_primitive_id = mod.addType(
+                    model::Type{model::PrimitiveType{model::PrimitiveKind::Int32}});
+            }
+            return default_primitive_id;
+        };
+
+        auto resolveParamLocalType = [&](const Variable& v) -> model::TypeId {
+            if (v.is_primitive) {
+                auto it = marker_to_type.find(v.type_marker);
+                if (it != marker_to_type.end()) return it->second;
+                return integerType();   // unit has no global of this marker
+            } else {
+                // Records / classes / enums: byte[N] fallback. We don't
+                // know N for params/locals at this stage -- default to
+                // a sensible 8 bytes which fits TPoint and most small
+                // records. Refine later when we decode aggregate types.
+                return byteArrayOfSize(8);
+            }
+        };
+
+        for (auto& s : cu.symbols) {
+            if (s.kind != model::SymbolKind::Function) continue;
+            const auto* proc = reader.findProcedureAt(s.address);
+            if (!proc) continue;
+
+            s.params.reserve(proc->params.size());
+            for (const auto& pv : proc->params) {
+                model::LocalVar lv;
+                lv.name         = pv.name;
+                lv.type         = resolveParamLocalType(pv);
+                lv.stack_offset = pv.stack_offset;
+                s.params.push_back(std::move(lv));
+            }
+            s.locals.reserve(proc->locals.size());
+            for (const auto& lvar : proc->locals) {
+                model::LocalVar lv;
+                lv.name         = lvar.name;
+                lv.type         = resolveParamLocalType(lvar);
+                lv.stack_offset = lvar.stack_offset;
+                s.locals.push_back(std::move(lv));
+            }
         }
     }
 }
