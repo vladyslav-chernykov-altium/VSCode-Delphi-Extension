@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rsm2pdb::rsm {
@@ -152,6 +153,10 @@ private:
     std::vector<Variable>        variables_;
     std::vector<ProcedureRecord> procedures_;
     std::string                  error_;
+    // VA -> index into variables_ / procedures_, built once after scanning.
+    // Speeds up findVariableAt / findProcedureAt from O(N) to O(1).
+    std::unordered_map<std::uint64_t, std::size_t> var_by_va_;
+    std::unordered_map<std::uint64_t, std::size_t> proc_by_va_;
 };
 
 // Decorate a populated model::Module with type information derived

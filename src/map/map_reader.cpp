@@ -9,6 +9,9 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace rsm2pdb::map {
 
@@ -389,30 +392,85 @@ void populate(const MapFile& mf, model::Module& mod) {
         return static_cast<std::uint32_t>(mod.source_files.size() - 1);
     };
 
-    // Group line tables by source file -> CompileUnit.
-    // (A CompileUnit corresponds to a Delphi unit; the .map gives us
-    // one line table per (module, source, segment) triple.)
-    for (const auto& lt : mf.line_tables) {
+    // Assign each public to EXACTLY ONE CompileUnit by finding the
+    // LONGEST registered-unit-name prefix in its dotted Pascal name.
+    //
+    // Without dedup, a public like "App.Colors.ColorName" gets added
+    // to BOTH a (hypothetical) "App" unit AND the "App.Colors" unit,
+    // blowing up the model. Real-world example: Altium's 946k-public
+    // .map produced 54 MILLION symbols (~57x dup) with the naive
+    // matching.
+    //
+    // Algorithm:
+    //   pass 1: build module-name set from line_tables; bucket publics
+    //           by their longest-matching module prefix.
+    //   pass 2: iterate line tables, pull just their bucket.
+    //
+    // Cost: O(publics * max_dots) which is essentially O(publics).
+    std::unordered_set<std::string> module_names;
+    module_names.reserve(mf.line_tables.size() * 2);
+    for (const auto& lt : mf.line_tables) module_names.insert(lt.module_name);
+
+    std::unordered_map<std::string, std::vector<std::size_t>> publics_by_module;
+    publics_by_module.reserve(module_names.size());
+    for (std::size_t i = 0; i < mf.publics.size(); ++i) {
+        const auto& name = mf.publics[i].name;
+        // Walk dot positions from rightmost (= longest prefix) to left.
+        auto pos = name.rfind('.');
+        while (pos != std::string::npos) {
+            std::string prefix = name.substr(0, pos);
+            if (module_names.count(prefix)) {
+                publics_by_module[std::move(prefix)].push_back(i);
+                break;
+            }
+            if (pos == 0) break;
+            pos = name.rfind('.', pos - 1);
+        }
+        // Unmatched publics (e.g. linker-internal $hash$ symbols not
+        // tied to any unit) are silently dropped.
+    }
+
+    // Group line tables by module_name. The .map emits one line table
+    // per (module, source, segment) triple, so the same module shows
+    // up in multiple entries (e.g. .text + .data + .pdata). Without
+    // collapsing them, publics get re-added once per line-table-of-
+    // this-module and symbol counts explode (~57x on Altium AdvPCB).
+    std::unordered_map<std::string, std::vector<std::size_t>> lts_by_module;
+    lts_by_module.reserve(module_names.size());
+    std::vector<std::string> module_order;
+    module_order.reserve(module_names.size());
+    for (std::size_t i = 0; i < mf.line_tables.size(); ++i) {
+        const auto& m = mf.line_tables[i].module_name;
+        auto [it, inserted] = lts_by_module.try_emplace(m);
+        if (inserted) module_order.push_back(m);
+        it->second.push_back(i);
+    }
+
+    for (const auto& module_name : module_order) {
+        const auto& lt_indices = lts_by_module.at(module_name);
         model::CompileUnit cu;
-        cu.source_path = lt.source_path;
-        std::uint32_t file_id = sourceFileId(lt.source_path);
-        for (const auto& l : lt.lines) {
-            model::LineEntry le;
-            le.address = resolveVA(mf, l.segment_id, l.segment_offset);
-            le.file_id = file_id;
-            le.line    = l.line;
-            cu.lines.push_back(le);
+        cu.source_path = mf.line_tables[lt_indices.front()].source_path;
+        const std::uint32_t file_id = sourceFileId(cu.source_path);
+        for (std::size_t idx : lt_indices) {
+            const auto& lt_i = mf.line_tables[idx];
+            for (const auto& l : lt_i.lines) {
+                model::LineEntry le;
+                le.address = resolveVA(mf, l.segment_id, l.segment_offset);
+                le.file_id = file_id;
+                le.line    = l.line;
+                cu.lines.push_back(le);
+            }
         }
 
-        // Public symbols whose name starts with "<module>." belong
-        // to this CU. We keep the full Delphi-qualified name (e.g.
-        // "Geometry.Add") so stack traces and `break X.Y` work as
-        // users expect. We also filter out linker-generated EH
-        // metadata symbols ($pdata$ / $unwind$) and anonymous
-        // compiler-internal symbols (".N" pattern), which aren't
-        // user code.
-        const std::string prefix = lt.module_name + ".";
-        for (const auto& p : mf.publics) {
+        // Public symbols belonging to this module.
+        const std::string prefix = module_name + ".";
+        const auto bIt = publics_by_module.find(module_name);
+        if (bIt != publics_by_module.end()) {
+        for (std::size_t idx : bIt->second) {
+            const auto& p = mf.publics[idx];
+            // Bucketing already guarantees this public's longest
+            // module-name prefix equals lt.module_name. Still safe to
+            // re-check the literal prefix to handle edge cases.
             if (p.name.rfind(prefix, 0) != 0) continue;
             const std::string local = p.name.substr(prefix.size());
             if (local.empty()) continue;
@@ -451,6 +509,7 @@ void populate(const MapFile& mf, model::Module& mod) {
             s.name = (s.kind == model::SymbolKind::Variable) ? local : p.name;
 
             cu.symbols.push_back(std::move(s));
+        }
         }
 
         mod.units.push_back(std::move(cu));

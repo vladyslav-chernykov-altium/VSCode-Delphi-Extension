@@ -458,6 +458,19 @@ bool Reader::open(const std::string& path) {
         }
     }
 
+    // Build VA -> index maps for O(1) lookup. Skipping addresses below
+    // the legacy image base catches the bogus VAs that the variable
+    // scanner picks up from procedure-internal byte sequences.
+    var_by_va_.reserve(variables_.size());
+    for (std::size_t k = 0; k < variables_.size(); ++k) {
+        const auto& v = variables_[k];
+        if (v.address >= 0x00400000) var_by_va_.emplace(v.address, k);
+    }
+    proc_by_va_.reserve(procedures_.size());
+    for (std::size_t k = 0; k < procedures_.size(); ++k) {
+        proc_by_va_.emplace(procedures_[k].address, k);
+    }
+
     return true;
 }
 
@@ -469,17 +482,13 @@ const Primitive* Reader::findPrimitive(const std::string& name) const {
 }
 
 const Variable* Reader::findVariableAt(std::uint64_t address) const {
-    for (const auto& v : variables_) {
-        if (v.address == address) return &v;
-    }
-    return nullptr;
+    auto it = var_by_va_.find(address);
+    return it == var_by_va_.end() ? nullptr : &variables_[it->second];
 }
 
 const ProcedureRecord* Reader::findProcedureAt(std::uint64_t address) const {
-    for (const auto& p : procedures_) {
-        if (p.address == address) return &p;
-    }
-    return nullptr;
+    auto it = proc_by_va_.find(address);
+    return it == proc_by_va_.end() ? nullptr : &procedures_[it->second];
 }
 
 void Reader::dump(std::FILE* out) const {
@@ -542,8 +551,12 @@ void Reader::dump(std::FILE* out) const {
     // record byte pattern) — filtering by VA keeps the report scoped
     // to the records the user actually cares about. The full unfiltered
     // vector is still available via variables() for cross-referencing.
-    constexpr std::uint64_t kVaLo = 0x00400000;   // Win64 image base lo bound
-    constexpr std::uint64_t kVaHi = 0x00800000;   // 4 MB above base; locals decode to huge "VAs" and are filtered
+    // VA range covering small Delphi projects (a few MB) up through
+    // large DLLs like AdvPCB (~100 MB of code). The bogus VAs that the
+    // variable scanner picks up from procedure-internal byte sequences
+    // typically land in the gigabyte range, well above this cap.
+    constexpr std::uint64_t kVaLo = 0x00400000;   // Win64 default image base
+    constexpr std::uint64_t kVaHi = 0x40000000;   // 1 GB cap
     std::size_t shown = 0;
     for (const auto& v : variables_) {
         if (v.address >= kVaLo && v.address < kVaHi) ++shown;
