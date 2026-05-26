@@ -892,6 +892,183 @@ Raw bytes:
 
 
 ================================================================================
+  2026-05-26  Real-world scale: proc-record format revisited (AdvPCB)
+================================================================================
+
+Context: M2 phase A worked on the small Geometry.Add / DistanceSq fixtures
+but the original parser only recovered ~6,473 procs out of ~301,829 .map
+function symbols on Altium AdvPCB (160 MB DLL, 575 MB .rsm).
+Investigation via three new diagnostic subcommands:
+  rsm2pdb diff-procs    -- VA-cross-check rsm procs vs .map function syms
+  rsm2pdb probe-procs   -- hex dump + decode for stratified missing procs
+  rsm2pdb analyze-procs -- single-pass histograms (proc subtag,
+                           trailer length, sub-record subtag) over the
+                           whole file
+
+Findings revealed four independent reasons the original parser was
+discarding 98% of legitimate proc records.
+
+[FACT]   Proc-record post-name sub-tag is variable. Not always 0xA0.
+         Histogram from AdvPCB (134,186 VA-confirmed proc candidates):
+            0xA0  98.08%  -- normal function
+            0xE0   1.46%  -- mostly RTL allocator/intrinsic helpers
+                             (SysGetMem, SysAllocMem, ...)
+            0x80   0.40%  -- inline / static? (e.g. WriteMemoryInt32)
+            other  0.06%  -- byte-level false-positive noise
+         Application rule: accept {0xA0, 0xE0, 0x80}.
+
+[FACT]   The "head" between the name+subtag+00+00+hash(4)+VA(4) and the
+         first sub-record is VARIABLE LENGTH. We had hard-coded
+         `s = headEnd + 16` (i.e. trailer assumed to be exactly 5 bytes
+         after VA). Reality:
+            trailer len   AdvPCB share
+            -----------   ------------
+                  7         27.3 %
+                  6         25.9 %
+                  5         16.4 %   <-- the only one the old parser
+                                          accepted
+                  8         14.6 %
+                  9          5.5 %
+                  10         1.5 %
+                  3..30      ~9 %    (long tail; max observed ~30)
+         Application rule: scan-forward up to ~64 bytes from
+         (name_end + 11) looking for EITHER a valid sub-record start
+         (0x20/0x21 + 1..32 namelen + printable Pascal name + the
+         double-zero invariant at the right offset) OR a real 0x63 end
+         marker (one whose following byte is a recognizable record
+         tag: 0x28 / 0x20 / 0x2A / 0xFF / 0x9C). A bare 0x63 inside
+         the trailer is a common false positive and must be filtered
+         by checking the byte after it.
+
+[FACT]   Sub-record subtag is NOT just {0x66, 0x62}. Histogram of
+         215k sub-records on AdvPCB:
+            0x66  56.4%  primitive-ish, the only one we accepted
+            0x16  26.0%
+            0x26   8.3%
+            0x62   5.0%  non-primitive-ish, also accepted
+            0x12   1.9%
+            0x22   1.3%
+            0x06   0.6%
+            tail   0.5%  (~10 more values)
+         The strong invariant is the TWO zero bytes immediately AFTER
+         the subtag byte; the subtag value itself is variable (almost
+         certainly encodes type-class / by-ref / register-class
+         attributes we don't yet decode). Application rule: accept any
+         byte at subtag position; require buf[bodyAt+1] == 0 and
+         buf[bodyAt+2] == 0.
+
+         Examples of non-0x66 sub-records (from real proc records, all
+         valid):
+            System.@Abs:
+              21 03 "Val"    16 00 00 24 20   <- param Val   subtag 0x16
+              20 06 "Result" 06 00 00 24 00   <- local Result subtag 0x06
+            Set8087CW:
+              21 05 "NewCW"  16 00 00 10 02   <- param NewCW subtag 0x16
+
+[FACT]   Some proc records carry sub-records with tags 0x23 / 0x25
+         AFTER the param/local list. Empirically these encode return-
+         value metadata and enum-entry definitions (e.g. for a function
+         returning an inline enum). They DON'T fit the fixed 5-byte
+         payload format. Application rule: on any tag != 0x20/0x21/0x63
+         inside the walk, stop GRACEFULLY (keep the params/locals we
+         already collected) instead of discarding the whole proc.
+
+         Example: PCBCommands_PCB.TPCBCommands.FileSave (override,
+         returns an inline enum):
+            ... 21 04 "Self" ...
+            ... 20 (var) "AInExport" ...
+            ... 21 05 "AKind" 62 00 00 0a 40
+            23 06 "Result" cd 02 00 00 04 50   <- 0x23: return-value descriptor
+            25 06 "eASCII" 0a 00 00 e1 04 ...  <- 0x25: first enum entry
+            25 08 "eBinary3" 0a ...            <- enum entry
+            25 08 "eBinary4" 0a ...
+            ...
+
+[FACT]   Between two consecutive sub-records there can be a 1-2 byte
+         padding / attribute prefix (probably encodes `var` / `out` /
+         `const` parameter qualifiers). Without this allowance our
+         scanner aligned to `bodyAt + 5` and read garbage as the next
+         tag. Example, FileSave Self -> AInExport:
+            21 04 "Self" 66 00 00 05 04  <- Self ends at +5 byte 0x04
+            20                            <- could be local tag, but
+                                             buf[+1] = 0x21 = nlen 33
+                                             which fails name check
+                                             (bytes 0x21 0x09 are not
+                                             printable Pascal name)
+            21 09 "AInExport" 66 ...     <- the REAL next sub-record
+                                            starts 1 byte later
+         Application rule: between sub-records, scan-forward 0..6 bytes
+         for the next valid sub-record signature (same validation as
+         the initial trailer scan). The 0x20 byte at offset 0 here is
+         probably a `var`/`out` qualifier; we currently skip past it
+         without preserving the attribute.
+
+[FACT]   Proc-record NAMES often contain `@` (RTL helpers like
+         System.@Abs, System.@DllMain, ...). Need to widen the Pascal-
+         identifier set used for printable-name validation.
+
+[QUESTION] What do the trailer bytes between VA and the first
+         sub-record encode? Hypotheses (untested):
+         - Return-type marker (for functions, encoded as a short
+           composite). Explains "trailer of 5 bytes" being typical
+           for return-typed functions but other lengths for procedures
+           and/or overrides.
+         - Calling-convention / linkage flags.
+         - Source-line range / scope info.
+         Deferred. We don't need to decode it to recover the proc.
+
+[QUESTION] Override method's `Self` stack offset is encoded as
+         RSM `off=+4` -> decoded by our formula `(off/2)+16` to
+         rbp+18. That's misaligned and non-standard. For non-override
+         methods (e.g. TControlsHookData.UsingStandardAtoms) Self has
+         RSM off=+32 -> rbp+48, which is consistent with the Delphi
+         convention discovered in M2-phase-A (args spilled starting
+         at rbp+32, NOT the MS-x64 rbp+16). It's plausible that the
+         off=+4 byte for override-methods' Self is a SENTINEL value
+         meaning "Self lives at rbp+8 / passed in RCX, not spilled"
+         rather than a literal stack offset. Either:
+           - We should special-case Self in overrides (display location
+             differently) and trust the rsm off only for non-Self
+             params.
+           - Or the RSM has a `virtual/override` discriminator we
+             haven't decoded that flips the offset interpretation.
+         Behavior today: Self for override methods shows up in the
+         Variables panel but its displayed value is wrong. Locals
+         and non-Self params are correct.
+
+[FACT]   Pre-existing .debug_* sections in the input PE are a real
+         hazard. The PE injector now RENAMES any incoming .debug_*
+         sections to ".old_dw" before appending the fresh ones.
+         Without this, the injected file ends up with two .debug_info
+         sections, gdb reads the FIRST one (stale), and reports
+         "no locals or arguments" even when our new DWARF correctly
+         carries them. See src/pe/pe_injector.cpp.
+
+----- Net impact -----
+
+Before  rsm2pdb diff-procs AdvPCB.{map,rsm}:
+  matched (VA):    6,448 (2.1% of map functions)
+  walk failures:   non-applicable (single rigid format)
+
+After:
+  matched (VA):    125,732 (41.7% of map functions)
+  walk failures:   0   (all candidate procs walked to completion)
+  rsm procs:       159,462 (24.6x improvement)
+
+The 58% of map functions still without an rsm proc record are
+compiler-generated stubs / RTTI helpers / destructors that
+genuinely don't get a proc-record in the .rsm.
+
+End-to-end verification via gdb on injected AdvPCB.dll:
+  PCBCommands_PCB.TPCBCommands.FileSave  -> Self, AInExport, AKind
+  PCBCommands_PCB.TPCBCommands.Create    -> Self, ., ADocumentInterface
+  PCBCommands_PCB.TPCBCommands.AutoRoute -> Self, View, Parameters +
+                                            6 locals (RecordTestResults,
+                                            ShowDebugView, Mode, Status,
+                                            ReportLocation, BaseGrid)
+
+
+================================================================================
   GLOSSARY (terms we keep using)
 ================================================================================
 

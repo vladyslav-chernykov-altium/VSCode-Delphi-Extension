@@ -21,7 +21,14 @@ constexpr std::uint8_t kRecordTagVariable   = 0x20;
 constexpr std::uint8_t kRecordTagParam      = 0x21;
 constexpr std::uint8_t kRecordTagFunction   = 0x28;
 constexpr std::uint8_t kFunctionEndMarker   = 0x63;
+// Post-name sub-tag of a function record; bit-flag-like, encodes some
+// per-function attribute we don't decode (likely virtual/static/inline
+// or calling convention). Empirically the top three values are 0xA0
+// (~98%), 0xE0 (~1.5%, RTL allocators), 0x80 (~0.4%). Other values
+// (~0.06%) appear to be byte-level false positives.
 constexpr std::uint8_t kFunctionSubTag0     = 0xA0;   // vs vars' 0x66
+constexpr std::uint8_t kFunctionSubTag1     = 0xE0;
+constexpr std::uint8_t kFunctionSubTag2     = 0x80;
 constexpr std::uint8_t kRecordTerminator    = 0xFF;
 constexpr std::uint8_t kTypeIdMarker0       = 0x9C;
 constexpr std::uint8_t kTypeIdMarker1       = 0x13;
@@ -257,17 +264,38 @@ bool Reader::open(const std::string& path) {
     auto isPrintableName = [](const char* p, std::size_t n) {
         for (std::size_t i = 0; i < n; ++i) {
             const auto c = static_cast<unsigned char>(p[i]);
-            // Allow Pascal identifier chars (incl. dot for qualified
-            // names, dollar/underscore for compiler-internal ones).
-            if (!(std::isalnum(c) || c == '_' || c == '.' || c == '$'))
+            // Pascal identifier chars (incl. '.' for qualified names,
+            // '$' / '_' for compiler-internal ones, '@' for RTL helpers
+            // like System.@Abs).
+            if (!(std::isalnum(c) || c == '_' || c == '.'
+                  || c == '$' || c == '@'))
                 return false;
         }
         return true;
     };
 
     // Step 1: scan procedures FIRST so we can skip their inner bytes.
-    // (Body code lives below the variable-scan loop; we duplicate the
-    //  proc-scan logic here to keep flow linear.)
+    //
+    // Format (validated against real-world RSMs, see docs/02-rsm-format-notes.md
+    // and the empirical histograms produced by `rsm2pdb analyze-procs`):
+    //
+    //   0x28 <namelen u8> <name>
+    //   <sub-tag {0xA0,0xE0,0x80}> 0x00 0x00
+    //   <hash u32> <shifted_va u32>
+    //   <variable-length trailer 3..30 bytes; not decoded yet>
+    //   sub-records ... (zero or more)
+    //   0x63                                            -- record-end marker
+    //
+    // Sub-record (param tag 0x21 / local tag 0x20):
+    //   <tag> <namelen> <name>
+    //   <subtag> 0x00 0x00 <marker u8> <stack_offset i8>      -- 5-byte payload
+    //
+    // The sub-record subtag varies (0x66/0x16/0x26/0x62/0x12/0x22/...).
+    // The strong invariant is the two 0x00 bytes at offsets +1,+2 after
+    // the subtag; we anchor on that, not on the subtag value itself.
+    // is_primitive is heuristically `subtag == 0x66`.
+    procedures_.reserve(150000);
+    std::size_t rej_subtag = 0, rej_name = 0, rej_no_subrec = 0, rej_walk = 0;
     auto scanProcedures = [&]() {
         const std::size_t pscanStart = std::min<std::size_t>(0x426, buf.size());
         std::size_t pi = pscanStart;
@@ -277,74 +305,156 @@ bool Reader::open(const std::string& path) {
                 continue;
             }
             const auto fnameLen = static_cast<std::uint8_t>(buf[pi + 1]);
-            if (fnameLen == 0 || fnameLen > 64) { ++pi; continue; }
+            if (fnameLen < 2 || fnameLen > 200) { ++pi; continue; }
             const std::size_t fnameStart = pi + 2;
             const std::size_t headEnd    = fnameStart + fnameLen;
             if (headEnd + 14 >= buf.size()) { ++pi; continue; }
-            if (static_cast<std::uint8_t>(buf[headEnd])     != kFunctionSubTag0 ||
+            const auto fnSubTag = static_cast<std::uint8_t>(buf[headEnd]);
+            if ((fnSubTag != kFunctionSubTag0
+                 && fnSubTag != kFunctionSubTag1
+                 && fnSubTag != kFunctionSubTag2) ||
                 static_cast<std::uint8_t>(buf[headEnd + 1]) != 0x00 ||
                 static_cast<std::uint8_t>(buf[headEnd + 2]) != 0x00) {
                 ++pi;
+                ++rej_subtag;
                 continue;
             }
             if (!isPrintableName(buf.data() + fnameStart, fnameLen)) {
                 ++pi;
+                ++rej_name;
                 continue;
             }
 
             const std::uint32_t shifted = readU32LE(buf.data() + headEnd + 7);
             const std::uint64_t va = static_cast<std::uint64_t>(shifted) >> 4;
 
+            // The trailer between the VA and the first sub-record (or
+            // end marker) is variable-length, 3..30 bytes empirically.
+            // Scan forward to locate either:
+            //   - a well-formed sub-record start (0x20/0x21 + valid
+            //     namelen + printable name + 0x00 0x00 at expected
+            //     offset), or
+            //   - a real 0x63 end marker (whose next byte starts a
+            //     recognizable record; bare 0x63 bytes inside the
+            //     trailer are common false positives).
+            const std::size_t scanFrom = headEnd + 11;
+            const std::size_t scanCap  = buf.size() > 8 ? buf.size() - 8 : 0;
+            const std::size_t scanTo   = std::min(scanFrom + 96, scanCap);
+            std::size_t firstSub = SIZE_MAX;
+            bool endedImmediately = false;
+            for (std::size_t t = scanFrom; t < scanTo; ++t) {
+                const auto tb = static_cast<std::uint8_t>(buf[t]);
+                if (tb == kRecordTagParam || tb == kRecordTagVariable) {
+                    const auto nl = static_cast<std::uint8_t>(buf[t + 1]);
+                    if (nl >= 1 && nl <= 64 && t + 2 + nl + 4 < buf.size()) {
+                        const std::size_t bodyAt = t + 2 + nl;
+                        if (static_cast<std::uint8_t>(buf[bodyAt + 1]) == 0 &&
+                            static_cast<std::uint8_t>(buf[bodyAt + 2]) == 0 &&
+                            isPrintableName(buf.data() + t + 2, nl)) {
+                            firstSub = t;
+                            break;
+                        }
+                    }
+                } else if (tb == kFunctionEndMarker && t + 1 < buf.size()) {
+                    const auto nx = static_cast<std::uint8_t>(buf[t + 1]);
+                    if (nx == kRecordTagFunction || nx == kRecordTagVariable ||
+                        nx == kRecordTagPrimitive || nx == kRecordTerminator ||
+                        nx == kTypeIdMarker0) {
+                        firstSub = t;
+                        endedImmediately = true;
+                        break;
+                    }
+                }
+            }
+            if (firstSub == SIZE_MAX) {
+                ++pi;
+                ++rej_no_subrec;
+                continue;
+            }
+
             ProcedureRecord proc;
             proc.name        = std::string(buf.data() + fnameStart, fnameLen);
             proc.address     = va;
             proc.file_offset = pi;
 
-            std::size_t s = headEnd + 16;
+            if (endedImmediately) {
+                proc.file_offset_end = firstSub + 1;
+                procedures_.push_back(std::move(proc));
+                pi = firstSub + 1;
+                continue;
+            }
+
+            std::size_t s = firstSub;
             bool ok = true;
-            while (s < buf.size()) {
+            while (s + 8 < buf.size()) {
+                // Between consecutive sub-records the encoding sometimes
+                // carries an extra 1-2 byte attribute/padding (e.g.
+                // `var` parameters in real Delphi binaries). Allow a
+                // small scan-forward to re-anchor on the next valid
+                // sub-record header or end marker. Without this we lose
+                // ~80k procs on AdvPCB.
+                const std::size_t reAnchorCap =
+                    std::min(s + 6, buf.size() > 8 ? buf.size() - 8 : 0);
+                while (s < reAnchorCap) {
+                    const auto tb = static_cast<std::uint8_t>(buf[s]);
+                    if (tb == kFunctionEndMarker && s + 1 < buf.size()) {
+                        const auto nx = static_cast<std::uint8_t>(buf[s + 1]);
+                        if (nx == kRecordTagFunction || nx == kRecordTagVariable ||
+                            nx == kRecordTagPrimitive || nx == kRecordTerminator ||
+                            nx == kTypeIdMarker0) {
+                            break;
+                        }
+                    }
+                    if (tb == kRecordTagParam || tb == kRecordTagVariable) {
+                        const auto nl = static_cast<std::uint8_t>(buf[s + 1]);
+                        if (nl >= 1 && nl <= 64 && s + 2 + nl + 4 < buf.size()) {
+                            const std::size_t bA = s + 2 + nl;
+                            if (static_cast<std::uint8_t>(buf[bA + 1]) == 0 &&
+                                static_cast<std::uint8_t>(buf[bA + 2]) == 0 &&
+                                isPrintableName(buf.data() + s + 2, nl)) {
+                                break;
+                            }
+                        }
+                    }
+                    ++s;
+                }
+                if (s + 8 >= buf.size()) break;  // EOF -- keep what we got
+
                 const auto tag = static_cast<std::uint8_t>(buf[s]);
                 if (tag == kFunctionEndMarker) { ++s; break; }
+                // Real Delphi RSMs use additional sub-record tags
+                // (e.g. 0x23 / 0x25) for return-value metadata and
+                // enum-entries. We don't decode them yet, so we stop
+                // the param/local walk gracefully on any unknown
+                // tag rather than discarding the whole proc.
                 if (tag != kRecordTagParam && tag != kRecordTagVariable) {
-                    ok = false;
                     break;
                 }
-                if (s + 4 >= buf.size()) { ok = false; break; }
                 const auto nlen = static_cast<std::uint8_t>(buf[s + 1]);
-                if (nlen == 0 || nlen > 32) { ok = false; break; }
-                if (s + 2 + nlen + 5 >= buf.size()) { ok = false; break; }
+                if (nlen == 0 || nlen > 64) break;
+                if (s + 2 + nlen + 5 >= buf.size()) break;
 
                 const std::size_t bodyAt = s + 2 + nlen;
                 const auto t0 = static_cast<std::uint8_t>(buf[bodyAt]);
-                if (t0 != kVarPayloadSubTag0 && t0 != kVarPayloadSubTagNP) {
-                    ok = false; break;
-                }
+                // The double-zero at +1,+2 is the strong invariant.
+                // The subtag itself varies widely; don't filter on it.
                 if (static_cast<std::uint8_t>(buf[bodyAt + 1]) != 0 ||
                     static_cast<std::uint8_t>(buf[bodyAt + 2]) != 0) {
-                    ok = false; break;
+                    break;
                 }
                 const auto marker = static_cast<std::uint8_t>(buf[bodyAt + 3]);
                 const auto offRaw = static_cast<std::int8_t>(buf[bodyAt + 4]);
 
-                // Validate name bytes: must be a printable Pascal
-                // identifier. Real-world RSMs can contain sub-records
-                // whose name bytes include NUL or non-printable chars
-                // (e.g. compiler-generated hidden parameters like
-                // `Self` for class methods). Those would corrupt our
-                // DWARF emission because DW_FORM_string truncates at
-                // the first NUL, shifting all subsequent fields and
-                // producing the cascading "Could not find abbrev N"
-                // errors seen in gdb. SKIP such sub-records but
-                // continue parsing the rest of this procedure.
                 bool name_ok = true;
                 for (std::uint8_t k = 0; k < nlen; ++k) {
                     const auto c = static_cast<unsigned char>(buf[s + 2 + k]);
-                    if (!(std::isalnum(c) || c == '_' || c == '.' || c == '$')) {
+                    if (!(std::isalnum(c) || c == '_' || c == '.'
+                          || c == '$' || c == '@')) {
                         name_ok = false; break;
                     }
                 }
                 if (!name_ok) {
-                    s = bodyAt + 5;   // skip this sub-record but stay in proc
+                    s = bodyAt + 5;
                     continue;
                 }
 
@@ -373,21 +483,31 @@ bool Reader::open(const std::string& path) {
                 pi = s;
             } else {
                 ++pi;
+                ++rej_walk;
             }
         }
     };
     scanProcedures();
+    std::fprintf(stderr,
+                 "[rsm] proc scan: %zu found "
+                 "(rejected subtag=%zu name=%zu no_sub=%zu walk=%zu)\n",
+                 procedures_.size(), rej_subtag, rej_name,
+                 rej_no_subrec, rej_walk);
 
     // Quick predicate: does the given file offset fall inside any
     // procedure record we just parsed?  procedures_ is in increasing
-    // file_offset order by construction.
+    // file_offset order by construction, so binary search is sound.
+    // (Linear search was fine with ~6k procs, but at 130k+ it dominated
+    //  the variable-scan loop.)
     auto isInsideProcedure = [&](std::size_t off) {
-        for (const auto& p : procedures_) {
-            if (off >= p.file_offset && off < p.file_offset_end)
-                return true;
-            if (p.file_offset > off) break;
-        }
-        return false;
+        auto it = std::upper_bound(
+            procedures_.begin(), procedures_.end(), off,
+            [](std::size_t v, const ProcedureRecord& p) {
+                return v < p.file_offset;
+            });
+        if (it == procedures_.begin()) return false;
+        --it;
+        return off < it->file_offset_end;
     };
 
     const std::size_t vscanStart = std::min<std::size_t>(0x426, buf.size());

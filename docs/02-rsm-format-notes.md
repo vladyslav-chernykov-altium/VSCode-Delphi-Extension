@@ -183,6 +183,100 @@ size derived from the `.map` next-symbol gap (1 byte → `Byte`, 2 →
 `Word`, 4 → `Integer`, 8 → `Int64`). Variables sharing a marker share
 a type, so even one sized example resolves all others.
 
+### Procedure record (tag `0x28`)
+
+```
+0x28  <namelen u8>  <pascal_name>
+      <fn_subtag u8>  0x00  0x00          (subtag ∈ {0xA0, 0xE0, 0x80})
+      <hash u32>  <shifted_va u32>        (VA decodes as stored >> 4)
+      <variable-length trailer 3..~30 bytes>
+      <sub-records ...>                   (zero or more 0x21/0x20)
+      0x63                                 (record-end marker)
+```
+
+The trailer between the VA and the first sub-record encodes return-
+type / calling-convention / attribute info that we don't yet decode.
+**Its length is not constant** — empirically 3 to ~30 bytes, with 5–8
+covering the bulk:
+
+| Trailer bytes | Share on Altium AdvPCB |
+|---:|---:|
+| 7 | 27 % |
+| 6 | 26 % |
+| 5 | 16 % |
+| 8 | 15 % |
+| 9 | 5 % |
+| 10 | 1.5 % |
+| 3, 4, 11..30 | ~9 % combined |
+
+The proper anchor for finding the first sub-record is therefore a
+bounded **scan-forward** from `name_end + 11` looking for a valid
+sub-record header or a real end marker.
+
+Sub-records are tag-prefixed; the param/local list uses two tags:
+
+| Tag | Kind |
+|---|---|
+| `0x21` | formal parameter |
+| `0x20` | local variable (includes `Result` for functions) |
+
+Payload after the name is a **fixed 5 bytes**:
+
+```
+<tag>  <namelen u8>  <pascal_name>  <subtag u8>  0x00  0x00  <type_marker u8>  <stack_offset i8>
+```
+
+**Sub-record subtag is variable.** Of 215k decoded sub-records on
+AdvPCB:
+
+| Subtag | Share | Subtag | Share |
+|---|---:|---|---:|
+| `0x66` | 56.4 % | `0x12` | 1.9 % |
+| `0x16` | 26.0 % | `0x22` | 1.3 % |
+| `0x26` |  8.3 % | `0x06` | 0.6 % |
+| `0x62` |  5.0 % | tail   | 0.5 % |
+
+The strong invariant is the **two zero bytes** at offsets `+1`,`+2`
+after the subtag — that's the signature to anchor on. The subtag
+byte itself is informational (probably type-class / by-reference /
+register-passed flags); a parser that wants robustness should accept
+any byte there and trust the zero-zero invariant.
+
+After the param/local list, some procs carry additional sub-records
+with tags **`0x23`** (return-value descriptor) and **`0x25`** (enum
+entries for inline-declared enum return types). These don't fit the
+5-byte sub-record format. The pragmatic rule is to stop the param/
+local walk on any tag other than `0x20`/`0x21`/`0x63` and keep
+whatever has been collected.
+
+Between consecutive sub-records the encoding can carry an extra 1–2
+byte attribute prefix (likely `var` / `out` / `const` qualifiers).
+Robust parsing scans 0..6 bytes forward from the expected `bodyAt + 5`
+for the next valid sub-record header before giving up.
+
+**Stack-offset encoding.** RSM stores 1-byte signed offsets in 2-byte
+stride units relative to a frame anchor at `rbp + 16`:
+
+```
+real_byte_offset = (rsm_offset_signed / 2) + 16
+```
+
+In Delphi Win64 the actual spill / local area starts at `rbp + 32`
+(not the MS-x64 `rbp + 16`). This formula was verified against
+Geometry.Add and DistanceSq on the small fixture and against ~125k
+matched procs on Altium AdvPCB.
+
+**Open: override / virtual methods' `Self`.** For override methods,
+`Self` is stored in the RSM with `stack_offset = +4`, which decodes to
+`rbp + 18` — misaligned and clearly not the real Self location. For
+non-override methods, `Self` typically has `stack_offset = +32`
+(`rbp + 48`). The `+4` value is likely a sentinel ("`Self` is in RCX
+/ at `rbp + 8`, not spilled") rather than a literal offset. The
+proc-record's variable-length trailer plausibly carries the
+virtual/override discriminator. Workaround: locals and non-Self
+params for override methods are correct; only the displayed value of
+`Self` itself is wrong.
+
 ### Scanner caveats
 
 The same `0x20 ... 0x66 0x00 0x00` byte pattern occurs inside

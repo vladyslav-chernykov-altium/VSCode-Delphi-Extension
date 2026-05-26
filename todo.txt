@@ -27,6 +27,114 @@ Out of scope for v1 (deferred):
   DONE
 ================================================================================
 
+[x] RSM proc parser: real-world scale; ~125k methods now carry args+locals
+         (2026-05-26).
+
+         Symptom: on Altium AdvPCB, breakpoints inside Delphi methods
+         showed an empty Variables panel ("only CPU registers" visible).
+         The same VSCode + cppdbg setup worked for the small two_units
+         fixture, indicating a regression of M2-phase-A on real binaries.
+
+         Diagnostic harness added (new subcommands):
+            rsm2pdb diff-procs    -- VA-cross-check rsm procs vs .map
+                                     functions; reports missing-in-rsm
+                                     with raw-name presence in .rsm bytes.
+            rsm2pdb probe-procs   -- hex + decoded byte dump for a
+                                     stratified sample of missing procs.
+            rsm2pdb analyze-procs -- single-pass histograms over the whole
+                                     file (proc subtag distribution,
+                                     trailer-length distribution, sub-
+                                     record subtag distribution) for
+                                     deriving application rules without
+                                     full format RE.
+
+         What the histograms showed:
+            map functions:        301,829
+            rsm proc candidates:  134,186  (VA-confirmed; upper bound)
+            our parser pre-fix:     6,473  (2.1% of map -- 24x undercount)
+
+         Four independent over-strict checks were each cutting deeply:
+
+         1. Fixed `headEnd + 16` jump. The bytes between VA and the
+            first sub-record have VARIABLE length (3..30 bytes
+            empirically; only 16.4% of procs happen to be 5).
+            Fix: scan-forward up to 96 bytes for a valid sub-record
+            start OR a real 0x63 end marker (one whose next byte is a
+            recognizable record tag 0x28/0x20/0x2A/0xFF/0x9C; bare
+            0x63 bytes inside the trailer are common false positives).
+
+         2. Proc-record sub-tag was hard-restricted to 0xA0. Histogram
+            shows 0xE0 (1.5%, RTL allocators) and 0x80 (0.4%) are also
+            valid. Fix: accept {0xA0, 0xE0, 0x80}.
+
+         3. Sub-record subtag was hard-restricted to {0x66, 0x62}.
+            Histogram shows 7 common values; 0x66 only 56% of the
+            time. The strong invariant is the two zero bytes after
+            the subtag, not the subtag value. Fix: accept any byte,
+            require the two-zero invariant.
+
+         4. Real Delphi RSMs contain additional sub-record tags
+            (0x23, 0x25) for return-value metadata and enum-entry
+            definitions after the param/local list. These don't fit
+            our fixed 5-byte sub-record format. Fix: stop the walk
+            gracefully on unknown tags (keep collected params/locals)
+            instead of discarding the whole proc.
+
+         Plus minor fixes:
+           - Pascal-identifier set widened to include `@` (so
+             System.@Abs, System.@DllMain etc. parse).
+           - Between sub-records: scan-forward 0..6 bytes for next
+             valid sub-record header to tolerate `var`/`out`/`const`
+             parameter qualifier prefix bytes.
+           - isInsideProcedure() replaced with std::upper_bound
+             binary search (linear was O(N) per query, catastrophic
+             at 134k procs in the variable-scan loop).
+
+         PE injector fix:
+           - The injector now RENAMES any pre-existing .debug_*
+             sections to ".old_dw" before appending fresh ones.
+             Without this, repeated re-injection produced a PE with
+             two .debug_info sections; gdb read the FIRST one
+             (stale) and reported "no locals or arguments" even
+             when the new DWARF carried them correctly. The user-
+             reported symptom was actually this masking bug, not
+             the parser bug alone.
+
+         Numbers post-fix:
+            rsm procs:        159,462  (24.6x improvement)
+            matched (VA):     125,732  (41.7% of map)
+            walk failures:          0
+            pipeline time:       ~39s  (vs ~52s pre-fix)
+
+         The remaining 58% of map functions have no rsm proc record
+         at all (compiler-generated stubs, RTTI helpers, virtual
+         method table thunks). Not our problem.
+
+         End-to-end verification via gdb on injected AdvPCB.dll:
+            PCBCommands_PCB.TPCBCommands.FileSave
+                Self, AInExport, AKind   (3 args)
+            PCBCommands_PCB.TPCBCommands.AutoRoute
+                Self, View, Parameters   (3 args)
+                + RecordTestResults, ShowDebugView, Mode, Status,
+                  ReportLocation, BaseGrid  (6 locals)
+            Geometry.Add (regression check on small fixture)
+                A, B + Result, Tmp        (unchanged from M2-phase-A)
+
+         Tests: 27 cases / 1.2M assertions all green.
+
+         Format reference is now in docs/02-rsm-format-notes.md
+         (procedure-record section) and the messy lab notes are in
+         the new 2026-05-26 section of rsm-format.txt.
+
+         Open question carried forward: for override / virtual methods,
+         `Self` is encoded with stack_offset=+4 (decoded to rbp+18) --
+         misaligned and clearly not the real location. Non-Self params
+         and locals are correct. Hypothesis: +4 is a sentinel meaning
+         "Self is in RCX, not spilled"; the proc-trailer probably
+         carries the virtual/override discriminator we don't decode
+         yet. Workaround until then: Self for override methods is
+         visible in the Variables panel but shows a wrong value.
+
 [x] DWARF emit: extend CU range to cover function symbols (2026-05-26).
          Commit d6d6abf.
 
@@ -708,6 +816,25 @@ delivered together. Remaining sub-milestones below are deferred.
 [x] 8    P1-lite: RSM header + primitive type table -- DONE.
 [x] 9    P2-lite: bind .map globals to RSM type IDs   -- DONE.
 [x] 10   D-globals-typed: DW_AT_type on variables    -- DONE.
+
+[ ] 10.4 (deferred) Fix override/virtual method `Self` stack offset.
+         For override methods (e.g. PCBCommands_PCB.TPCBCommands.FileSave)
+         RSM encodes Self with stack_offset=+4, which our `(off/2)+16`
+         formula decodes to rbp+18 -- misaligned and wrong. For non-
+         override methods Self has stack_offset=+32 -> rbp+48, which is
+         correct.
+         Two paths:
+           a) Decode the variable-length proc-trailer (between VA and
+              first sub-record) to find the virtual/override
+              discriminator bit, then special-case Self for those.
+           b) Heuristic: if Self's stack_offset is suspiciously small
+              (< 16), emit it with the Win64 default "passed in RCX,
+              spilled to rbp+8" location instead of the rsm-derived
+              one.
+         Effort: ~half a day (b) or ~1-2 days (a, includes deeper
+         trailer RE).
+         Non-Self params and locals are correct, so this is purely
+         a Self-display fix for override methods.
 
 [ ] 10.5 (deferred) Precise primitive typing -- remove D-017 limits.
          Currently same-size primitives (Cardinal vs Integer,

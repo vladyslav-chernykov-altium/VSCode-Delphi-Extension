@@ -20,8 +20,10 @@ Status snapshot (auto-rotting; verify against the latest commit):
 | M2 phase C — opaque global variables | ✅ done |
 | M2 phase B-lite — typed globals (Integer + byte[N] fallback) | ✅ done |
 | M2 phase A — function parameters + locals | ✅ done |
-| Real-project scale (Altium AdvPCB: 120 MB DLL / 543 MB RSM) | ✅ verified, ~52s pipeline |
+| Real-project scale (Altium AdvPCB: 120 MB DLL / 543 MB RSM) | ✅ verified, ~39s pipeline |
+| **M2A v2 — real-world proc-record format** (24.6× more procs decoded; gdb sees args+locals for ~125k methods) | ✅ done 2026-05-26 |
 | VSCode extension (build / debug / source nav, keybindings) | ✅ working end-to-end |
+| Step 10.4 — fix override-method `Self` offset (currently shows wrong value for overrides; non-Self params + locals correct) | ⏳ deferred |
 | Step 10.5 — precise primitive typing (Cardinal vs Integer, Double vs Int64, ...) | ⏳ deferred |
 | Step 11 — full records / enums / classes | ⏳ deferred |
 | Synthesise line entries at begin/end (begin/end-line source nav) | ⏳ deferred |
@@ -202,6 +204,48 @@ body. `git log --oneline` for the recent history.
     "Hint" diagnostics must be mapped to `Information` instead to
     surface in the panel. See `vscode-ext/src/buildRunner.ts`.
 
+16. **The PE injector renames pre-existing `.debug_*` sections to
+    `.old_dw` before appending fresh ones.** Without this, a DLL
+    that's been injected once before ends up with TWO `.debug_info`
+    sections; gdb reads the FIRST (stale) one and reports "no
+    locals or arguments" even when the new DWARF carries them.
+    This bit us on AdvPCB the first time round (the input DLL was
+    already an output of a prior `rsm2pdb dwarf` run). See
+    `src/pe/pe_injector.cpp` (search for `.old_dw`). Side note:
+    each re-injection cycle leaves the old `.old_dw` in place;
+    accumulation is harmless but cosmetically ugly.
+
+17. **Real Delphi proc records are MUCH more varied than the small
+    fixtures showed.** The original M2-phase-A parser hard-coded
+    a fixed 16-byte head (assumed 5-byte trailer between VA and
+    sub-records), a single proc subtag value (`0xA0`), and two
+    sub-record subtag values (`0x66`/`0x62`). On real binaries
+    that's 2% coverage. Reality:
+      - Proc subtag ∈ {0xA0, 0xE0, 0x80}.
+      - Trailer between VA and first sub-record is variable
+        (3..30 bytes; the "5 bytes" was just one common case).
+      - Sub-record subtag is variable (~10 values); the strong
+        invariant is the two zero bytes at +1,+2 after it.
+      - Real procs carry additional sub-records with tags `0x23`
+        (return-value descriptor) and `0x25` (enum entries) after
+        the param/local list.
+    Application rules in `src/rsm/rsm_reader.cpp scanProcedures()`:
+    permissive subtag acceptance, scan-forward to find first valid
+    sub-record / true end marker, graceful break on unknown sub-
+    record tags. See `docs/02-rsm-format-notes.md` (Procedure
+    record section) and `rsm-format.txt` (2026-05-26 entry).
+
+18. **Override / virtual methods encode `Self` with a non-literal
+    stack-offset byte.** For override methods the RSM stores Self
+    with `stack_offset = +4`, which our `(off/2)+16` formula
+    decodes to rbp+18 — misaligned, clearly not Self's real
+    location. For non-override methods Self has +32 -> rbp+48,
+    which is correct (Delphi spills args starting at rbp+32, not
+    the MS-x64 rbp+16). The `+4` value is likely a sentinel
+    meaning "Self in RCX, not spilled". Non-Self params and
+    locals are correct, so this is purely a Self-display issue
+    on overrides. Tracked as step 10.4 in `todo.txt`.
+
 ---
 
 ## How we maintain `todo.txt` and `rsm-format.txt`
@@ -236,22 +280,40 @@ body. `git log --oneline` for the recent history.
 
 **Three candidate next steps:**
 
-1. **Step 11 — full records / enums / classes** (~2-3 days). Most
+1. **Step 10.4 — override-method `Self` offset fix** (~few hours to
+   a day). Smallest visible cosmetic bug after M2A v2: for override
+   methods (`PCBCommands_PCB.TPCBCommands.FileSave` and similar),
+   `Self` is displayed at `rbp+18` (misaligned) because the RSM
+   stores `+4` as a sentinel meaning "in RCX, not spilled" instead
+   of a literal offset. Heuristic fix: special-case suspiciously
+   small Self offsets to emit `DW_OP_reg2` (rcx) or the standard
+   `rbp+8` shadow location. Full fix: decode the variable-length
+   proc-trailer to find the virtual/override discriminator.
+
+2. **Step 11 — full records / enums / classes** (~2-3 days). Most
    visible user UX win. Replaces `byte[N]` fallback for TPoint /
    TColor / classes with proper field display. RSM has the data
    (we saw the patterns); just needs decoding work.
 
-2. **Step 10.5 — precise primitive typing** (~1-2 days). Lifts the
+3. **Step 10.5 — precise primitive typing** (~1-2 days). Lifts the
    D-017 same-size-merge limit (Cardinal/Single/Double distinguishable
    from Integer/Int64). Smaller win but unblocks step 11's type-ID
    reasoning.
 
-3. **Synthesise line entries for begin/end** (~few hours). Closes
-   the cosmetic gap where bare `begin`/`end` lines have no source
-   mapping. `map2pdb` does this; we don't yet.
-
 If working on RSM RE, recall the offsets and conventions are
-documented in `docs/02-rsm-format-notes.md` and `rsm-format.txt`.
+documented in `docs/02-rsm-format-notes.md` (procedure-record
+section is the freshest) and `rsm-format.txt` (2026-05-26 entry
+covers the proc-format empirical findings).
+
+**Diagnostic subcommands available** (added during M2A v2 work,
+keep them — they're invaluable for future RSM RE):
+- `rsm2pdb diff-procs <map> <rsm>` — VA cross-check; reports
+  missing-in-rsm count with raw-name-in-bytes probe.
+- `rsm2pdb probe-procs <map> <rsm>` — stratified sample of failed
+  proc-records, hex + decoded.
+- `rsm2pdb analyze-procs <map> <rsm>` — single-pass aggregate
+  histograms (proc subtag, trailer length, sub-record subtag) over
+  the whole .rsm file.
 
 **Don't:**
 - Reverse the line tables — D-016 established `.map` is authoritative.
@@ -261,5 +323,8 @@ documented in `docs/02-rsm-format-notes.md` and `rsm-format.txt`.
 
 ---
 
-*Last updated: after commit d6d6abf (extend CU range to cover function
-symbols, so AdvPCB.AdvPCB's begin..end becomes navigable).*
+*Last updated: after the M2A v2 work (real-world proc-record format
+rules: scan-forward trailer + permissive subtags + graceful break on
+unknown sub-record tags). gdb now sees args+locals for ~125k methods
+on Altium AdvPCB; FileSave (override) shows 3 params correctly with
+the caveat that override-`Self` itself is at a sentinel offset.*

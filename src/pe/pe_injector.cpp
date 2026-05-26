@@ -245,6 +245,52 @@ bool injectDwarfSections(const std::vector<std::uint8_t>& pe_in,
         }
     }
 
+    // If the input PE already carries pre-existing .debug_* sections
+    // (from a previous rsm2pdb run, or built-in TD32 debug info),
+    // rename them in the output so the loader / gdb doesn't accidentally
+    // read the stale data instead of the freshly-injected sections.
+    // Without this, gdb reads the FIRST .debug_info it finds, which is
+    // the stale one, and reports e.g. "no locals or arguments" even
+    // when our new DWARF correctly carries them.
+    auto resolveSectionName = [&](const IMAGE_SECTION_HEADER& sh) -> std::string {
+        if (sh.Name[0] != '/') {
+            char buf[9] = {};
+            std::memcpy(buf, sh.Name, 8);
+            return std::string(buf);
+        }
+        // Long name: "/N" -> offset N into COFF string table.
+        char numbuf[8] = {};
+        int nlen = 0;
+        for (int k = 1; k < 8 && sh.Name[k]; ++k) {
+            numbuf[nlen++] = static_cast<char>(sh.Name[k]);
+        }
+        if (nlen == 0 || old_symtab_offset == 0) return {};
+        std::uint32_t offset = static_cast<std::uint32_t>(
+            std::strtoul(numbuf, nullptr, 10));
+        if (offset >= old_strtab_size) return {};
+        const std::uint8_t* strtab_base =
+            pe_in.data() + old_symtab_offset + old_symtab_size;
+        const char* p = reinterpret_cast<const char*>(strtab_base + offset);
+        const std::size_t avail = old_strtab_size - offset;
+        std::size_t len = 0;
+        while (len < avail && p[len] != '\0') ++len;
+        return std::string(p, len);
+    };
+    std::size_t renamed_debug = 0;
+    for (std::uint16_t i = 0; i < tgt_n; ++i) {
+        const auto name = resolveSectionName(tgt_secs[i]);
+        if (name.size() >= 6 && name.compare(0, 6, ".debug") == 0) {
+            std::memset(out_secs[i].Name, 0, 8);
+            std::memcpy(out_secs[i].Name, ".old_dw", 7);
+            ++renamed_debug;
+        }
+    }
+    if (renamed_debug > 0) {
+        std::fprintf(stderr,
+                     "[pe-inject] renamed %zu pre-existing .debug_* section(s) to .old_dw\n",
+                     renamed_debug);
+    }
+
     // Copy existing symtab to its new (final) location, then write
     // the extended string table after it.
     const std::uint32_t shifted_old_symtab_off =
