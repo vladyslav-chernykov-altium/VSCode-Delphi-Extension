@@ -326,6 +326,28 @@ bool Reader::open(const std::string& path) {
                 const auto marker = static_cast<std::uint8_t>(buf[bodyAt + 3]);
                 const auto offRaw = static_cast<std::int8_t>(buf[bodyAt + 4]);
 
+                // Validate name bytes: must be a printable Pascal
+                // identifier. Real-world RSMs can contain sub-records
+                // whose name bytes include NUL or non-printable chars
+                // (e.g. compiler-generated hidden parameters like
+                // `Self` for class methods). Those would corrupt our
+                // DWARF emission because DW_FORM_string truncates at
+                // the first NUL, shifting all subsequent fields and
+                // producing the cascading "Could not find abbrev N"
+                // errors seen in gdb. SKIP such sub-records but
+                // continue parsing the rest of this procedure.
+                bool name_ok = true;
+                for (std::uint8_t k = 0; k < nlen; ++k) {
+                    const auto c = static_cast<unsigned char>(buf[s + 2 + k]);
+                    if (!(std::isalnum(c) || c == '_' || c == '.' || c == '$')) {
+                        name_ok = false; break;
+                    }
+                }
+                if (!name_ok) {
+                    s = bodyAt + 5;   // skip this sub-record but stay in proc
+                    continue;
+                }
+
                 Variable sv{};
                 sv.name           = std::string(buf.data() + s + 2, nlen);
                 sv.address        = 0;
