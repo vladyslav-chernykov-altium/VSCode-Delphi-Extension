@@ -5,6 +5,7 @@
 #include "pe/pe_injector.h"
 #include "pe/pe_pdb_injector.h"
 #include "pe/prologue.h"
+#include "pe/size_sniffer.h"
 #include "pdb/pdb_writer.h"
 
 #include <random>
@@ -1110,6 +1111,49 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Build a per-marker byte-size table from RSM globals. RSM
+        // stores each variable's `type_marker` (a per-unit primitive
+        // type id) but never the byte width directly; we recover the
+        // width by sorting global VAs and taking the gap to the next
+        // higher symbol. Markers that resolve to the same width
+        // everywhere they're seen win; markers with conflicting
+        // widths across units are dropped (left to the disasm
+        // fallback). Cheap one-shot pass; populated regardless of
+        // whether any specific function needs it.
+        std::unordered_map<std::uint8_t, std::uint32_t> marker_sizes;
+        if (have_rsm) {
+            std::vector<std::uint64_t> all_vas;
+            all_vas.reserve(rsm_reader.variables().size());
+            for (const auto& v : rsm_reader.variables()) {
+                if (v.is_primitive && v.address != 0) {
+                    all_vas.push_back(v.address);
+                }
+            }
+            std::sort(all_vas.begin(), all_vas.end());
+            all_vas.erase(std::unique(all_vas.begin(), all_vas.end()),
+                          all_vas.end());
+
+            std::unordered_set<std::uint8_t> conflicting;
+            for (const auto& v : rsm_reader.variables()) {
+                if (!v.is_primitive || v.address == 0) continue;
+                auto it = std::upper_bound(all_vas.begin(), all_vas.end(),
+                                           v.address);
+                if (it == all_vas.end()) continue;
+                const std::uint64_t gap = *it - v.address;
+                // Gaps larger than a register-sized value mean we
+                // straddled an unrelated symbol (or hit the end of a
+                // section). Skip rather than overestimate.
+                if (gap == 0 || gap > 16) continue;
+                const auto size = static_cast<std::uint32_t>(gap);
+                auto [hit, inserted] = marker_sizes.emplace(
+                    v.type_marker, size);
+                if (!inserted && hit->second != size) {
+                    conflicting.insert(v.type_marker);
+                }
+            }
+            for (auto m : conflicting) marker_sizes.erase(m);
+        }
+
         stamp("phase: compose modules");
         // Memoize resolveSourcePath -- on real Delphi projects the
         // same basename ("System.SysUtils.pas") appears in thousands of
@@ -1280,11 +1324,41 @@ int main(int argc, char** argv) {
                             const std::int32_t sub_rsp =
                                 rsm2pdb::pe::parsePrologueSubRsp(
                                     code, code_len);
+                            // Disasm-derived rbp-relative widths.
+                            // Used as fallback when the RSM marker
+                            // table doesn't carry a size for a given
+                            // variable. First memory access wins per
+                            // offset -- typically the prologue's
+                            // ECX/EDX/R8D/R9D spill, which sets the
+                            // natural width.
+                            const auto sniffed =
+                                rsm2pdb::pe::sniffStackVarSizes(
+                                    code, code_len);
 
                             auto isSelf = [](const rsm2pdb::rsm::Variable& v) {
                                 return v.name == "Self"
                                     || v.type_marker == 0x29
                                     || v.type_marker == 0xD5;
+                            };
+                            // Width resolution policy:
+                            //   - Self / managed-self markers -> 8
+                            //     (pointer-to-object / interface
+                            //     reference);
+                            //   - RSM marker -> size from globals'
+                            //     marker table (preferred; consistent
+                            //     across procs in the unit);
+                            //   - else disasm-sniffed width at the
+                            //     resolved rbp offset;
+                            //   - else 0 (void* fallback).
+                            auto resolveSize = [&](const rsm2pdb::rsm::Variable& v,
+                                                   std::int32_t real_off)
+                                                   -> std::uint32_t {
+                                if (isSelf(v)) return 8;
+                                auto it = marker_sizes.find(v.type_marker);
+                                if (it != marker_sizes.end()) return it->second;
+                                auto sit = sniffed.find(real_off);
+                                if (sit != sniffed.end()) return sit->second;
+                                return 0;
                             };
                             for (const auto& p : pr->params) {
                                 rsm2pdb::pdb::ModuleLocal ml;
@@ -1293,6 +1367,7 @@ int main(int argc, char** argv) {
                                 ml.offset   = isSelf(p)
                                               ? sub_rsp + 16
                                               : sub_rsp + (p.stack_offset / 2);
+                                ml.byte_size = resolveSize(p, ml.offset);
                                 mf_out.locals.push_back(std::move(ml));
                             }
                             for (const auto& l : pr->locals) {
@@ -1300,6 +1375,7 @@ int main(int argc, char** argv) {
                                 ml.name     = l.name;
                                 ml.is_param = false;
                                 ml.offset   = sub_rsp + (l.stack_offset / 2);
+                                ml.byte_size = resolveSize(l, ml.offset);
                                 mf_out.locals.push_back(std::move(ml));
                             }
                         }

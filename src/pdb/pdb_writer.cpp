@@ -1,6 +1,7 @@
 #include "pdb/pdb_writer.h"
 
 #include "llvm/BinaryFormat/COFF.h"
+#include "llvm/DebugInfo/CodeView/AppendingTypeTableBuilder.h"
 #include "llvm/DebugInfo/CodeView/CodeView.h"
 #include "llvm/DebugInfo/CodeView/DebugChecksumsSubsection.h"
 #include "llvm/DebugInfo/CodeView/DebugLinesSubsection.h"
@@ -9,6 +10,7 @@
 #include "llvm/DebugInfo/CodeView/Line.h"
 #include "llvm/DebugInfo/CodeView/SymbolRecord.h"
 #include "llvm/DebugInfo/CodeView/SymbolSerializer.h"
+#include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/MSF/MSFBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/DbiModuleDescriptorBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/DbiStreamBuilder.h"
@@ -26,6 +28,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include <cstring>
+#include <unordered_map>
 
 namespace rsm2pdb::pdb {
 
@@ -100,9 +103,41 @@ bool writePdb(const std::string& path,
     dbi.setBuildNumber(14, 11);   // pretend to be VS2017+; many debuggers
                                   // refuse to load PDBs with version 0.
 
-    // -- Empty TPI + IPI (still need version headers)
+    // -- TPI + IPI: IPI stays empty; TPI receives any LF_ARRAY records
+    //    we build for non-{1,2,4,8}-byte variables. Built up as we walk
+    //    modules, then bulk-pushed below.
     builder.getTpiBuilder().setVersionHeader(PdbTpiV80);
     builder.getIpiBuilder().setVersionHeader(PdbTpiV80);
+
+    codeview::AppendingTypeTableBuilder tpi_table(alloc);
+    std::unordered_map<std::uint32_t, codeview::TypeIndex> byte_array_cache;
+
+    // Pick a CodeView TypeIndex for a stack variable of `size` bytes.
+    //   1/2/4/8 -> simple built-in (UCHAR/USHORT/UINT32/UINT64) so the
+    //              debugger displays them as plain hex of the right
+    //              width;
+    //   N other -> LF_ARRAY of UCHAR with that count, cached per size;
+    //   0       -> void* (8-byte hex), our "unknown size" fallback.
+    auto typeForSize = [&](std::uint32_t size) -> codeview::TypeIndex {
+        switch (size) {
+            case 0: return codeview::TypeIndex::VoidPointer64();
+            case 1: return codeview::TypeIndex::UnsignedCharacter();
+            case 2: return codeview::TypeIndex::UInt16Short();
+            case 4: return codeview::TypeIndex::UInt32();
+            case 8: return codeview::TypeIndex::UInt64();
+            default: break;
+        }
+        auto it = byte_array_cache.find(size);
+        if (it != byte_array_cache.end()) return it->second;
+        codeview::ArrayRecord rec(
+            codeview::TypeIndex::UnsignedCharacter(),
+            codeview::TypeIndex::UInt32(),
+            size,
+            std::string{});
+        const auto ti = tpi_table.writeLeafType(rec);
+        byte_array_cache.emplace(size, ti);
+        return ti;
+    };
 
     // -- GSI: publish caller-supplied publics
     auto& gsi = builder.getGsiBuilder();
@@ -284,7 +319,7 @@ bool writePdb(const std::string& path,
                     // covering [fn.offset, fn.offset + fn.size).
                     codeview::LocalSym loc(
                         codeview::SymbolRecordKind::LocalSym);
-                    loc.Type  = codeview::TypeIndex::VoidPointer64();
+                    loc.Type  = typeForSize(v.byte_size);
                     loc.Flags = v.is_param
                                 ? codeview::LocalSymFlags::IsParameter
                                 : codeview::LocalSymFlags::None;
@@ -312,7 +347,7 @@ bool writePdb(const std::string& path,
                     // it as `<optimized away>` in Locals.
                     codeview::LocalSym loc(
                         codeview::SymbolRecordKind::LocalSym);
-                    loc.Type  = codeview::TypeIndex::VoidPointer64();
+                    loc.Type  = typeForSize(v.byte_size);
                     loc.Flags = v.is_param
                                 ? codeview::LocalSymFlags::IsParameter
                                 : codeview::LocalSymFlags::None;
@@ -324,7 +359,7 @@ bool writePdb(const std::string& path,
                 codeview::RegRelativeSym reg(
                     codeview::SymbolRecordKind::RegRelativeSym);
                 reg.Offset   = static_cast<std::uint32_t>(v.offset);
-                reg.Type     = codeview::TypeIndex::VoidPointer64();
+                reg.Type     = typeForSize(v.byte_size);
                 reg.Register = codeview::RegisterId::RBP;
                 reg.Name     = v.name;
                 m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
@@ -464,6 +499,13 @@ bool writePdb(const std::string& path,
             return a.Off < b.Off;
         });
     for (const auto& sc : pending_contribs) dbi.addSectionContrib(sc);
+
+    // Push any LF_ARRAY records (byte[N] for non-{1,2,4,8} variable
+    // widths) into the TPI stream so the symbol-level TypeIndex
+    // references we emitted above resolve at debug time.
+    for (auto rec : tpi_table.records()) {
+        builder.getTpiBuilder().addTypeRecord(rec, std::nullopt);
+    }
 
     // Publish the shared string table into the PDB-global /names
     // stream once, after every module has registered its file paths.

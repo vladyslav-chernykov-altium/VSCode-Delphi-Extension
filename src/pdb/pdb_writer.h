@@ -55,6 +55,14 @@ struct ModuleLocal {
     bool          is_param = false;    // informational; CV doesn't distinguish
     bool          optimized_out = false;
     std::uint16_t register_id = 0;     // CodeView RegisterId (0 = not in reg)
+    // Width of the variable as observed in machine code / RSM. Maps to:
+    //   1 -> UChar, 2 -> UShort, 4 -> UInt32, 8 -> UInt64,
+    //   other N -> LF_ARRAY of UChar with count=N (TPI record),
+    //   0 -> void* (8-byte hex), used when size couldn't be inferred.
+    // Everything is treated as raw hex on purpose: until we ship a real
+    // Pascal type map (M3 follow-up), surfacing accurate byte counts is
+    // more useful than mislabelling things as Integer.
+    std::uint32_t byte_size = 0;
 };
 
 // Function inside a Pascal compile unit. Emits as S_GPROC32 + S_END
