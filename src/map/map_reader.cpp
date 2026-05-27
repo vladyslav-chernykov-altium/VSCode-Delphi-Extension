@@ -1,14 +1,16 @@
 #include "map/map_reader.h"
 
 #include <cctype>
+#include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -29,14 +31,25 @@ const Segment* MapFile::findSegment(std::uint16_t id) const {
 // -------------------------------------------------------------------------
 
 bool Reader::open(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        error_ = "cannot open " + path;
-        return false;
+    // Real Delphi .map files are 100s of MB; the previous
+    // `ostringstream << rdbuf; ss.str()` path copied the buffer twice.
+    // Read directly into a single std::string sized from tellg().
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) { error_ = "cannot open " + path; return false; }
+    const auto sz = in.tellg();
+    in.seekg(0);
+    std::string text;
+    if (sz > 0) {
+        text.resize(static_cast<std::size_t>(sz));
+        in.read(text.data(), sz);
+        text.resize(static_cast<std::size_t>(in.gcount()));
+    } else {
+        // Fallback for streams that don't support tellg (pipes, etc.)
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        text = ss.str();
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return parse(ss.str());
+    return parse(text);
 }
 
 // -------------------------------------------------------------------------
@@ -63,20 +76,24 @@ std::string_view lstrip(std::string_view s) {
 std::string_view strip(std::string_view s) { return lstrip(rstrip(s)); }
 
 // Parse "AAAA:BBBBBBBB" -> (AAAA, BBBBBBBB). Returns true on success.
+// Uses std::from_chars to avoid the per-call std::string allocation
+// that std::strtoull() forces; on AdvPCB.map this halves .map parsing.
 bool parseSegOffset(std::string_view tok,
                     std::uint16_t& segment,
                     std::uint64_t& offset) {
-    auto colon = tok.find(':');
+    const auto colon = tok.find(':');
     if (colon == std::string_view::npos) return false;
-    auto seg_s = tok.substr(0, colon);
-    auto off_s = tok.substr(colon + 1);
-    char* end = nullptr;
-    segment = static_cast<std::uint16_t>(std::strtoul(
-        std::string(seg_s).c_str(), &end, 16));
-    if (!end || *end != 0) return false;
-    offset = std::strtoull(std::string(off_s).c_str(), &end, 16);
-    if (!end || *end != 0) return false;
-    return true;
+    const auto seg_s = tok.substr(0, colon);
+    const auto off_s = tok.substr(colon + 1);
+    auto r1 = std::from_chars(seg_s.data(), seg_s.data() + seg_s.size(),
+                              segment, 16);
+    if (r1.ec != std::errc{} || r1.ptr != seg_s.data() + seg_s.size()) {
+        return false;
+    }
+    auto r2 = std::from_chars(off_s.data(), off_s.data() + off_s.size(),
+                              offset, 16);
+    return r2.ec == std::errc{} &&
+           r2.ptr == off_s.data() + off_s.size();
 }
 
 // Trailing 'H' is sometimes appended to hex numbers in segment overview.
@@ -84,7 +101,23 @@ std::uint64_t parseHex(std::string_view tok) {
     if (!tok.empty() && (tok.back() == 'H' || tok.back() == 'h')) {
         tok.remove_suffix(1);
     }
-    return std::strtoull(std::string(tok).c_str(), nullptr, 16);
+    std::uint64_t v = 0;
+    std::from_chars(tok.data(), tok.data() + tok.size(), v, 16);
+    return v;
+}
+
+// Parse a decimal u32 from string_view without heap allocation.
+std::uint32_t parseDec32(std::string_view tok) {
+    std::uint32_t v = 0;
+    std::from_chars(tok.data(), tok.data() + tok.size(), v, 10);
+    return v;
+}
+
+// Inline whitespace check -- C library std::isspace consults the
+// global locale on every call, which costs measurably on hot loops
+// (~3M invocations on real Delphi .map files).
+inline bool isWS(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
 }
 
 // Split a line into whitespace-separated tokens.
@@ -92,10 +125,10 @@ std::vector<std::string_view> tokenize(std::string_view line) {
     std::vector<std::string_view> out;
     std::size_t i = 0;
     while (i < line.size()) {
-        while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+        while (i < line.size() && isWS(line[i])) ++i;
         if (i == line.size()) break;
         std::size_t start = i;
-        while (i < line.size() && !std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+        while (i < line.size() && !isWS(line[i])) ++i;
         out.emplace_back(line.substr(start, i - start));
     }
     return out;
@@ -123,81 +156,154 @@ bool Reader::parse(const std::string& text) {
     State state = State::Initial;
     LineTable current_table{};  // accumulator when in LineNumbers
 
-    // Section header detection (line-by-line)
-    static const std::regex re_segments_hdr(
-        R"(^\s*Start\s+Length\s+Name\s+Class\s*$)");
-    static const std::regex re_detailed_hdr(
-        R"(^\s*Detailed map of segments\s*$)");
-    static const std::regex re_pub_name_hdr(
-        R"(^\s*Address\s+Publics by Name\s*$)");
-    static const std::regex re_pub_value_hdr(
-        R"(^\s*Address\s+Publics by Value\s*$)");
-    static const std::regex re_line_hdr(
-        R"(^\s*Line numbers for (\S+)\((.+)\)\s+segment\s+(\S+)\s*$)");
-    static const std::regex re_resource_hdr(
-        R"(^\s*Bound resource files\s*$)");
-    static const std::regex re_entry_point(
-        R"(^\s*Program entry point at\s+([0-9a-fA-F]+):([0-9a-fA-F]+)\s*$)");
+    // Section headers are detected by cheap substring match instead of
+    // regex. On real Delphi projects (AdvPCB.map = ~3M lines) running
+    // 7 std::regex_match calls per data row used to dominate parse
+    // time (was ~33s; substring matching pulls it down well under 10s).
+    auto trimLeft = [](std::string_view s) {
+        std::size_t i = 0;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+        return s.substr(i);
+    };
+    auto stripCRLF = [](std::string_view s) {
+        while (!s.empty() && (s.back() == '\r' || s.back() == ' ' ||
+                              s.back() == '\t' || s.back() == '\n')) {
+            s.remove_suffix(1);
+        }
+        return s;
+    };
 
     auto flushLineTable = [&]() {
         if (!current_table.lines.empty()) {
             file_.line_tables.push_back(std::move(current_table));
         }
         current_table = LineTable{};
+        current_table.lines.reserve(64);  // typical Pascal unit
     };
+    current_table.lines.reserve(64);
 
-    std::istringstream in(text);
-    std::string raw;
+    // On large .map files vector growth dominates (947k publics +
+    // 1.8M line entries on AdvPCB). Pre-reserve generously based on
+    // file size; overshoots are cheap, reallocations aren't.
+    file_.publics.reserve(text.size() / 64);
+    file_.module_segments.reserve(8192);
+
+    // Diagnostic: per-state time accumulator. Toggle via env var
+    // RSM2PDB_MAP_PROFILE=1 to dump after parse.
+    const bool profile_map = std::getenv("RSM2PDB_MAP_PROFILE") != nullptr;
+    using clk2 = std::chrono::steady_clock;
+    clk2::duration t_hdr{}, t_pub{}, t_lines{}, t_seg{}, t_detailed{};
+    std::size_t n_hdr_check = 0;
+
+    // Walk the buffer line-by-line via string_view -- avoids per-line
+    // heap allocation of std::getline + std::string. Saves multiple
+    // seconds on real-project .map files (~3M lines).
     std::size_t line_no = 0;
+    std::size_t cursor = 0;
+    const std::string_view buf{text};
 
-    while (std::getline(in, raw)) {
+    while (cursor < buf.size()) {
+        const auto nl = buf.find('\n', cursor);
+        const std::size_t end = (nl == std::string_view::npos) ? buf.size() : nl;
+        std::string_view line = buf.substr(cursor, end - cursor);
+        cursor = (nl == std::string_view::npos) ? buf.size() : nl + 1;
         ++line_no;
-        std::string_view line = raw;
+        // Strip trailing \r (Windows-style CRLF).
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
 
-        // Section header transitions first (high priority).
-        std::smatch m;
-        if (std::regex_match(raw, m, re_segments_hdr)) {
-            flushLineTable();
-            state = State::Segments;
-            continue;
+        const auto t_pre_hdr = profile_map ? clk2::now() : clk2::time_point{};
+
+        // Header detection. Data rows always start with whitespace
+        // then a hex/decimal digit; headers start with a letter at the
+        // left edge after the optional leading whitespace. Branch on
+        // the first non-space character so the hot path (99% data rows)
+        // only does a single char check.
+        const auto lstripped = stripCRLF(trimLeft(line));
+        bool is_header = false;
+        if (!lstripped.empty()) {
+            const char c0 = lstripped.front();
+            switch (c0) {
+            case 'S':
+                if (lstripped.starts_with("Start") &&
+                    lstripped.find("Length") != std::string_view::npos) {
+                    flushLineTable(); state = State::Segments;
+                    is_header = true;
+                }
+                break;
+            case 'D':
+                if (lstripped.starts_with("Detailed map of segments")) {
+                    flushLineTable(); state = State::DetailedMap;
+                    is_header = true;
+                }
+                break;
+            case 'A':
+                if (lstripped.starts_with("Address")) {
+                    if (lstripped.find("Publics by Name") !=
+                        std::string_view::npos) {
+                        flushLineTable(); state = State::PublicsByName;
+                        is_header = true;
+                    } else if (lstripped.find("Publics by Value") !=
+                               std::string_view::npos) {
+                        flushLineTable(); state = State::PublicsByValue;
+                        is_header = true;
+                    }
+                }
+                break;
+            case 'B':
+                if (lstripped.starts_with("Bound resource files")) {
+                    flushLineTable(); state = State::Resources;
+                    is_header = true;
+                }
+                break;
+            case 'L':
+                if (lstripped.starts_with("Line numbers for ")) {
+                    // "Line numbers for <module>(<source>) segment <name>"
+                    flushLineTable();
+                    std::string_view rest = lstripped;
+                    rest.remove_prefix(
+                        std::string_view("Line numbers for ").size());
+                    const auto lparen = rest.find('(');
+                    const auto rparen = rest.rfind(')');
+                    const auto seg_kw = rest.rfind(" segment ");
+                    if (lparen != std::string_view::npos &&
+                        rparen != std::string_view::npos &&
+                        seg_kw != std::string_view::npos &&
+                        lparen < rparen && rparen < seg_kw) {
+                        current_table.module_name =
+                            std::string(rest.substr(0, lparen));
+                        current_table.source_path = std::string(
+                            rest.substr(lparen + 1, rparen - lparen - 1));
+                        current_table.segment_name = std::string(rest.substr(
+                            seg_kw + std::string_view(" segment ").size()));
+                    }
+                    state = State::LineNumbers; is_header = true;
+                }
+                break;
+            case 'P':
+                if (lstripped.starts_with("Program entry point at ")) {
+                    std::string_view rest = lstripped;
+                    rest.remove_prefix(
+                        std::string_view("Program entry point at ").size());
+                    std::uint16_t seg = 0;
+                    std::uint64_t off = 0;
+                    if (parseSegOffset(rest, seg, off)) {
+                        file_.entry_point.has_value = true;
+                        file_.entry_point.segment_id = seg;
+                        file_.entry_point.segment_offset = off;
+                    }
+                    state = State::EntryPoint; is_header = true;
+                }
+                break;
+            default:
+                break;  // hot path: data row, fall through to dispatch
+            }
         }
-        if (std::regex_match(raw, m, re_detailed_hdr)) {
-            flushLineTable();
-            state = State::DetailedMap;
-            continue;
+        if (profile_map) {
+            t_hdr += clk2::now() - t_pre_hdr;
+            ++n_hdr_check;
         }
-        if (std::regex_match(raw, m, re_pub_name_hdr)) {
-            flushLineTable();
-            state = State::PublicsByName;
-            continue;
-        }
-        if (std::regex_match(raw, m, re_pub_value_hdr)) {
-            flushLineTable();
-            state = State::PublicsByValue;
-            continue;
-        }
-        if (std::regex_match(raw, m, re_resource_hdr)) {
-            flushLineTable();
-            state = State::Resources;
-            continue;
-        }
-        if (std::regex_match(raw, m, re_line_hdr)) {
-            flushLineTable();
-            current_table.module_name = m[1].str();
-            current_table.source_path = m[2].str();
-            current_table.segment_name = m[3].str();
-            state = State::LineNumbers;
-            continue;
-        }
-        if (std::regex_match(raw, m, re_entry_point)) {
-            file_.entry_point.has_value = true;
-            file_.entry_point.segment_id = static_cast<std::uint16_t>(
-                std::strtoul(m[1].str().c_str(), nullptr, 16));
-            file_.entry_point.segment_offset = std::strtoull(
-                m[2].str().c_str(), nullptr, 16);
-            state = State::EntryPoint;
-            continue;
-        }
+        if (is_header) continue;
+        const auto t_pre_body = profile_map ? clk2::now() : clk2::time_point{};
 
         // Skip blank lines.
         if (strip(line).empty()) continue;
@@ -244,19 +350,26 @@ bool Reader::parse(const std::string& text) {
 
         case State::PublicsByName: {
             // " 0001:00025900       hello.Add"
-            auto toks = tokenize(line);
-            if (toks.size() < 2) break;
+            // Hand-parsed: skip leading WS, take seg:offset token, skip
+            // WS, take everything else as the name. Avoids the
+            // tokenize() vector allocation per row (947k publics on
+            // AdvPCB.map -> 947k transient vectors gone).
+            std::size_t i = 0;
+            while (i < line.size() && isWS(line[i])) ++i;
+            const std::size_t a = i;
+            while (i < line.size() && !isWS(line[i])) ++i;
+            const auto t_addr = line.substr(a, i - a);
             Public p{};
-            if (!parseSegOffset(toks[0], p.segment_id, p.segment_offset)) break;
-            // The name can contain spaces? Delphi usually doesn't but
-            // the map row in our fixture never does. Use the rest joined.
-            std::string name(toks[1]);
-            for (std::size_t i = 2; i < toks.size(); ++i) {
-                name += ' ';
-                name += std::string(toks[i]);
+            if (!parseSegOffset(t_addr, p.segment_id, p.segment_offset)) {
+                break;
             }
-            p.name = std::move(name);
+            while (i < line.size() && isWS(line[i])) ++i;
+            std::size_t name_end = line.size();
+            while (name_end > i && isWS(line[name_end - 1])) --name_end;
+            if (name_end <= i) break;
+            p.name.assign(line.data() + i, name_end - i);
             file_.publics.push_back(std::move(p));
+            if (profile_map) t_pub += clk2::now() - t_pre_body;
             break;
         }
 
@@ -268,18 +381,30 @@ bool Reader::parse(const std::string& text) {
         case State::LineNumbers: {
             // Rows look like:
             //   "    24 0001:00025900    25 0001:0002590E    26 0001:00025917    27 0001:0002591D"
-            // Multiple (line, seg:off) tuples per row.
-            auto toks = tokenize(line);
-            for (std::size_t i = 0; i + 1 < toks.size(); i += 2) {
+            // Multiple (line, seg:off) tuples per row. Hand-parse
+            // without tokenize/string-copy -- this is the hottest loop
+            // by far on real Delphi projects (AdvPCB.map has ~1.8M
+            // line entries).
+            std::size_t i = 0;
+            while (i < line.size()) {
+                while (i < line.size() && isWS(line[i])) ++i;
+                if (i >= line.size()) break;
+                std::size_t a = i;
+                while (i < line.size() && !isWS(line[i])) ++i;
+                const auto t_line = line.substr(a, i - a);
+                while (i < line.size() && isWS(line[i])) ++i;
+                if (i >= line.size()) break;
+                a = i;
+                while (i < line.size() && !isWS(line[i])) ++i;
+                const auto t_addr = line.substr(a, i - a);
+
                 LineRecord lr{};
-                lr.line = static_cast<std::uint32_t>(std::strtoul(
-                    std::string(toks[i]).c_str(), nullptr, 10));
-                if (!parseSegOffset(toks[i + 1], lr.segment_id, lr.segment_offset)) {
-                    // bad row - skip
-                    continue;
+                lr.line = parseDec32(t_line);
+                if (parseSegOffset(t_addr, lr.segment_id, lr.segment_offset)) {
+                    current_table.lines.push_back(lr);
                 }
-                current_table.lines.push_back(std::move(lr));
             }
+            if (profile_map) t_lines += clk2::now() - t_pre_body;
             break;
         }
 
@@ -293,6 +418,16 @@ bool Reader::parse(const std::string& text) {
     // Flush any trailing line table.
     flushLineTable();
 
+    if (profile_map) {
+        auto ms = [](clk2::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        std::fprintf(stderr,
+            "[map-profile] lines=%zu hdr_checks=%zu  hdr=%.0fms pub=%.0fms "
+            "lines=%.0fms seg=%.0fms detailed=%.0fms\n",
+            line_no, n_hdr_check, ms(t_hdr), ms(t_pub), ms(t_lines),
+            ms(t_seg), ms(t_detailed));
+    }
     return true;
 }
 
