@@ -871,22 +871,15 @@ delivered together. Remaining sub-milestones below are deferred.
 [x] 9    P2-lite: bind .map globals to RSM type IDs   -- DONE.
 [x] 10   D-globals-typed: DW_AT_type on variables    -- DONE.
 
-[ ] 10.4 (deferred) Fix override/virtual method `Self` stack offset.
-         For override methods (e.g. PCBCommands_PCB.TPCBCommands.FileSave)
-         RSM encodes Self with stack_offset=+4, which our `(off/2)+16`
-         formula decodes to rbp+18 -- misaligned and wrong. For non-
-         override methods Self has stack_offset=+32 -> rbp+48, which is
-         correct.
-         Two paths:
-           a) Decode the variable-length proc-trailer (between VA and
-              first sub-record) to find the virtual/override
-              discriminator bit, then special-case Self for those.
-           b) Heuristic: if Self's stack_offset is suspiciously small
-              (< 16), emit it with the Win64 default "passed in RCX,
-              spilled to rbp+8" location instead of the rsm-derived
-              one.
-         Effort: ~half a day (b) or ~1-2 days (a, includes deeper
-         trailer RE).
+[x] 10.4 DONE 2026-05-27. Subsumed by the Delphi-x64 frame-layout RE
+         (commits dcdc159 + 2f1e807). Self is always placed at
+         rbp + sub_rsp + 16 (rcx-shadow slot) regardless of the
+         sentinel RSM stack_offset, gated on
+         `name == "Self" || marker in {0x29, 0xD5}`. Override-method
+         Self (marker 0x31) is picked up by the name check. Verified
+         in cdb on examples/04_locals TBase.VirtProc1 / VirtFunc1
+         and TDerived.VirtProc1 / VirtFunc1: Self resolves to the
+         expected heap pointer; pA / lA values correct.
          Non-Self params and locals are correct, so this is purely
          a Self-display fix for override methods.
 

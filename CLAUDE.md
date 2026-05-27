@@ -24,7 +24,7 @@ Status snapshot (auto-rotting; verify against the latest commit):
 | Real-project scale (Altium AdvPCB: 120 MB DLL / 543 MB RSM) | ✅ verified, ~39s pipeline |
 | **M2A v2 — real-world proc-record format** (24.6× more procs decoded; gdb sees args+locals for ~125k methods) | ✅ done 2026-05-26 |
 | VSCode extension (build / debug / source nav, keybindings) | ✅ working end-to-end |
-| Step 10.4 — fix override-method `Self` offset (currently shows wrong value for overrides; non-Self params + locals correct) | ⏳ deferred |
+| Step 10.4 — fix override-method `Self` offset | ✅ done (subsumed by Delphi-x64 frame RE: Self always at rbp+sub_rsp+16 via name + marker check) |
 | Step 10.5 — precise primitive typing (Cardinal vs Integer, Double vs Int64, ...) | ⏳ deferred |
 | Step 11 — full records / enums / classes | ⏳ deferred |
 | Synthesise line entries at begin/end (begin/end-line source nav) | ⏳ deferred |
@@ -238,16 +238,22 @@ body. `git log --oneline` for the recent history.
     record tags. See `docs/02-rsm-format-notes.md` (Procedure
     record section) and `rsm-format.txt` (2026-05-26 entry).
 
-18. **Override / virtual methods encode `Self` with a non-literal
-    stack-offset byte.** For override methods the RSM stores Self
-    with `stack_offset = +4`, which our `(off/2)+16` formula
-    decodes to rbp+18 — misaligned, clearly not Self's real
-    location. For non-override methods Self has +32 -> rbp+48,
-    which is correct (Delphi spills args starting at rbp+32, not
-    the MS-x64 rbp+16). The `+4` value is likely a sentinel
-    meaning "Self in RCX, not spilled". Non-Self params and
-    locals are correct, so this is purely a Self-display issue
-    on overrides. Tracked as step 10.4 in `todo.txt`.
+18. **`Self` in class methods carries a sentinel `stack_offset`
+    (not a real frame offset).** RSM tags Self with a non-primitive
+    marker:
+      - 0x29 for base-class virtual / regular methods
+      - 0x31 for override methods
+      - 0xD5 for anonymous-method closure Self
+    paired with sentinel offsets `+4109` (newer Delphi) or `+4`
+    (older). Don't decode these via the general `sub_rsp + RSM/2`
+    formula -- it lands well outside any real frame slot. Instead,
+    Self always lives at `rbp + sub_rsp + 16` (= the rcx-shadow
+    slot, where Delphi spills the implicit `this`-pointer). main.cpp
+    routes Self through this special case by checking
+    `name == "Self" || marker == 0x29 || marker == 0xD5` -- the
+    name fallback also catches 0x31 (override) so we don't need to
+    enumerate every marker variant. Verified on examples/04_locals
+    against TBase + TDerived virtuals/overrides.
 
 19. **PDB writer (LLVM-backed) gotchas — `cppvsdbg` is strict.**
     Building a PDB that VS native debug actually accepts took
@@ -349,15 +355,14 @@ body. `git log --oneline` for the recent history.
 
 **Three candidate next steps:**
 
-1. **Step 10.4 — override-method `Self` offset fix** (~few hours to
-   a day). Smallest visible cosmetic bug after M2A v2: for override
-   methods (`PCBCommands_PCB.TPCBCommands.FileSave` and similar),
-   `Self` is displayed at `rbp+18` (misaligned) because the RSM
-   stores `+4` as a sentinel meaning "in RCX, not spilled" instead
-   of a literal offset. Heuristic fix: special-case suspiciously
-   small Self offsets to emit `DW_OP_reg2` (rcx) or the standard
-   `rbp+8` shadow location. Full fix: decode the variable-length
-   proc-trailer to find the virtual/override discriminator.
+1. **Closure visibility: TPI structs for nested + lambda frames**
+   (~half a day). nested static-link and lambda Self are emitted as
+   8-byte hex pointers (user can manually deref via
+   `dd poi(@rbp+0x20)+0x40`). Auto-deref needs synthesising a TPI
+   `ClassRecord` + `FieldList` + `PointerRecord` for outer's frame
+   and the ActRec class. Heuristic for nested: previous RSM record
+   in scan order = parent. For lambda: ActRec is a real RSM type
+   with discoverable layout. Same machinery for both.
 
 2. **Step 11 — full records / enums / classes** (~2-3 days). Most
    visible user UX win. Replaces `byte[N]` fallback for TPoint /
