@@ -31,6 +31,13 @@ constexpr std::uint8_t kFunctionSubTag0     = 0xA0;   // vs vars' 0x66
 constexpr std::uint8_t kFunctionSubTag1     = 0xE0;
 constexpr std::uint8_t kFunctionSubTag2     = 0x80;
 constexpr std::uint8_t kFunctionSubTag3     = 0x20;   // user-code methods
+constexpr std::uint8_t kFunctionSubTagNested = 0x41;  // nested functions
+                                                      // (Pascal `function
+                                                      // inside function`):
+                                                      // takes an implicit
+                                                      // static-link pointer
+                                                      // to the parent's
+                                                      // stack frame in rcx.
                                                        // (Delphi 10.x emits
                                                        //  this for TClass.X)
 constexpr std::uint8_t kRecordTerminator    = 0xFF;
@@ -398,12 +405,25 @@ bool Reader::open(const std::string& path) {
             const std::size_t headEnd    = fnameStart + fnameLen;
             if (headEnd + 14 >= buf.size()) { ++pi; continue; }
             const auto fnSubTag = static_cast<std::uint8_t>(buf[headEnd]);
-            if ((fnSubTag != kFunctionSubTag0
-                 && fnSubTag != kFunctionSubTag1
-                 && fnSubTag != kFunctionSubTag2
-                 && fnSubTag != kFunctionSubTag3) ||
-                static_cast<std::uint8_t>(buf[headEnd + 1]) != 0x00 ||
-                static_cast<std::uint8_t>(buf[headEnd + 2]) != 0x00) {
+            const bool isNested = fnSubTag == kFunctionSubTagNested;
+            if (fnSubTag != kFunctionSubTag0
+                && fnSubTag != kFunctionSubTag1
+                && fnSubTag != kFunctionSubTag2
+                && fnSubTag != kFunctionSubTag3
+                && !isNested) {
+                ++pi;
+                ++rej_subtag;
+                continue;
+            }
+            // Most flavours require two zero bytes after the subtag
+            // (the byte pair distinguishes proc records from random
+            // data). The nested-function flavour uses two non-zero
+            // bytes (`02 10` in our samples) -- skip the check for it
+            // and rely on the printable-name + sub-record-scan checks
+            // below to filter out false positives.
+            if (!isNested &&
+                (static_cast<std::uint8_t>(buf[headEnd + 1]) != 0x00 ||
+                 static_cast<std::uint8_t>(buf[headEnd + 2]) != 0x00)) {
                 ++pi;
                 ++rej_subtag;
                 continue;
@@ -419,12 +439,17 @@ bool Reader::open(const std::string& path) {
             //                   VA bytes at headEnd + 7.
             //   0x20:           no hash, VA bytes immediately follow
             //                   the subtag triple; VA bytes at headEnd + 3.
-            // Both forms store the VA as a u32 left-shifted by 4
-            // (low nibble unused). The shorter 0x20 layout is what
-            // modern Delphi (10.x) emits for user-code class methods.
+            //   0x41:           nested-function flavour, 3 mystery
+            //                   bytes after the subtag (likely a
+            //                   parent-frame hash or flags), then VA
+            //                   at headEnd + 4.
+            // All forms store the VA as a u32 left-shifted by 4 (low
+            // nibble unused). The shorter 0x20 layout is what modern
+            // Delphi (10.x) emits for user-code class methods.
             const std::size_t va_off = (fnSubTag == kFunctionSubTag3)
                                        ? headEnd + 3
-                                       : headEnd + 7;
+                                       : (isNested ? headEnd + 4
+                                                   : headEnd + 7);
             const std::uint32_t shifted = readU32LE(buf.data() + va_off);
             const std::uint64_t va = static_cast<std::uint64_t>(shifted) >> 4;
 
@@ -468,9 +493,10 @@ bool Reader::open(const std::string& path) {
             }
 
             ProcedureRecord proc;
-            proc.name        = std::string(buf.data() + fnameStart, fnameLen);
-            proc.address     = va;
-            proc.file_offset = pi;
+            proc.name             = std::string(buf.data() + fnameStart, fnameLen);
+            proc.address          = va;
+            proc.file_offset      = pi;
+            proc.has_static_link  = isNested;
 
             if (endedImmediately) {
                 proc.file_offset_end = firstSub + 1;

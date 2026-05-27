@@ -105,6 +105,13 @@ struct ProcedureRecord {
     std::vector<Variable>   locals;        // includes Result for functions
     std::uint64_t           file_offset;
     std::uint64_t           file_offset_end;  // one past the 0x63 end marker
+    // True for Pascal `nested functions` (a `function inside another
+    // function`). They receive an implicit `static link` -- a pointer
+    // to the enclosing function's stack frame -- in rcx, spilled to
+    // [rbp+sub_rsp+16] like a real first parameter would be. The
+    // sub-records below do NOT include this slot; consumers need to
+    // synthesise a `$frame_outer` local themselves.
+    bool                    has_static_link = false;
 };
 
 struct Header {

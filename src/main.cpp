@@ -1360,6 +1360,27 @@ int main(int argc, char** argv) {
                                 if (sit != sniffed.end()) return sit->second;
                                 return 0;
                             };
+                            // Pascal nested functions get an implicit
+                            // static-link param (pointer to outer's
+                            // stack frame) in rcx; Delphi spills it
+                            // to the first shadow slot but the RSM
+                            // record never mentions it. Surface it
+                            // as a synthesised $frame_outer local so
+                            // the user can navigate to outer's vars
+                            // (e.g. `*(int*)((char*)$frame_outer +
+                            // 0x40)`).
+                            if (pr->has_static_link) {
+                                rsm2pdb::pdb::ModuleLocal sl;
+                                // Avoid `$`-prefixed names: cdb's
+                                // expression parser treats `$` as a
+                                // pseudo-register sigil and refuses
+                                // to evaluate `?? $foo`.
+                                sl.name      = "__frame_outer__";
+                                sl.is_param  = true;
+                                sl.offset    = sub_rsp + 16;
+                                sl.byte_size = 8;
+                                mf_out.locals.push_back(std::move(sl));
+                            }
                             for (const auto& p : pr->params) {
                                 rsm2pdb::pdb::ModuleLocal ml;
                                 ml.name     = p.name;
