@@ -1,0 +1,28 @@
+@echo off
+REM Build types.dproj and inject PDB. Companion fixture for the
+REM TPI / primitive-type encoding RE work (every primitive +
+REM string type as global, local, and param).
+
+setlocal
+set CONFIG=%1
+if "%CONFIG%"=="" set CONFIG=Debug
+
+set REPO_ROOT=%~dp0..\..
+set OUT=Win64\%CONFIG%
+set RSM2PDB=%REPO_ROOT%\build\src\rsm2pdb.exe
+
+call "C:\Dev\Tools\Embarcadero\Studio\19.0\bin\rsvars.bat"
+if errorlevel 1 ( echo rsvars.bat failed & exit /b 1 )
+
+msbuild types.dproj /t:Rebuild /p:Config=%CONFIG% /p:Platform=Win64 /nologo /v:minimal
+if errorlevel 1 ( echo MSBuild failed & exit /b 1 )
+
+if not exist "%OUT%\types.exe" ( echo no exe produced & exit /b 1 )
+if not exist "%OUT%\types.map" ( echo no map produced & exit /b 1 )
+
+copy /Y "%OUT%\types.exe" "%OUT%\types_orig.exe" >nul
+"%RSM2PDB%" pdb "%OUT%\types.map" "%OUT%\types.exe" "%OUT%\types.pdb"
+if errorlevel 1 ( echo rsm2pdb failed & exit /b 1 )
+
+echo Built %OUT%\types.exe with PDB.
+exit /b 0
