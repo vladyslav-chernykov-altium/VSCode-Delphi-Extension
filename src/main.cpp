@@ -957,6 +957,21 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Per-phase timings; AdvPCB scale (~88 MB .text / ~500 MB .rsm)
+        // makes individual phases run for many seconds, so emit
+        // [N.NNs] timestamps the moment each phase starts/finishes.
+        using clk = std::chrono::steady_clock;
+        auto t = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double>(b - a).count();
+        };
+        const auto t0 = clk::now();
+        auto stamp = [&](const char* tag) {
+            std::fprintf(stdout, "[%6.2fs] %s\n",
+                         t(t0, clk::now()), tag);
+            std::fflush(stdout);
+        };
+        stamp("phase: read PE");
+
         // 1. Parse the input PE to recover its section headers. Both
         //    the SectionMap in the PDB and the public symbols' segment
         //    + offset coordinates are derived from these.
@@ -1004,12 +1019,17 @@ int main(int argc, char** argv) {
         }
 
         // 2. Parse the .map for publics.
+        stamp("phase: parse .map");
         rsm2pdb::map::Reader reader;
         if (!reader.open(map_path)) {
             std::fprintf(stderr, "error: %s\n", reader.error().c_str());
             return 1;
         }
         const auto& mf = reader.file();
+        std::fprintf(stdout,
+            "        .map: %zu segments, %zu publics, %zu line-tables\n",
+            mf.segments.size(), mf.publics.size(), mf.line_tables.size());
+        std::fflush(stdout);
 
         // Build a segment-id -> CODE/DATA classifier from the .map.
         std::unordered_map<std::uint16_t, bool> seg_is_code;
@@ -1079,13 +1099,29 @@ int main(int argc, char** argv) {
         {
             std::filesystem::path rp = map_path;
             rp.replace_extension(".rsm");
+            if (std::filesystem::exists(rp)) {
+                stamp("phase: parse .rsm");
+            }
             if (std::filesystem::exists(rp) && rsm_reader.open(rp.string())) {
                 have_rsm = true;
-                std::fprintf(stdout, "rsm: %zu procs available\n",
+                std::fprintf(stdout, "        .rsm: %zu procs available\n",
                              rsm_reader.procedures().size());
             }
         }
 
+        stamp("phase: compose modules");
+        // Memoize resolveSourcePath -- on real Delphi projects the
+        // same basename ("System.SysUtils.pas") appears in thousands of
+        // line tables. Without caching, ~24M filesystem stat calls
+        // dominated this phase (5+ minutes on Altium AdvPCB).
+        std::unordered_map<std::string, std::string> src_cache;
+        auto resolveSourceCached = [&](const std::string& raw) -> std::string {
+            auto it = src_cache.find(raw);
+            if (it != src_cache.end()) return it->second;
+            std::string r = resolveSourcePath(raw, map_path, src_search_dirs);
+            src_cache.emplace(raw, r);
+            return r;
+        };
         // 2b. Compose modules from .map: one DBI module per Pascal
         //     compile unit (= one line_table) carrying its source
         //     path, functions, and line entries. Functions come from
@@ -1140,13 +1176,19 @@ int main(int argc, char** argv) {
                 by_unit[ur->unit].push_back({p.name, va});
             }
 
-            // Build the module list keyed by line_table.module_name
-            // (the authoritative unit list -- has source paths).
-            std::unordered_map<std::string, const rsm2pdb::map::LineTable*> by_name;
+            // Build the module list. A single Pascal unit can have
+            // multiple line_tables (one per source file pulled in via
+            // {$INCLUDE} or named alongside the unit) -- aggregate
+            // them by unit name so all line entries make it into the
+            // module's C13 subsection. Previously we kept only the
+            // last entry, so BPs in any but one .pas per multi-source
+            // unit failed to bind silently.
+            std::unordered_map<std::string,
+                std::vector<const rsm2pdb::map::LineTable*>> by_name;
             for (const auto& lt : mf.line_tables) {
-                by_name[lt.module_name] = &lt;
+                by_name[lt.module_name].push_back(&lt);
             }
-            // Also include units that have publics but no line_table.
+            // Include units that have publics but no line_table at all.
             std::set<std::string> unit_names;
             for (const auto& kv : by_unit) unit_names.insert(kv.first);
             for (const auto& lt : mf.line_tables) unit_names.insert(lt.module_name);
@@ -1155,14 +1197,9 @@ int main(int argc, char** argv) {
             for (const auto& uname : unit_names) {
                 rsm2pdb::pdb::Module pdb_mod;
                 pdb_mod.name = uname;
-                const auto* lt = by_name.count(uname) ? by_name[uname] : nullptr;
-                if (lt) {
-                    // Resolve the bare basename Delphi puts in the
-                    // .map (e.g. "Geometry.pas") to an absolute path
-                    // so debuggers can open it without sourceFileMap.
-                    pdb_mod.source_path = resolveSourcePath(
-                        lt->source_path, map_path, src_search_dirs);
-                }
+                auto it_lts = by_name.find(uname);
+                const std::vector<const rsm2pdb::map::LineTable*>* lts =
+                    it_lts != by_name.end() ? &it_lts->second : nullptr;
 
                 // Sort functions in this unit by VA so we can compute
                 // sizes as next-VA gaps.
@@ -1216,24 +1253,35 @@ int main(int argc, char** argv) {
                 total_fns += pdb_mod.functions.size();
 
                 // Line entries: translate .map LineRecord coords -> PE
-                // section-relative (segment, offset).
-                if (lt) {
-                    for (const auto& lr : lt->lines) {
-                        const auto* seg = mf.findSegment(lr.segment_id);
-                        if (!seg) continue;
-                        const std::uint64_t va = seg->start_va + lr.segment_offset;
-                        const std::uint64_t rva = va - image_base;
-                        const std::uint16_t seg_idx = findPeSection(rva);
-                        if (seg_idx == 0) continue;
-                        const auto& pe_sec = inputs.sections[seg_idx - 1];
-                        rsm2pdb::pdb::ModuleLine ml;
-                        ml.segment = seg_idx;
-                        ml.offset  = static_cast<std::uint32_t>(
-                                        rva - pe_sec.virtual_address);
-                        ml.line    = lr.line;
-                        pdb_mod.lines.push_back(ml);
+                // section-relative (segment, offset). Each .map
+                // LineTable becomes one ModuleSource so multi-file
+                // units (PCBCommands_PCB.pas + System.Generics.Collections.pas
+                // under unit PCBCommands_PCB) keep all their lines.
+                if (lts) {
+                    for (const auto* lt : *lts) {
+                        rsm2pdb::pdb::ModuleSource src;
+                        src.source_path = resolveSourceCached(lt->source_path);
+                        for (const auto& lr : lt->lines) {
+                            const auto* seg = mf.findSegment(lr.segment_id);
+                            if (!seg) continue;
+                            const std::uint64_t va =
+                                seg->start_va + lr.segment_offset;
+                            const std::uint64_t rva = va - image_base;
+                            const std::uint16_t seg_idx = findPeSection(rva);
+                            if (seg_idx == 0) continue;
+                            const auto& pe_sec = inputs.sections[seg_idx - 1];
+                            rsm2pdb::pdb::ModuleLine ml;
+                            ml.segment = seg_idx;
+                            ml.offset  = static_cast<std::uint32_t>(
+                                            rva - pe_sec.virtual_address);
+                            ml.line    = lr.line;
+                            src.lines.push_back(ml);
+                        }
+                        total_lines += src.lines.size();
+                        if (!src.lines.empty()) {
+                            pdb_mod.sources.push_back(std::move(src));
+                        }
                     }
-                    total_lines += pdb_mod.lines.size();
                 }
 
                 inputs.modules.push_back(std::move(pdb_mod));
@@ -1243,6 +1291,7 @@ int main(int argc, char** argv) {
                 inputs.modules.size(), total_fns, total_lines);
         }
 
+        stamp("phase: write PDB (LLVM streams)");
         // 3. Write the PDB.
         std::string err;
         if (!rsm2pdb::pdb::writePdb(output_pdb, inputs, err)) {
@@ -1251,6 +1300,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stdout, "wrote PDB: %s\n", output_pdb.c_str());
 
+        stamp("phase: inject RSDS into PE");
         // 4. Inject the matching RSDS pointer into the PE.
         const std::string pdb_basename =
             std::filesystem::path(output_pdb).filename().string();
@@ -1263,6 +1313,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stdout, "wrote PE with RSDS pointer: %s\n",
                      output_exe.c_str());
+        stamp("done");
         return 0;
     }
 

@@ -94,10 +94,12 @@ TEST_CASE("PDB writer: publics + module + function + line") {
 
     rsm2pdb::pdb::Module mod;
     mod.name = "Foo";
-    mod.source_path = "Foo.pas";  // file-not-found path is acceptable
     mod.functions.push_back(fn);
-    mod.lines.push_back({1, 0x40, 10});
-    mod.lines.push_back({1, 0x48, 11});
+    rsm2pdb::pdb::ModuleSource src;
+    src.source_path = "Foo.pas";  // file-not-found path is acceptable
+    src.lines.push_back({1, 0x40, 10});
+    src.lines.push_back({1, 0x48, 11});
+    mod.sources.push_back(std::move(src));
     in.modules.push_back(mod);
 
     const auto path = tmpPdbPath("rich");

@@ -132,7 +132,10 @@ bool writePdb(const std::string& path,
     //       (Pascal's namespace separator is a syntax error to it), so
     //       `Watch: two_units.S` reports "two_units undefined".
     //   (2) Without a real type the debugger can't display the value,
-    //       so we default everything to Int32 (raw 4-byte view).
+    //       so we default everything to `void*` -- 8-byte hex view
+    //       that doubles as a freely-castable handle in Watch
+    //       (e.g. `(char*)PChar, 10` shows 10 chars; `*(int*)&I`
+    //       reads 4 bytes at a variable's address).
     // The fully-qualified name still lives in S_PUB32 for stack traces.
     // Stored strings must outlive gsi.addGlobalSymbol() so we hold them
     // in a vector kept alive until commit().
@@ -149,7 +152,7 @@ bool writePdb(const std::string& path,
         for (const auto& p : inputs.publics) {
             if (p.is_function) continue;
             codeview::DataSym data(codeview::SymbolRecordKind::GlobalData);
-            data.Type       = codeview::TypeIndex::Int32();
+            data.Type       = codeview::TypeIndex::VoidPointer64();
             data.DataOffset = p.offset;
             data.Segment    = p.segment;
             data.Name       = global_unqualified[idx++];
@@ -218,8 +221,9 @@ bool writePdb(const std::string& path,
         }
         auto& m = *m_or_err;
         m.setObjFileName(mod.name + ".obj");
-        if (!mod.source_path.empty()) {
-            if (auto e = dbi.addModuleSourceFile(m, mod.source_path)) {
+        for (const auto& src : mod.sources) {
+            if (src.source_path.empty()) continue;
+            if (auto e = dbi.addModuleSourceFile(m, src.source_path)) {
                 error_out = "DbiStreamBuilder::addModuleSourceFile: " +
                             toString(std::move(e));
                 return false;
@@ -277,7 +281,7 @@ bool writePdb(const std::string& path,
                 codeview::RegRelativeSym reg(
                     codeview::SymbolRecordKind::RegRelativeSym);
                 reg.Offset   = static_cast<std::uint32_t>(v.offset);
-                reg.Type     = codeview::TypeIndex::Int32();
+                reg.Type     = codeview::TypeIndex::VoidPointer64();
                 reg.Register = codeview::RegisterId::RBP;
                 reg.Name     = v.name;
                 m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
@@ -308,50 +312,89 @@ bool writePdb(const std::string& path,
             pending_contribs.push_back(sc);
         }
 
-        // C13 line info. Skip if no lines or no source path -- but
-        // first bump mod_index so the next module's SectionContribs
-        // get the right index. (Forgetting this collapsed every
+        // C13 line info. Skip cleanly when there's nothing to emit --
+        // but first bump mod_index so the next module's SectionContribs
+        // get the right Imod. (Forgetting this collapsed every
         // line-less module's contribs onto a single bogus Imod.)
-        if (mod.lines.empty() || mod.source_path.empty()) {
-            ++mod_index;
-            continue;
+        bool any_lines = false;
+        for (const auto& src : mod.sources) {
+            if (!src.lines.empty() && !src.source_path.empty()) {
+                any_lines = true; break;
+            }
         }
+        if (!any_lines) { ++mod_index; continue; }
 
+        // One DebugChecksumsSubsection per module holds an entry for
+        // every source file referenced by this module's line tables.
+        // cppvsdbg refuses to resolve BPs in modules whose checksums
+        // are FileChecksumKind::None, so we compute MD5 of each path
+        // (zero-filled MD5 when the file is unreadable -- BPs still
+        // bind, just with a "source changed" warning).
         auto checksums = std::make_shared<codeview::DebugChecksumsSubsection>(
             *shared_strings);
-        // Compute an MD5 checksum of the source file. cppvsdbg refuses
-        // to resolve breakpoints in modules whose checksums are
-        // FileChecksumKind::None ("Unexpected symbol reader error").
-        // If the file is unreadable, fall back to a zero-filled MD5 --
-        // that still lets the debugger resolve lines, just with
-        // "source file changed" warnings.
-        std::array<std::uint8_t, 16> md5{};
-        if (auto buf_or = MemoryBuffer::getFile(mod.source_path)) {
-            MD5 hasher;
-            hasher.update((*buf_or)->getBuffer());
-            MD5::MD5Result result;
-            hasher.final(result);
-            std::memcpy(md5.data(), result.data(), 16);
+        for (const auto& src : mod.sources) {
+            if (src.source_path.empty()) continue;
+            std::array<std::uint8_t, 16> md5{};
+            if (auto buf_or = MemoryBuffer::getFile(src.source_path)) {
+                MD5 hasher;
+                hasher.update((*buf_or)->getBuffer());
+                MD5::MD5Result result;
+                hasher.final(result);
+                std::memcpy(md5.data(), result.data(), 16);
+            }
+            checksums->addChecksum(src.source_path,
+                                   codeview::FileChecksumKind::MD5,
+                                   md5);
         }
-        checksums->addChecksum(mod.source_path,
-                               codeview::FileChecksumKind::MD5,
-                               md5);
-
-        // Checksums must be present in the module BEFORE any Lines
-        // subsection that references it. (The shared string table is
-        // attached to the PDB globally via /names.)
         m.addDebugSubsection(checksums);
 
-        // One DebugLinesSubsection per function so each carries a
-        // precise relocation address + code size.
+        // Build a per-source sorted index of line entries so we can
+        // binary-search by (segment, offset) for each function instead
+        // of scanning every line every time. Skipping this turned the
+        // composition phase O(F * L) per module which on AdvPCB (~336k
+        // functions / ~1.8M line entries) burned minutes.
+        struct LineIdx {
+            const ModuleSource* src;
+            const ModuleLine*   line;
+        };
+        std::vector<LineIdx> sorted_lines;
+        std::size_t total_lines = 0;
+        for (const auto& s : mod.sources) total_lines += s.lines.size();
+        sorted_lines.reserve(total_lines);
+        for (const auto& s : mod.sources) {
+            for (const auto& l : s.lines) sorted_lines.push_back({&s, &l});
+        }
+        std::sort(sorted_lines.begin(), sorted_lines.end(),
+            [](const LineIdx& a, const LineIdx& b) {
+                if (a.line->segment != b.line->segment)
+                    return a.line->segment < b.line->segment;
+                return a.line->offset < b.line->offset;
+            });
+
+        // One DebugLinesSubsection per function. lower_bound jumps us
+        // to the first line at or after fn.offset; iterate until we
+        // run past the function's end. A function's lines are assumed
+        // to live in one source file (true in practice for Delphi).
         for (const auto& fn : mod.functions) {
+            ModuleLine key{};
+            key.segment = fn.segment;
+            key.offset  = fn.offset;
+            auto first = std::lower_bound(
+                sorted_lines.begin(), sorted_lines.end(), key,
+                [](const LineIdx& a, const ModuleLine& k) {
+                    if (a.line->segment != k.segment)
+                        return a.line->segment < k.segment;
+                    return a.line->offset < k.offset;
+                });
+            const std::uint32_t fn_end =
+                fn.offset + std::max<std::uint32_t>(fn.size, 1);
+            const ModuleSource* fn_src = nullptr;
             std::vector<const ModuleLine*> fn_lines;
-            for (const auto& l : mod.lines) {
-                if (l.segment != fn.segment) continue;
-                if (l.offset >= fn.offset &&
-                    l.offset <  fn.offset + std::max<std::uint32_t>(fn.size, 1)) {
-                    fn_lines.push_back(&l);
-                }
+            for (auto it = first; it != sorted_lines.end(); ++it) {
+                if (it->line->segment != fn.segment) break;
+                if (it->line->offset >= fn_end) break;
+                if (!fn_src) fn_src = it->src;
+                fn_lines.push_back(it->line);
             }
             if (fn_lines.empty()) continue;
 
@@ -360,7 +403,7 @@ bool writePdb(const std::string& path,
             lines->setRelocationAddress(fn.segment, fn.offset);
             lines->setCodeSize(fn.size);
             lines->setFlags(codeview::LineFlags::LF_None);
-            lines->createBlock(mod.source_path);
+            lines->createBlock(fn_src->source_path);
             for (const auto* l : fn_lines) {
                 lines->addLineInfo(
                     l->offset - fn.offset,

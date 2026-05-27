@@ -66,13 +66,20 @@ struct ModuleLine {
     std::uint32_t line    = 0;       // 1-based source line
 };
 
-// A Pascal compile unit. Becomes one DBI module with one source file,
-// N functions, and a C13 line subsection.
+// One source file's worth of line entries within a compile unit. A
+// single Pascal unit can have multiple of these when {$INCLUDE} pulls
+// extra .pas / .inc files into the same module.
+struct ModuleSource {
+    std::string             source_path;   // absolute path preferred
+    std::vector<ModuleLine> lines;
+};
+
+// A Pascal compile unit. Becomes one DBI module with N source files,
+// N functions, and a C13 line subsection per source.
 struct Module {
-    std::string name;                // e.g. "App.Colors"
-    std::string source_path;         // absolute or .dproj-relative
+    std::string name;                       // e.g. "App.Colors"
+    std::vector<ModuleSource>   sources;    // empty -> no line info
     std::vector<ModuleFunction> functions;
-    std::vector<ModuleLine>     lines;  // can be empty
 };
 
 struct PdbInputs {
