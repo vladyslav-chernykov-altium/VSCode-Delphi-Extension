@@ -192,7 +192,9 @@ export async function runBuild(
   }
 
   // ----- 3. rsm2pdb dwarf -----
-  output.appendLine(`${stamp()} Injecting DWARF via rsm2pdb...`);
+  const backendSel = vscode.workspace.getConfiguration('rsm2pdb')
+    .get<string>('backend') ?? 'pdb';
+  output.appendLine(`${stamp()} Injecting ${backendSel.toUpperCase()} via rsm2pdb...`);
   const tDwarf0 = Date.now();
   const dwarfOk = await runRsm2pdb(output, plan, tools);
   output.appendLine(
@@ -304,6 +306,16 @@ async function runMsbuild(
     `  /t:${plan.target} ^\r\n` +
     `  /p:Config="${plan.configName}" ^\r\n` +
     `  /p:Platform=${plan.platform} ^\r\n` +
+    // Force the debug-info artifacts rsm2pdb needs, regardless of
+    // what the .dproj sets. DCC_MapFile=3 -> detailed .map;
+    // DCC_RemoteDebug=true -> emit .rsm; DCC_DebugInformation=2 +
+    // DCC_LocalDebugSymbols=true -> full symbols; DebugInfoInExe=false
+    // frees PE header space for our DWARF injection.
+    `  /p:DCC_MapFile=3 ^\r\n` +
+    `  /p:DCC_RemoteDebug=true ^\r\n` +
+    `  /p:DCC_DebugInformation=2 ^\r\n` +
+    `  /p:DCC_LocalDebugSymbols=true ^\r\n` +
+    `  /p:DCC_DebugInfoInExe=false ^\r\n` +
     `  /nologo /v:normal /clp:Summary;NoItemAndPropertyList\r\n`;
   output.appendLine(`\n--- msbuild wrapper ---\n${script.replace(/\r/g, '')}---`);
   return runViaBatchFile(script, dprojDir, output, 'msbuild', diagAcc, dprojDir);
@@ -335,8 +347,36 @@ async function runRsm2pdb(
     );
   }
 
-  // In-place injection: input = output. rsm2pdb reads the whole input
-  // into memory before writing, so this is safe.
+  // Backend selection: PDB (CodeView, native VS debugger) is default;
+  // DWARF (mingw gdb) is opt-in via rsm2pdb.backend setting.
+  const backend = vscode.workspace.getConfiguration('rsm2pdb')
+    .get<string>('backend') ?? 'pdb';
+
+  if (backend === 'pdb') {
+    const pdbPath = path.join(outDir, base + '.pdb');
+    // Pass the .dproj's source search directories so rsm2pdb can
+    // resolve the bare basenames Delphi writes in .map (e.g.
+    // "Geometry.pas") to absolute paths inside the PDB. Without this,
+    // cppvsdbg can't match VSCode's absolute-path breakpoint to the
+    // PDB's stored file entry.
+    const searchDirs = [
+      ...plan.settings.unitSearchPaths,
+      ...plan.settings.includeSearchPaths,
+      ...plan.settings.dccReferences.map((f) => path.dirname(f)),
+    ];
+    const uniqDirs = Array.from(new Set(searchDirs));
+    const args = ['pdb', mapPath, exePath, pdbPath];
+    for (const d of uniqDirs) { args.push('--src-search', d); }
+    output.appendLine(
+      `\n$ "${tools.rsm2pdbExe}" pdb "${mapPath}" "${exePath}" "${pdbPath}" ` +
+        `(${uniqDirs.length} --src-search dirs)`,
+    );
+    return spawnAndPipe(
+      tools.rsm2pdbExe, args, outDir, output, 'rsm2pdb pdb',
+    );
+  }
+
+  // DWARF (in-place injection: input = output).
   output.appendLine(
     `\n$ "${tools.rsm2pdbExe}" dwarf "${mapPath}" "${exePath}" "${exePath}"`,
   );

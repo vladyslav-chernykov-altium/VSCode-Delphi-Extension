@@ -34,6 +34,9 @@ llvm_map_components_to_libnames(RSM2PDB_LLVM_LIBS
   Object
   BinaryFormat
   DebugInfoDWARF
+  DebugInfoPDB
+  DebugInfoMSF
+  DebugInfoCodeView
   MC
 )
 

@@ -3,6 +3,11 @@
 #include "model/model.h"
 #include "dwarf/dwarf_emitter.h"
 #include "pe/pe_injector.h"
+#include "pe/pe_pdb_injector.h"
+#include "pdb/pdb_writer.h"
+
+#include <random>
+#include <sstream>
 
 #include <algorithm>
 #include <cctype>
@@ -12,11 +17,47 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+// Delphi's .map stores source files by bare basename ("Geometry.pas").
+// PDB debuggers (cppvsdbg / WinDbg) look up files by the exact path
+// they read from the PDB. Resolve the basename to an absolute path
+// by probing common locations relative to the .map. Falls back to the
+// original string if nothing matches.
+static std::string resolveSourcePath(
+    const std::string& raw,
+    const std::string& map_path,
+    const std::vector<std::string>& extra_dirs) {
+    namespace fs = std::filesystem;
+    if (raw.empty()) return raw;
+    fs::path p(raw);
+    if (p.is_absolute() && fs::exists(p)) return p.string();
+
+    // Build the search list: explicit --src-search dirs first, then
+    // common Delphi project-layout fallbacks relative to the .map.
+    std::vector<fs::path> candidates;
+    for (const auto& d : extra_dirs) candidates.emplace_back(d);
+    const fs::path map_dir = fs::path(map_path).parent_path();
+    candidates.push_back(map_dir);                       // alongside .map
+    candidates.push_back(map_dir.parent_path());         // one level up
+    candidates.push_back(map_dir.parent_path().parent_path()); // two up
+
+    const std::string base = p.filename().string();
+    for (const auto& dir : candidates) {
+        fs::path cand = dir / base;
+        std::error_code ec;
+        if (fs::exists(cand, ec)) return fs::canonical(cand, ec).string();
+    }
+    return raw;
+}
 
 static int usage() {
     std::fputs(
@@ -26,6 +67,7 @@ static int usage() {
         "  rsm2pdb dump       <input.rsm | input.map>\n"
         "  rsm2pdb dwarf      <input.map> <input.exe> <output.exe>\n"
         "  rsm2pdb dwarf-emit <input.map> <out-dir>\n"
+        "  rsm2pdb pdb        <input.map> <exe-in-place> <output.pdb>\n"
         "  rsm2pdb diff-procs  <input.map> <input.rsm>\n"
         "  rsm2pdb probe-procs   <input.map> <input.rsm>\n"
         "  rsm2pdb analyze-procs <input.map> <input.rsm>\n"
@@ -892,6 +934,335 @@ int main(int argc, char** argv) {
         std::fprintf(stdout, "[%6.2fs] PE injection done -> %s\n",
                      t(t_emit, t_inj), output_exe.c_str());
         std::fprintf(stdout, "[%6.2fs] TOTAL\n", t(t0, t_inj));
+        return 0;
+    }
+
+    if (cmd == "pdb" && argc >= 5) {
+        // pdb <map> <exe-in-place> <pdb> [--src-search <dir> ...]
+        const std::string map_path(argv[2]);
+        const std::string input_exe(argv[3]);
+        const std::string& output_exe = input_exe;  // in-place injection
+        const std::string output_pdb(argv[4]);
+        std::vector<std::string> src_search_dirs;
+        for (int i = 5; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--src-search") == 0 && i + 1 < argc) {
+                src_search_dirs.emplace_back(argv[++i]);
+            } else {
+                std::fprintf(stderr, "error: unknown pdb arg: %s\n", argv[i]);
+                return 1;
+            }
+        }
+        if (extLower(map_path) != "map") {
+            std::fprintf(stderr, "error: first argument must be a .map file\n");
+            return 1;
+        }
+
+        // 1. Parse the input PE to recover its section headers. Both
+        //    the SectionMap in the PDB and the public symbols' segment
+        //    + offset coordinates are derived from these.
+        std::vector<std::uint8_t> pe_bytes;
+        {
+            std::ifstream f(input_exe, std::ios::binary);
+            if (!f) {
+                std::fprintf(stderr, "error: cannot open input PE: %s\n",
+                             input_exe.c_str());
+                return 1;
+            }
+            std::ostringstream ss; ss << f.rdbuf();
+            const std::string& s = ss.str();
+            pe_bytes.assign(s.begin(), s.end());
+        }
+        if (pe_bytes.size() < sizeof(IMAGE_DOS_HEADER)) {
+            std::fprintf(stderr, "error: input PE too small\n");
+            return 1;
+        }
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(pe_bytes.data());
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            std::fprintf(stderr, "error: input is not a PE\n");
+            return 1;
+        }
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+            pe_bytes.data() + dos->e_lfanew);
+        const auto* pe_secs = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
+            reinterpret_cast<const std::uint8_t*>(nt)
+                + offsetof(IMAGE_NT_HEADERS64, OptionalHeader)
+                + nt->FileHeader.SizeOfOptionalHeader);
+
+        std::vector<rsm2pdb::pdb::CoffSection> coff_sections;
+        coff_sections.reserve(nt->FileHeader.NumberOfSections);
+        for (std::uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+            const auto& s = pe_secs[i];
+            rsm2pdb::pdb::CoffSection cs;
+            cs.name.assign(reinterpret_cast<const char*>(s.Name),
+                           strnlen(reinterpret_cast<const char*>(s.Name), 8));
+            cs.virtual_size        = s.Misc.VirtualSize;
+            cs.virtual_address     = s.VirtualAddress;
+            cs.size_of_raw_data    = s.SizeOfRawData;
+            cs.pointer_to_raw_data = s.PointerToRawData;
+            cs.characteristics     = s.Characteristics;
+            coff_sections.push_back(std::move(cs));
+        }
+
+        // 2. Parse the .map for publics.
+        rsm2pdb::map::Reader reader;
+        if (!reader.open(map_path)) {
+            std::fprintf(stderr, "error: %s\n", reader.error().c_str());
+            return 1;
+        }
+        const auto& mf = reader.file();
+
+        // Build a segment-id -> CODE/DATA classifier from the .map.
+        std::unordered_map<std::uint16_t, bool> seg_is_code;
+        for (const auto& seg : mf.segments) {
+            seg_is_code[seg.id] = (seg.klass == "CODE");
+        }
+
+        // Translate (.map segment, .map offset) into (PE section index,
+        // PE-section-relative offset) by RVA. The .map's segment list
+        // and PE's section list aren't 1:1 (PE adds .rdata, .pdata,
+        // .reloc, ...) so we anchor via RVA = seg.start_va + offset.
+        // .map segment.start_va is an absolute VA (image_base + RVA).
+        // Convert to RVA so it lines up with PE section VirtualAddress.
+        const std::uint64_t image_base = nt->OptionalHeader.ImageBase;
+        auto rvaOfPublic = [&](const rsm2pdb::map::Public& p) -> std::uint64_t {
+            const auto* seg = mf.findSegment(p.segment_id);
+            if (!seg) return 0;
+            const std::uint64_t va = seg->start_va + p.segment_offset;
+            return va >= image_base ? va - image_base : va;
+        };
+        rsm2pdb::pdb::PdbInputs inputs;
+        inputs.sections = std::move(coff_sections);
+
+        auto findPeSection = [&](std::uint64_t rva) -> std::uint16_t {
+            for (std::uint16_t i = 0; i < inputs.sections.size(); ++i) {
+                const auto& s = inputs.sections[i];
+                if (rva >= s.virtual_address &&
+                    rva <  static_cast<std::uint64_t>(s.virtual_address) +
+                           std::max(s.virtual_size, s.size_of_raw_data)) {
+                    return static_cast<std::uint16_t>(i + 1);
+                }
+            }
+            return 0;
+        };
+
+        inputs.age = 1;
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        for (std::size_t i = 0; i < inputs.guid.size(); i += 8) {
+            std::uint64_t r = gen();
+            std::size_t take = std::min<std::size_t>(8, inputs.guid.size() - i);
+            std::memcpy(inputs.guid.data() + i, &r, take);
+        }
+
+        std::size_t skipped = 0;
+        inputs.publics.reserve(mf.publics.size());
+        for (const auto& p : mf.publics) {
+            const std::uint64_t rva = rvaOfPublic(p);
+            const std::uint16_t seg_idx = findPeSection(rva);
+            if (seg_idx == 0) { ++skipped; continue; }
+            const auto& pe_sec = inputs.sections[seg_idx - 1];
+            rsm2pdb::pdb::PublicSymbol ps;
+            ps.name        = p.name;
+            ps.segment     = seg_idx;
+            ps.offset      = static_cast<std::uint32_t>(rva - pe_sec.virtual_address);
+            ps.is_function = seg_is_code[p.segment_id];
+            inputs.publics.push_back(std::move(ps));
+        }
+        std::fprintf(stdout, "publics: %zu emitted, %zu skipped (no PE section)\n",
+                     inputs.publics.size(), skipped);
+
+        // Optional: parse sibling .rsm for procedure records (params +
+        // locals). When present, each function's locals[] gets
+        // populated and we emit S_REGREL32 records inside its proc.
+        rsm2pdb::rsm::Reader rsm_reader;
+        bool have_rsm = false;
+        {
+            std::filesystem::path rp = map_path;
+            rp.replace_extension(".rsm");
+            if (std::filesystem::exists(rp) && rsm_reader.open(rp.string())) {
+                have_rsm = true;
+                std::fprintf(stdout, "rsm: %zu procs available\n",
+                             rsm_reader.procedures().size());
+            }
+        }
+
+        // 2b. Compose modules from .map: one DBI module per Pascal
+        //     compile unit (= one line_table) carrying its source
+        //     path, functions, and line entries. Functions come from
+        //     publics whose VA falls in a module_segment for the unit.
+        {
+            // Index module_segments in segment 1 (.text) by VA range.
+            struct UnitRange {
+                std::string unit;
+                std::uint64_t va_start;
+                std::uint64_t va_end;
+            };
+            std::vector<UnitRange> code_ranges;
+            for (const auto& ms : mf.module_segments) {
+                if (ms.segment_id != 1) continue;
+                const auto* seg = mf.findSegment(ms.segment_id);
+                if (!seg) continue;
+                UnitRange r;
+                r.unit = ms.module_name;
+                r.va_start = seg->start_va + ms.segment_offset;
+                r.va_end   = r.va_start + ms.length;
+                code_ranges.push_back(std::move(r));
+            }
+            std::sort(code_ranges.begin(), code_ranges.end(),
+                [](const UnitRange& a, const UnitRange& b) {
+                    return a.va_start < b.va_start;
+                });
+            auto findUnit = [&](std::uint64_t va) -> const UnitRange* {
+                // Binary-search the sorted ranges.
+                auto it = std::upper_bound(
+                    code_ranges.begin(), code_ranges.end(), va,
+                    [](std::uint64_t v, const UnitRange& r) {
+                        return v < r.va_start;
+                    });
+                if (it == code_ranges.begin()) return nullptr;
+                --it;
+                if (va < it->va_end) return &*it;
+                return nullptr;
+            };
+
+            // Collect functions per unit (segment 1 publics only).
+            struct FnRaw {
+                std::string name;
+                std::uint64_t va;
+            };
+            std::map<std::string, std::vector<FnRaw>> by_unit;
+            for (const auto& p : mf.publics) {
+                if (p.segment_id != 1) continue;
+                const std::uint64_t va = mf.findSegment(p.segment_id)->start_va +
+                                         p.segment_offset;
+                const auto* ur = findUnit(va);
+                if (!ur) continue;
+                by_unit[ur->unit].push_back({p.name, va});
+            }
+
+            // Build the module list keyed by line_table.module_name
+            // (the authoritative unit list -- has source paths).
+            std::unordered_map<std::string, const rsm2pdb::map::LineTable*> by_name;
+            for (const auto& lt : mf.line_tables) {
+                by_name[lt.module_name] = &lt;
+            }
+            // Also include units that have publics but no line_table.
+            std::set<std::string> unit_names;
+            for (const auto& kv : by_unit) unit_names.insert(kv.first);
+            for (const auto& lt : mf.line_tables) unit_names.insert(lt.module_name);
+
+            std::size_t total_fns = 0, total_lines = 0;
+            for (const auto& uname : unit_names) {
+                rsm2pdb::pdb::Module pdb_mod;
+                pdb_mod.name = uname;
+                const auto* lt = by_name.count(uname) ? by_name[uname] : nullptr;
+                if (lt) {
+                    // Resolve the bare basename Delphi puts in the
+                    // .map (e.g. "Geometry.pas") to an absolute path
+                    // so debuggers can open it without sourceFileMap.
+                    pdb_mod.source_path = resolveSourcePath(
+                        lt->source_path, map_path, src_search_dirs);
+                }
+
+                // Sort functions in this unit by VA so we can compute
+                // sizes as next-VA gaps.
+                auto& raws = by_unit[uname];
+                std::sort(raws.begin(), raws.end(),
+                    [](const FnRaw& a, const FnRaw& b) { return a.va < b.va; });
+                for (std::size_t i = 0; i < raws.size(); ++i) {
+                    const auto& r = raws[i];
+                    const std::uint64_t rva = r.va - image_base;
+                    const std::uint16_t seg_idx = findPeSection(rva);
+                    if (seg_idx == 0) continue;
+                    const auto& pe_sec = inputs.sections[seg_idx - 1];
+                    std::uint64_t end_va;
+                    if (i + 1 < raws.size()) {
+                        end_va = raws[i + 1].va;
+                    } else {
+                        // Last function in unit: use unit's range end.
+                        const auto* ur = findUnit(r.va);
+                        end_va = ur ? ur->va_end : (r.va + 1);
+                    }
+                    rsm2pdb::pdb::ModuleFunction mf_out;
+                    mf_out.name    = r.name;
+                    mf_out.segment = seg_idx;
+                    mf_out.offset  = static_cast<std::uint32_t>(
+                                        rva - pe_sec.virtual_address);
+                    mf_out.size    = static_cast<std::uint32_t>(end_va - r.va);
+
+                    // Params + locals from the matching .rsm proc rec.
+                    // CodeView S_REGREL32.Offset = 16 + rsm_offset/2,
+                    // matching the DWARF emitter's frame_base = rbp+16
+                    // convention (see model::Variable docs).
+                    if (have_rsm) {
+                        const auto* pr =
+                            rsm_reader.findProcedureAt(r.va);
+                        if (pr) {
+                            auto pushVar = [&](const rsm2pdb::rsm::Variable& v,
+                                               bool is_param) {
+                                rsm2pdb::pdb::ModuleLocal ml;
+                                ml.name     = v.name;
+                                ml.is_param = is_param;
+                                ml.offset   = 16 + (v.stack_offset / 2);
+                                mf_out.locals.push_back(std::move(ml));
+                            };
+                            for (const auto& p : pr->params) pushVar(p, true);
+                            for (const auto& l : pr->locals) pushVar(l, false);
+                        }
+                    }
+
+                    pdb_mod.functions.push_back(std::move(mf_out));
+                }
+                total_fns += pdb_mod.functions.size();
+
+                // Line entries: translate .map LineRecord coords -> PE
+                // section-relative (segment, offset).
+                if (lt) {
+                    for (const auto& lr : lt->lines) {
+                        const auto* seg = mf.findSegment(lr.segment_id);
+                        if (!seg) continue;
+                        const std::uint64_t va = seg->start_va + lr.segment_offset;
+                        const std::uint64_t rva = va - image_base;
+                        const std::uint16_t seg_idx = findPeSection(rva);
+                        if (seg_idx == 0) continue;
+                        const auto& pe_sec = inputs.sections[seg_idx - 1];
+                        rsm2pdb::pdb::ModuleLine ml;
+                        ml.segment = seg_idx;
+                        ml.offset  = static_cast<std::uint32_t>(
+                                        rva - pe_sec.virtual_address);
+                        ml.line    = lr.line;
+                        pdb_mod.lines.push_back(ml);
+                    }
+                    total_lines += pdb_mod.lines.size();
+                }
+
+                inputs.modules.push_back(std::move(pdb_mod));
+            }
+            std::fprintf(stdout,
+                "modules: %zu, S_GPROC32: %zu, line entries: %zu\n",
+                inputs.modules.size(), total_fns, total_lines);
+        }
+
+        // 3. Write the PDB.
+        std::string err;
+        if (!rsm2pdb::pdb::writePdb(output_pdb, inputs, err)) {
+            std::fprintf(stderr, "error: PDB write failed: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stdout, "wrote PDB: %s\n", output_pdb.c_str());
+
+        // 4. Inject the matching RSDS pointer into the PE.
+        const std::string pdb_basename =
+            std::filesystem::path(output_pdb).filename().string();
+        if (!rsm2pdb::pe::injectPdbReferenceFile(input_exe, inputs.guid,
+                                                 inputs.age, pdb_basename,
+                                                 output_exe, err)) {
+            std::fprintf(stderr, "error: PE injection failed: %s\n",
+                         err.c_str());
+            return 1;
+        }
+        std::fprintf(stdout, "wrote PE with RSDS pointer: %s\n",
+                     output_exe.c_str());
         return 0;
     }
 

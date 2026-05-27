@@ -27,6 +27,60 @@ Out of scope for v1 (deferred):
   DONE
 ================================================================================
 
+[x] M3 -- PDB backend (LLVM-backed). Default backend in the VSCode
+         extension; DWARF is now opt-in via rsm2pdb.backend = dwarf.
+
+         Pipeline (rsm2pdb pdb <map> <exe-in-place> <pdb>):
+            1. Parse PE for section headers (also become the PDB's
+               SectionMap + DbgStream[SectionHdr]).
+            2. Parse .map -> publics + line tables + module_segments.
+            3. Optional .rsm -> proc records (params + locals).
+            4. Compose Modules (one per Pascal unit), each with
+               functions, locals, line entries. Convert .map
+               (segment_id, segment_offset) -> (PE section index,
+               section-relative offset) via image_base + RVA math.
+            5. Resolve source paths (Delphi writes basenames in .map)
+               against --src-search dirs and mapDir / mapDir/.. /
+               mapDir/../.. fallbacks. fs::canonical() makes them
+               absolute -- cppvsdbg won't bind BPs to relative paths.
+            6. writePdb (src/pdb/pdb_writer.cpp): LLVM PDBFileBuilder
+               + InfoStreamBuilder + DbiStreamBuilder + TpiStreamBuilder
+               + IpiStreamBuilder + GSIStreamBuilder. Emits:
+                  - S_PUB32 (publics, qualified names, function-flag set)
+                  - S_GDATA32 globals (UNQUALIFIED names; Int32 type)
+                  - Per-module S_GPROC32 + S_FRAMEPROC + S_REGREL32 +
+                    S_END (Int32 type, RBP frame ptr)
+                  - C13 line subsections (DebugChecksums MD5 +
+                    DebugLines per function)
+                  - SectionContribs sorted by (ISect, Off) before submit
+                  - DbgStream[SectionHdr] = COFF section headers verbatim
+            7. injectPdbReference (src/pe/pe_pdb_injector.cpp): adds a
+               new .debug section containing IMAGE_DEBUG_DIRECTORY +
+               RSDS payload (magic "RSDS" + GUID + age + PDB basename)
+               and patches OptionalHeader.DataDirectory[DEBUG].
+
+         VSCode extension (vscode-ext): new rsm2pdb.backend setting
+         (default "pdb"). buildRunner branches on it; extension.ts
+         composes a cppvsdbg launch config for PDB mode (no MIMode/
+         setupCommands -- VS native engine reads PDB directly). The
+         --src-search dirs come from the .dproj's unitSearchPaths +
+         includeSearchPaths + dirname(dccReferences).
+
+         Verified end-to-end on examples/02_two_units: breakpoints in
+         .dpr and .pas hit, step-into enters Pascal source, Locals
+         shows A/B/Tmp/Result, Watch on `S` / `D` / `P1` resolves
+         global vars (typed as Int32 raw view for now).
+
+         Tests: test/unit/test_pdb_writer.cpp +
+         test/unit/test_pe_pdb_injector.cpp. 31/31 pass.
+
+         Pitfalls encountered & documented in CLAUDE.md gotchas 19-21
+         (reserved streams, SectionHdr stream, MD5 checksums, End
+         linking, SectionContrib sort, S_FRAMEPROC, name qualification).
+
+         Deferred: real Pascal types in PDB TPI -- everything is
+         currently Int32. Lifting that is the M3-follow-up milestone.
+
 [x] RSM proc parser: real-world scale; ~125k methods now carry args+locals
          (2026-05-26).
 

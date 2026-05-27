@@ -7,10 +7,11 @@ first**, then `todo.txt`, then `rsm-format.txt`. Everything else follows.
 
 ## Project at a glance
 
-**rsm2pdb** converts Delphi's `.map` + `.rsm` debug-info into DWARF and
-injects the DWARF into the matching PE, so VSCode + gdb can debug Delphi
-Win64 binaries. Comes with a turnkey VSCode extension that drives the
-whole pipeline.
+**rsm2pdb** converts Delphi's `.map` + `.rsm` debug-info into either
+**PDB** (CodeView, for VS native debugger / cppvsdbg) or **DWARF v5**
+(for mingw gdb / cppdbg) and injects the result into the matching PE.
+PDB is the default; DWARF is opt-in via `rsm2pdb.backend = dwarf`.
+Comes with a turnkey VSCode extension that drives the whole pipeline.
 
 Status snapshot (auto-rotting; verify against the latest commit):
 
@@ -27,7 +28,8 @@ Status snapshot (auto-rotting; verify against the latest commit):
 | Step 10.5 — precise primitive typing (Cardinal vs Integer, Double vs Int64, ...) | ⏳ deferred |
 | Step 11 — full records / enums / classes | ⏳ deferred |
 | Synthesise line entries at begin/end (begin/end-line source nav) | ⏳ deferred |
-| M3 — PDB backend | ⏳ deferred |
+| **M3 — PDB backend (LLVM-backed)** — line BPs + step-into in .pas, S_GDATA32 globals + S_REGREL32 locals/params visible in cppvsdbg | ✅ done, user-verified |
+| M3 follow-up — real Pascal types in PDB TPI (currently every var typed Int32 as placeholder) | ⏳ deferred |
 
 Most current commit on `main` should explain the latest delta in its
 body. `git log --oneline` for the recent history.
@@ -50,7 +52,8 @@ body. `git log --oneline` for the recent history.
 | `src/rsm/` | Delphi .rsm binary parser. Header + primitive table + variable records + procedure records (params/locals). |
 | `src/model/` | Debugger-agnostic intermediate IR. |
 | `src/dwarf/` | DWARF v5 emitter (hand-rolled, LLVM for constants only). Includes subprogram-with-kids, base_type, array_type, formal_parameter. |
-| `src/pe/` | PE section injector. |
+| `src/pdb/` | PDB writer (LLVM-backed via `PDBFileBuilder` + `SymbolSerializer`). Emits Info/DBI/TPI/IPI/GSI streams, S_PUB32 publics, S_GDATA32 globals, per-module S_GPROC32+S_FRAMEPROC+S_REGREL32+S_END, C13 line subsections, SectionHdr DbgStream, SectionContribs. All vars typed Int32 until TPI follow-up. |
+| `src/pe/` | PE section injector. `pe_injector.cpp` writes DWARF sections; `pe_pdb_injector.cpp` adds the RSDS Debug Directory entry pointing at the .pdb and patches `DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG]`. |
 | `examples/01_hello/` | Single-file Delphi sample. |
 | `examples/02_two_units/` | Multi-unit (Geometry + App.Colors + dpr). Primary local-debug fixture. |
 | `examples/03_primitives/` | 13 user globals across 12 distinct primitive types. Used to RE the type-marker encoding. |
@@ -245,6 +248,72 @@ body. `git log --oneline` for the recent history.
     meaning "Self in RCX, not spilled". Non-Self params and
     locals are correct, so this is purely a Self-display issue
     on overrides. Tracked as step 10.4 in `todo.txt`.
+
+19. **PDB writer (LLVM-backed) gotchas — `cppvsdbg` is strict.**
+    Building a PDB that VS native debug actually accepts took
+    multiple rounds of fixing. Surface area in
+    `src/pdb/pdb_writer.cpp`:
+      a. `PDBFileBuilder::initialize()` does NOT allocate the 5
+         reserved stream slots. Call
+         `getMsfBuilder().addStream(0)` `kSpecialStreamCount` times
+         immediately after `initialize()`, or `commit()` fails with
+         "stream too short".
+      b. DBI requires `DbgStream[SectionHdr]` (the COFF section
+         headers verbatim). Without it, vsdbg loads symbols but
+         throws "Unexpected symbol reader error" when resolving a
+         breakpoint.
+      c. File checksums must be a real hash (MD5 minimum); kind
+         `None` silently breaks BP resolution in cppvsdbg.
+      d. `S_GDATA32` / `S_REGREL32` with `TypeIndex::None()` are
+         invisible in Watch/Locals. Until M3-followup ships real
+         types, default everything to `Int32` (raw 4-byte view).
+      e. `ProcSym.End` must be patched to point at the matching
+         `S_END`'s module-stream offset. Use `getNextSymbolOffset()`
+         before+after to compute it, then patch the proc record's
+         bytes in place (offset 8 = 4-byte CVHeader + 4-byte Parent).
+         End=0 means the scope is "open" and Locals stays empty.
+      f. SectionContribs must be sorted by `(ISect, Off)` before
+         submission — vsdbg binary-searches them. Adding in module
+         iteration order leaves SCs interleaved and BP resolution
+         fails for whichever module lands at "the wrong" position.
+      g. Per-module `mod_index` increment must be UNCONDITIONAL.
+         A `continue` that skips it (e.g. for modules without C13
+         lines) silently mis-attributes every later module's SCs.
+      h. `S_FRAMEPROC` is required for cppvsdbg to resolve
+         RegRel-based locals. Encoded frame ptr reg bits 14-15
+         (local) and 16-17 (param) must both be 2 (`FramePtr`,
+         which decodes to RBP on x64).
+      i. cppvsdbg's expression evaluator treats `.` as field
+         access. Qualified Pascal names like `two_units.S` parse
+         as "field S of two_units" and report "two_units is
+         undefined" in Watch. Strip the module prefix in
+         `S_GDATA32` names; keep the fully-qualified name in
+         `S_PUB32` so stack traces stay informative.
+      j. RSDS file checksum / Image file checksum mismatch is
+         tolerated by vsdbg as a "source-file changed" warning
+         but BPs still bind, so MD5 of the resolved source path
+         is good enough.
+
+20. **PDB Section header file offsets don't match the patched
+    PE.** The PDB stores the PE's section table BEFORE our RSDS
+    section gets appended. After our `injectPdbReference`
+    extends the PE (and possibly bumps file offsets via header
+    expansion), the file offsets in the PDB's SectionHdr stream
+    are stale. They don't matter for runtime resolution (which
+    is RVA-based) but `llvm-readobj --coff-debug-directory`
+    against the patched PE will sometimes complain about
+    "uneven size" if a prior debug directory entry survived.
+    Cosmetic; debug works.
+
+21. **PDB source path stored in `C13 FileChecksums`** is what
+    cppvsdbg uses to match breakpoint file paths. Delphi's
+    `.map` carries only basenames (`Geometry.pas`); we resolve
+    against (`--src-search` dirs from the extension) +
+    (mapDir/.., mapDir, mapDir/../..) and call
+    `std::filesystem::canonical()` so the PDB ends up with
+    absolute paths. Without absolute paths, cppvsdbg fails to
+    bind BPs even with `sourceFileMap` set — its matcher is
+    less flexible than gdb's.
 
 ---
 

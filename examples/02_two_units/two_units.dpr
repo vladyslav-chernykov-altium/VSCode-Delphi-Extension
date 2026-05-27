@@ -15,7 +15,7 @@ uses
 var
   P1, P2: Geometry.TPoint;
   C:      App.Colors.TColor;
-  D:      Integer;
+  D:      Double;
   S:      Integer;
 
 begin

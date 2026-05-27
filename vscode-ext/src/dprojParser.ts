@@ -89,24 +89,40 @@ export function listConfigs(dprojPath: string): DprojConfig[] {
     cfgNameByCfgId[`Cfg_${m[2]}`] = m[1];
   }
 
-  // Find every Cfg_N_PlatformX PropertyGroup; that's the canonical
-  // proof of an actual buildable (config, platform).
+  // Find every Cfg_N_PlatformX PropertyGroup; that's the strongest signal
+  // of an explicitly-refined (config, platform) tuple. Larger .dprojs
+  // (e.g. AdvPCB) carry these and use them to specialise settings per
+  // (cfg, platform).
+  const platsByCfg: Record<string, Set<Platform>> = {};
   const reCfgPlat =
     /<PropertyGroup\s+Condition\s*=\s*"\([^"]*'\$\(Cfg_(\d+)\)'=='true'\)[^"]*'\$\(Cfg_\d+_(Win32|Win64)\)'/g;
-  const seen = new Set<string>();
-  const out: DprojConfig[] = [];
   for (let m: RegExpExecArray | null; (m = reCfgPlat.exec(xml)); ) {
     const cfgId = `Cfg_${m[1]}`;
-    const platform = m[2] as Platform;
-    const key = `${cfgId}::${platform}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({
-      cfgId,
-      platform,
-      name: cfgNameByCfgId[cfgId] ?? cfgId,
-    });
+    const plat = m[2] as Platform;
+    (platsByCfg[cfgId] ??= new Set()).add(plat);
   }
+
+  // Smaller .dprojs (e.g. AdvPcbTools) advertise platforms only via
+  // Base_Win32 / Base_Win64 groups, with no per-config-per-platform
+  // refinement. Detect those as a fallback so we can still offer
+  // (named-config x base-platform) tuples to the picker.
+  const basePlatforms: Set<Platform> = new Set();
+  if (/<PropertyGroup\s+Condition\s*=\s*"[^"]*'\$\(Base_Win32\)'!=''/.test(xml)) {
+    basePlatforms.add('Win32');
+  }
+  if (/<PropertyGroup\s+Condition\s*=\s*"[^"]*'\$\(Base_Win64\)'!=''/.test(xml)) {
+    basePlatforms.add('Win64');
+  }
+
+  const out: DprojConfig[] = [];
+  for (const cfgId of Object.keys(cfgNameByCfgId)) {
+    const explicit = platsByCfg[cfgId];
+    const plats = explicit && explicit.size > 0 ? explicit : basePlatforms;
+    for (const platform of plats) {
+      out.push({ cfgId, platform, name: cfgNameByCfgId[cfgId] });
+    }
+  }
+
   // Stable order: Win64 first within each Cfg, ascending Cfg_N.
   out.sort((a, b) => {
     const an = parseInt(a.cfgId.slice(4), 10);
@@ -125,12 +141,25 @@ export function resolveSettings(
   dprojPath: string,
   cfgId: string,
   platform: Platform,
+  configName?: string,
 ): DprojSettings {
   const xml = fs.readFileSync(dprojPath, 'utf8');
   const dprojDir = path.dirname(dprojPath);
 
   // -------- 1. Collect raw key/value pairs per PropertyGroup --------
   const groups = extractPropertyGroups(xml);
+
+  // If the caller didn't pass the human config name, recover it from
+  // the same conditional-header pattern used by listConfigs(). The
+  // .dproj uses this name as the value of $(Config) at msbuild time
+  // and it must expand to that string in DCC_ExeOutput etc.
+  let resolvedConfigName = configName;
+  if (!resolvedConfigName) {
+    const re = new RegExp(
+      `<PropertyGroup\\s+Condition\\s*=\\s*"'\\$\\(Config\\)'=='([^']+)'\\s+or\\s+'\\$\\(${cfgId}\\)'!=''"\\s*>`);
+    const m = re.exec(xml);
+    if (m) resolvedConfigName = m[1];
+  }
 
   // -------- 2. Determine which groups apply, in inheritance order --------
   // The chain we apply (most-general to most-specific):
@@ -162,12 +191,22 @@ export function resolveSettings(
     'Application';
 
   // -------- 4. Resolve env vars in string-valued settings --------
-  const resolve = (s: string | undefined): string =>
-    s === undefined ? '' : expandVars(s, { Platform: platform });
+  const resolve = (s: string | undefined): string => {
+    if (s === undefined) return '';
+    const extra: Record<string, string> = { Platform: platform };
+    if (resolvedConfigName) extra.Config = resolvedConfigName;
+    return expandVars(s, extra);
+  };
 
-  const outputDir = resolve(merged.DCC_ExeOutput) ||
-                    resolve(merged.DCC_AsmOutput) ||
-                    dprojDir;
+  const rawOutputDir = resolve(merged.DCC_ExeOutput) ||
+                       resolve(merged.DCC_AsmOutput) ||
+                       dprojDir;
+  // Delphi commonly writes ".\$(Platform)\$(Config)" -- a path relative
+  // to the .dproj. Resolve against dprojDir so downstream consumers
+  // (msbuild, rsm2pdb, debugger) see an absolute path.
+  const outputDir = path.isAbsolute(rawOutputDir)
+    ? rawOutputDir
+    : path.resolve(dprojDir, rawOutputDir);
   const outputBaseName = path.basename(mainSource, path.extname(mainSource));
   const outputExtension =
     appType === 'Library' ? '.dll' :

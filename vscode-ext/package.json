@@ -101,6 +101,12 @@
           "enum": ["Win64", "Win32"],
           "default": "Win64",
           "description": "Target Delphi platform. Only Win64 is supported by the rsm2pdb pipeline today."
+        },
+        "rsm2pdb.backend": {
+          "type": "string",
+          "enum": ["pdb", "dwarf"],
+          "default": "pdb",
+          "description": "Debug-info backend. 'pdb' injects a CodeView/PDB and uses VS native debug (cppvsdbg) -- recommended on Windows. 'dwarf' injects DWARF v5 and uses mingw gdb (cppdbg)."
         }
       }
     }

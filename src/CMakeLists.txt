@@ -4,6 +4,8 @@ add_library(rsm2pdb_core STATIC
   model/model.cpp
   dwarf/dwarf_emitter.cpp
   pe/pe_injector.cpp
+  pe/pe_pdb_injector.cpp
+  pdb/pdb_writer.cpp
 )
 
 target_include_directories(rsm2pdb_core PUBLIC

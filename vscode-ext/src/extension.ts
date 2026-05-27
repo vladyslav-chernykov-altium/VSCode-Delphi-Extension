@@ -85,6 +85,31 @@ export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('rsm2pdb');
   context.subscriptions.push(output);
 
+  // VSCode rejects gutter-click breakpoints on .pas/.dpr because Pascal
+  // isn't in its known-languages list. Flip the workspace-scoped setting
+  // so the user doesn't have to discover it manually.
+  void (async () => {
+    const cfg = vscode.workspace.getConfiguration('debug');
+    if (cfg.get<boolean>('allowBreakpointsEverywhere') !== true) {
+      try {
+        await cfg.update(
+          'allowBreakpointsEverywhere',
+          true,
+          vscode.ConfigurationTarget.Workspace,
+        );
+        output.appendLine(
+          'rsm2pdb: enabled debug.allowBreakpointsEverywhere ' +
+            '(needed for .pas/.dpr breakpoints).',
+        );
+      } catch (e: any) {
+        output.appendLine(
+          `rsm2pdb: could not set debug.allowBreakpointsEverywhere: ` +
+            `${e?.message ?? String(e)}`,
+        );
+      }
+    }
+  })();
+
   // PROBLEMS-tab integration. Populated from Delphi compiler messages
   // captured during msbuild output streaming. Cleared at the start of
   // each build.
@@ -382,23 +407,43 @@ export function activate(context: vscode.ExtensionContext): void {
       ignoreFailures: true,
     });
 
-    const launch: vscode.DebugConfiguration = {
-      name: `rsm2pdb: ${settings.projectName} (${chosen.name} ${chosen.platform})`,
-      type: 'cppdbg',
-      request: 'launch',
-      program,
-      cwd: settings.debuggerCwd ?? path.dirname(program),
-      args: settings.debuggerRunParams ? [settings.debuggerRunParams] : [],
-      environment: [],
-      externalConsole: true,
-      MIMode: 'gdb',
-      miDebuggerPath: gdbPath,
-      stopAtEntry: false,
-      sourceFileMap,
-      setupCommands,
-    };
+    const backend = vscode.workspace.getConfiguration('rsm2pdb')
+      .get<string>('backend') ?? 'pdb';
 
-    output.appendLine(`\nLaunching cppdbg with program: ${program}`);
+    // cppvsdbg (VS native engine) reads PDBs directly. No gdb / MI /
+    // setupCommands needed; sourceFileMap (basename -> abs path) still
+    // works the same way for resolving the bare-filename paths Delphi
+    // stores in the .map.
+    const launch: vscode.DebugConfiguration = backend === 'pdb'
+      ? {
+          name: `rsm2pdb: ${settings.projectName} (${chosen.name} ${chosen.platform})`,
+          type: 'cppvsdbg',
+          request: 'launch',
+          program,
+          cwd: settings.debuggerCwd ?? path.dirname(program),
+          args: settings.debuggerRunParams ? [settings.debuggerRunParams] : [],
+          environment: [],
+          console: 'externalTerminal',
+          stopAtEntry: false,
+          sourceFileMap,
+        }
+      : {
+          name: `rsm2pdb: ${settings.projectName} (${chosen.name} ${chosen.platform})`,
+          type: 'cppdbg',
+          request: 'launch',
+          program,
+          cwd: settings.debuggerCwd ?? path.dirname(program),
+          args: settings.debuggerRunParams ? [settings.debuggerRunParams] : [],
+          environment: [],
+          externalConsole: true,
+          MIMode: 'gdb',
+          miDebuggerPath: gdbPath,
+          stopAtEntry: false,
+          sourceFileMap,
+          setupCommands,
+        };
+
+    output.appendLine(`\nLaunching ${launch.type} with program: ${program}`);
     output.appendLine(`  cwd:  ${launch.cwd}`);
     output.appendLine(`  args: ${JSON.stringify(launch.args)}`);
     const ws = vscode.workspace.workspaceFolders?.[0];
