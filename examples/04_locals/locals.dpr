@@ -58,6 +58,82 @@ function GlobalFunc3(pA, pB, pC: Integer): Integer;
 var lA: Integer;
 begin lA := pA + pB + pC; Result := lA; end;
 
+// ---------- 1b. Nested function (function inside function) ----------
+
+function NestedOuter(pA: Integer): Integer;
+var lOuter: Integer;
+
+  // Inner sees pA / lOuter from its parent's frame (Delphi closure).
+  function NestedInner(pB: Integer): Integer;
+  var lInner: Integer;
+  begin
+    lInner := pB + lOuter;     // touches outer's local
+    Result := lInner + pA;     // touches outer's param
+  end;
+
+begin
+  lOuter := pA * 10;
+  Result := NestedInner(pA + 1);
+end;
+
+// ---------- 1c. Anonymous methods (Delphi closures / lambdas) ----------
+
+type
+  TIntFunc = reference to function(pA: Integer): Integer;
+
+function MakeLambda(pCapture: Integer): TIntFunc;
+begin
+  // Captures pCapture in an implicit interface-backed frame.
+  Result := function(pA: Integer): Integer
+            var lA: Integer;
+            begin
+              lA := pA + pCapture;
+              Result := lA;
+            end;
+end;
+
+// ---------- 1d. Param modes: var / const / out + by-value String ----------
+//
+// Each modifier produces a different RSM encoding (byref flag, possibly
+// different stack_offset semantics, "out" zero-init prologue, etc.).
+// Mix integer (4-byte) and string (managed reference) so we can see
+// how the encoding differs by value-category as well as by mode.
+
+procedure WithVarParam(var pVar: Integer);
+var lA: Integer;
+begin lA := pVar; pVar := lA + 1; Writeln('VAR ', pVar); end;
+
+procedure WithConstParam(const pConst: Integer);
+var lA: Integer;
+begin lA := pConst; Writeln('CONST ', lA); end;
+
+procedure WithOutParam(out pOut: Integer);
+var lA: Integer;
+begin lA := 42; pOut := lA; Writeln('OUT ', pOut); end;
+
+procedure WithStringByValue(pS: string);
+var lS: string;
+begin lS := pS + '!'; Writeln('SVAL ', lS); end;
+
+procedure WithStringByVar(var pS: string);
+var lS: string;
+begin lS := pS; pS := pS + '?'; Writeln('SVAR ', lS); end;
+
+procedure WithStringByConst(const pS: string);
+var lS: string;
+begin lS := pS + '#'; Writeln('SCONST ', lS); end;
+
+procedure WithMixedParams(
+  pInt: Integer; var pVarInt: Integer;
+  const pConstStr: string; out pOutInt: Integer);
+var lA: Integer;
+begin
+  lA := pInt + pVarInt;
+  pVarInt := pVarInt + 1;
+  pOutInt := lA;
+  Writeln('MIX ', lA, ' ', pConstStr);
+end;
+
 // ---------- 2. Class methods (implicit Self) ----------
 
 type
@@ -152,6 +228,9 @@ var
   base:    TBase;
   derived: TDerived;
   alias:   TBase;
+  vInt:    Integer;
+  vOut:    Integer;
+  vStr:    string;
 begin
   GlobalProc0;
   GlobalProc1(1);
@@ -162,6 +241,18 @@ begin
   Writeln('GF0=', GlobalFunc0);
   Writeln('GF1=', GlobalFunc1(5));
   Writeln('GF3=', GlobalFunc3(1, 2, 3));
+  Writeln('NESTED=', NestedOuter(7));
+  Writeln('LAMBDA=', MakeLambda(100)(5));
+
+  // Param-mode exercises.
+  vInt := 10; vOut := 0; vStr := 'world';
+  WithVarParam(vInt);
+  WithConstParam(20);
+  WithOutParam(vOut);
+  WithStringByValue('hello');
+  WithStringByVar(vStr);
+  WithStringByConst('frozen');
+  WithMixedParams(1, vInt, 'const-str', vOut);
 
   base := TBase.Create;
   try
