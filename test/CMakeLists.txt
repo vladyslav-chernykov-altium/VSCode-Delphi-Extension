@@ -19,6 +19,7 @@ add_executable(rsm2pdb_tests
   unit/test_rsm_reader.cpp
   unit/test_pdb_writer.cpp
   unit/test_pe_pdb_injector.cpp
+  unit/test_prologue.cpp
 )
 target_link_libraries(rsm2pdb_tests PRIVATE rsm2pdb_core doctest::doctest)
 target_compile_definitions(rsm2pdb_tests PRIVATE

@@ -40,16 +40,21 @@ struct CoffSection {
     std::uint32_t characteristics     = 0;
 };
 
-// One parameter or local variable inside a function. Emits as
-// S_REGREL32 (located on the stack via RBP) when `optimized_out` is
-// false, or S_LOCAL with no location range when true -- the latter
-// surfaces in the Locals panel as "<optimized away>" rather than a
-// confusing garbage value.
+// One parameter or local variable inside a function. Encoded as one
+// of three CodeView shapes:
+//   - register_id != 0    -> S_LOCAL + S_DEFRANGE_REGISTER (variable
+//                            lives in CPU register for the whole proc;
+//                            used for tiny Delphi methods whose
+//                            args/Self never spill to stack).
+//   - optimized_out=true  -> S_LOCAL with no defrange ("<optimized
+//                            away>" in cppvsdbg).
+//   - default             -> S_REGREL32 at RBP + offset.
 struct ModuleLocal {
-    std::string  name;
-    std::int32_t offset = 0;          // signed, relative to RBP
-    bool         is_param = false;    // informational; CV doesn't distinguish
-    bool         optimized_out = false;  // emit S_LOCAL, no defrange
+    std::string   name;
+    std::int32_t  offset = 0;          // RBP-relative when register_id==0
+    bool          is_param = false;    // informational; CV doesn't distinguish
+    bool          optimized_out = false;
+    std::uint16_t register_id = 0;     // CodeView RegisterId (0 = not in reg)
 };
 
 // Function inside a Pascal compile unit. Emits as S_GPROC32 + S_END

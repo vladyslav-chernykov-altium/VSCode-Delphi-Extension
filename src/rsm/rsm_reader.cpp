@@ -19,6 +19,7 @@ namespace {
 constexpr std::uint8_t kRecordTagPrimitive  = 0x2A;
 constexpr std::uint8_t kRecordTagVariable   = 0x20;
 constexpr std::uint8_t kRecordTagParam      = 0x21;
+constexpr std::uint8_t kRecordTagVarParam   = 0x22;   // var / out params
 constexpr std::uint8_t kRecordTagFunction   = 0x28;
 constexpr std::uint8_t kFunctionEndMarker   = 0x63;
 // Post-name sub-tag of a function record; bit-flag-like, encodes some
@@ -289,16 +290,100 @@ bool Reader::open(const std::string& path) {
     //   sub-records ... (zero or more)
     //   0x63                                            -- record-end marker
     //
-    // Sub-record (param tag 0x21 / local tag 0x20):
-    //   <tag> <namelen> <name>
-    //   <subtag> 0x00 0x00 <marker u8> <stack_offset i8>      -- 5-byte payload
+    // Sub-record (local tag 0x20 / regular param tag 0x21 / var-or-out
+    // param tag 0x22):
+    //   <tag> <namelen> <name> <body>
     //
-    // The sub-record subtag varies (0x66/0x16/0x26/0x62/0x12/0x22/...).
-    // The strong invariant is the two 0x00 bytes at offsets +1,+2 after
-    // the subtag; we anchor on that, not on the subtag value itself.
-    // is_primitive is heuristically `subtag == 0x66`.
+    // Body has two shapes (discriminator: which pair of bytes is 00 00):
+    //   5-byte: <subtag>      0x00 0x00 <marker u8> <off ...>   -- typical
+    //   6-byte: <subtag> 0x02 0x00 0x00 <marker u8> <off ...>   -- 'out'
+    //                                                              params,
+    //                                                              subtag=0xCD
+    //
+    // The sub-record subtag varies (0x66/0x16/0x26/0x62/0x12/0x22/.../0xCD).
+    // The strong invariant is the two 0x00 bytes; we anchor on that, not
+    // on the subtag value itself. is_primitive is heuristically
+    // `subtag == 0x66`.
+    //
+    // <off ...> is variable-length, discriminated by the LSB of the
+    // first byte:
+    //   LSB=0: single byte, value is signed (i8), real rbp-offset
+    //          formula is `16 + i8/2` (same as Delphi DWARF emission).
+    //   LSB=1: two bytes u16-LE, real rbp-offset formula is
+    //          `16 + (u16 - 1)/4`. The tag-bit lets Delphi disambiguate
+    //          between a negative i8 (e.g. 0x80) and a large positive
+    //          stack offset (e.g. for the 7th+ register/stack-passed
+    //          parameter on Win64).
+    // We normalise both forms into a stored value such that the
+    // downstream `16 + stored/2` formula in main.cpp / dwarf_emitter.cpp
+    // keeps working: for 2-byte form we store `(u16 - 1) / 2`.
     procedures_.reserve(150000);
     std::size_t rej_subtag = 0, rej_name = 0, rej_no_subrec = 0, rej_walk = 0;
+
+    // Decoded sub-record. `total_size` is the byte-count of the whole
+    // record (tag + namelen + name + body + offset bytes), so callers
+    // can advance their cursor by exactly the right amount.
+    struct SubRec {
+        bool          ok            = false;
+        std::uint8_t  tag           = 0;     // 0x20 local / 0x21 param / 0x22 var-param
+        std::uint8_t  namelen       = 0;
+        std::size_t   name_at       = 0;     // index of first name byte
+        std::uint8_t  subtag        = 0;
+        std::uint8_t  marker        = 0;
+        std::int32_t  stored_off    = 0;     // normalised for `16 + s/2` formula
+        std::size_t   total_size    = 0;
+    };
+    auto parseSub = [&](std::size_t s) -> SubRec {
+        SubRec r{};
+        if (s + 8 >= buf.size()) return r;
+        const auto tag = static_cast<std::uint8_t>(buf[s]);
+        if (tag != kRecordTagVariable && tag != kRecordTagParam
+            && tag != kRecordTagVarParam) return r;
+        const auto nl = static_cast<std::uint8_t>(buf[s + 1]);
+        if (nl == 0 || nl > 64) return r;
+        const std::size_t bodyAt = s + 2 + nl;
+        if (bodyAt + 5 >= buf.size()) return r;
+        // Find marker position: either after 1-byte subtag + "00 00"
+        // (markerAt = bodyAt + 3) or after 2-byte subtag + "00 00"
+        // (markerAt = bodyAt + 4, used by 'out' params).
+        std::size_t markerAt;
+        if (static_cast<std::uint8_t>(buf[bodyAt + 1]) == 0 &&
+            static_cast<std::uint8_t>(buf[bodyAt + 2]) == 0) {
+            markerAt = bodyAt + 3;
+        } else if (static_cast<std::uint8_t>(buf[bodyAt + 2]) == 0 &&
+                   static_cast<std::uint8_t>(buf[bodyAt + 3]) == 0) {
+            markerAt = bodyAt + 4;
+        } else {
+            return r;
+        }
+        if (markerAt + 1 >= buf.size()) return r;
+        if (!isPrintableName(buf.data() + s + 2, nl)) return r;
+
+        r.tag       = tag;
+        r.namelen   = nl;
+        r.name_at   = s + 2;
+        r.subtag    = static_cast<std::uint8_t>(buf[bodyAt]);
+        r.marker    = static_cast<std::uint8_t>(buf[markerAt]);
+
+        const auto b0 = static_cast<std::uint8_t>(buf[markerAt + 1]);
+        if ((b0 & 1u) == 0u) {
+            const auto iv = static_cast<std::int8_t>(b0);
+            r.stored_off = static_cast<std::int32_t>(iv);
+            r.total_size = (markerAt + 2) - s;
+        } else {
+            if (markerAt + 2 >= buf.size()) return r;
+            const auto b1 = static_cast<std::uint8_t>(buf[markerAt + 2]);
+            const std::uint16_t v =
+                  static_cast<std::uint16_t>(b0)
+                | (static_cast<std::uint16_t>(b1) << 8);
+            // Normalise so `16 + stored/2` downstream yields the same
+            // rbp-relative real offset that `16 + (v-1)/4` would give.
+            r.stored_off = static_cast<std::int32_t>((v - 1) / 2);
+            r.total_size = (markerAt + 3) - s;
+        }
+        r.ok = true;
+        return r;
+    };
     auto scanProcedures = [&]() {
         const std::size_t pscanStart = std::min<std::size_t>(0x426, buf.size());
         std::size_t pi = pscanStart;
@@ -359,16 +444,11 @@ bool Reader::open(const std::string& path) {
             bool endedImmediately = false;
             for (std::size_t t = scanFrom; t < scanTo; ++t) {
                 const auto tb = static_cast<std::uint8_t>(buf[t]);
-                if (tb == kRecordTagParam || tb == kRecordTagVariable) {
-                    const auto nl = static_cast<std::uint8_t>(buf[t + 1]);
-                    if (nl >= 1 && nl <= 64 && t + 2 + nl + 4 < buf.size()) {
-                        const std::size_t bodyAt = t + 2 + nl;
-                        if (static_cast<std::uint8_t>(buf[bodyAt + 1]) == 0 &&
-                            static_cast<std::uint8_t>(buf[bodyAt + 2]) == 0 &&
-                            isPrintableName(buf.data() + t + 2, nl)) {
-                            firstSub = t;
-                            break;
-                        }
+                if (tb == kRecordTagParam || tb == kRecordTagVariable
+                    || tb == kRecordTagVarParam) {
+                    if (parseSub(t).ok) {
+                        firstSub = t;
+                        break;
                     }
                 } else if (tb == kFunctionEndMarker && t + 1 < buf.size()) {
                     const auto nx = static_cast<std::uint8_t>(buf[t + 1]);
@@ -420,16 +500,9 @@ bool Reader::open(const std::string& path) {
                             break;
                         }
                     }
-                    if (tb == kRecordTagParam || tb == kRecordTagVariable) {
-                        const auto nl = static_cast<std::uint8_t>(buf[s + 1]);
-                        if (nl >= 1 && nl <= 64 && s + 2 + nl + 4 < buf.size()) {
-                            const std::size_t bA = s + 2 + nl;
-                            if (static_cast<std::uint8_t>(buf[bA + 1]) == 0 &&
-                                static_cast<std::uint8_t>(buf[bA + 2]) == 0 &&
-                                isPrintableName(buf.data() + s + 2, nl)) {
-                                break;
-                            }
-                        }
+                    if (tb == kRecordTagParam || tb == kRecordTagVariable
+                        || tb == kRecordTagVarParam) {
+                        if (parseSub(s).ok) break;
                     }
                     ++s;
                 }
@@ -442,54 +515,31 @@ bool Reader::open(const std::string& path) {
                 // enum-entries. We don't decode them yet, so we stop
                 // the param/local walk gracefully on any unknown
                 // tag rather than discarding the whole proc.
-                if (tag != kRecordTagParam && tag != kRecordTagVariable) {
+                if (tag != kRecordTagParam && tag != kRecordTagVariable
+                    && tag != kRecordTagVarParam) {
                     break;
                 }
-                const auto nlen = static_cast<std::uint8_t>(buf[s + 1]);
-                if (nlen == 0 || nlen > 64) break;
-                if (s + 2 + nlen + 5 >= buf.size()) break;
-
-                const std::size_t bodyAt = s + 2 + nlen;
-                const auto t0 = static_cast<std::uint8_t>(buf[bodyAt]);
-                // The double-zero at +1,+2 is the strong invariant.
-                // The subtag itself varies widely; don't filter on it.
-                if (static_cast<std::uint8_t>(buf[bodyAt + 1]) != 0 ||
-                    static_cast<std::uint8_t>(buf[bodyAt + 2]) != 0) {
-                    break;
-                }
-                const auto marker = static_cast<std::uint8_t>(buf[bodyAt + 3]);
-                const auto offRaw = static_cast<std::int8_t>(buf[bodyAt + 4]);
-
-                bool name_ok = true;
-                for (std::uint8_t k = 0; k < nlen; ++k) {
-                    const auto c = static_cast<unsigned char>(buf[s + 2 + k]);
-                    if (!(std::isalnum(c) || c == '_' || c == '.'
-                          || c == '$' || c == '@')) {
-                        name_ok = false; break;
-                    }
-                }
-                if (!name_ok) {
-                    s = bodyAt + 5;
-                    continue;
-                }
+                const SubRec sub = parseSub(s);
+                if (!sub.ok) break;
 
                 Variable sv{};
-                sv.name           = std::string(buf.data() + s + 2, nlen);
+                sv.name           = std::string(buf.data() + sub.name_at,
+                                                sub.namelen);
                 sv.address        = 0;
-                sv.stack_offset   = static_cast<std::int32_t>(offRaw);
-                sv.type_marker    = marker;
-                sv.is_primitive   = (t0 == kVarPayloadSubTag0);
+                sv.stack_offset   = sub.stored_off;
+                sv.type_marker    = sub.marker;
+                sv.is_primitive   = (sub.subtag == kVarPayloadSubTag0);
                 sv.has_trailer    = false;
-                sv.inline_type_id = sv.is_primitive ? 0 : marker;
+                sv.inline_type_id = sv.is_primitive ? 0 : sub.marker;
                 sv.trailer_type_id = 0;
                 sv.file_offset    = s;
 
-                if (tag == kRecordTagParam) {
-                    proc.params.push_back(std::move(sv));
-                } else {
+                if (sub.tag == kRecordTagVariable) {
                     proc.locals.push_back(std::move(sv));
+                } else {
+                    proc.params.push_back(std::move(sv));
                 }
-                s = bodyAt + 5;
+                s += sub.total_size;
             }
 
             if (ok) {

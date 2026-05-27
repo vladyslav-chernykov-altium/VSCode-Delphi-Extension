@@ -4,6 +4,7 @@
 #include "dwarf/dwarf_emitter.h"
 #include "pe/pe_injector.h"
 #include "pe/pe_pdb_injector.h"
+#include "pe/prologue.h"
 #include "pdb/pdb_writer.h"
 
 #include <random>
@@ -1238,55 +1239,68 @@ int main(int argc, char** argv) {
                     //     local stack_offset is the real signed offset
                     //     from the frame anchor; formula `16 + off/2`
                     //     gives the correct rbp-relative byte offset.
-                    //   - Class methods: `Self` is encoded with a
-                    //     sentinel `+26` (constant across methods) --
-                    //     decode would give rbp+29 which is wrong.
-                    //     All OTHER params and locals carry real
-                    //     offsets and decode via the same formula.
-                    //     Override Self alone to the Delphi x64 ABI
-                    //     slot rbp+32.
-                    //   - Collisions among multiple vars after decode
-                    //     indicate a frameless proc (tiny override
-                    //     thunk); mark every var optimized_out so
-                    //     cppvsdbg shows "<optimized away>" instead
-                    //     of reading garbage.
+                    //   - Delphi-x64 places rbp at the BOTTOM of the
+                    //     local-area (after `sub rsp, N`), so every
+                    //     spilled param + every local sits at a
+                    //     POSITIVE offset from rbp. The size of that
+                    //     local area (N) is the only run-time piece
+                    //     RSM doesn't carry -- we recover it by
+                    //     reading the function's prologue out of the
+                    //     PE we just parsed.
+                    //   - `Self` is the rcx-spill at rbp+sub_rsp+16
+                    //     (= first shadow slot). It's flagged in RSM
+                    //     by a non-primitive marker (0x29 for class
+                    //     methods, 0xd5 for anonymous-method
+                    //     closures) and a sentinel stack_offset that
+                    //     would never decode meaningfully via the
+                    //     general formula. We special-case on both
+                    //     marker AND name for belt-and-braces.
+                    // Every var is emitted as a real S_REGREL32 typed
+                    // `void*` (8-byte hex view). For frameless
+                    // thunks (no `sub rsp` in the head) sub_rsp falls
+                    // back to 0 and the user sees stale hex addresses
+                    // -- more useful than hiding the var entirely.
                     if (have_rsm) {
                         const auto* pr =
                             rsm_reader.findProcedureAt(r.va);
                         if (pr) {
-                            std::vector<rsm2pdb::pdb::ModuleLocal> tentative;
+                            // Locate the function's bytes inside the
+                            // mapped PE so we can read its prologue.
+                            const auto& pe_sec_fn = inputs.sections[
+                                mf_out.segment - 1];
+                            const std::size_t fn_fo =
+                                pe_sec_fn.pointer_to_raw_data
+                                    + mf_out.offset;
+                            const std::uint8_t* code = nullptr;
+                            std::size_t code_len = 0;
+                            if (fn_fo + mf_out.size <= pe_bytes.size()) {
+                                code = pe_bytes.data() + fn_fo;
+                                code_len = mf_out.size;
+                            }
+                            const std::int32_t sub_rsp =
+                                rsm2pdb::pe::parsePrologueSubRsp(
+                                    code, code_len);
+
+                            auto isSelf = [](const rsm2pdb::rsm::Variable& v) {
+                                return v.name == "Self"
+                                    || v.type_marker == 0x29
+                                    || v.type_marker == 0xD5;
+                            };
                             for (const auto& p : pr->params) {
                                 rsm2pdb::pdb::ModuleLocal ml;
                                 ml.name     = p.name;
                                 ml.is_param = true;
-                                ml.offset   = (p.name == "Self")
-                                              ? 32
-                                              : 16 + (p.stack_offset / 2);
-                                tentative.push_back(std::move(ml));
+                                ml.offset   = isSelf(p)
+                                              ? sub_rsp + 16
+                                              : sub_rsp + (p.stack_offset / 2);
+                                mf_out.locals.push_back(std::move(ml));
                             }
                             for (const auto& l : pr->locals) {
                                 rsm2pdb::pdb::ModuleLocal ml;
                                 ml.name     = l.name;
                                 ml.is_param = false;
-                                ml.offset   = 16 + (l.stack_offset / 2);
-                                tentative.push_back(std::move(ml));
-                            }
-
-                            std::unordered_map<std::int32_t, int> off_count;
-                            for (const auto& ml : tentative) {
-                                ++off_count[ml.offset];
-                            }
-                            bool collided = false;
-                            for (const auto& kv : off_count) {
-                                if (kv.second > 1) { collided = true; break; }
-                            }
-                            if (!collided) {
-                                mf_out.locals = std::move(tentative);
-                            } else {
-                                for (auto& ml : tentative) {
-                                    ml.optimized_out = true;
-                                    mf_out.locals.push_back(std::move(ml));
-                                }
+                                ml.offset   = sub_rsp + (l.stack_offset / 2);
+                                mf_out.locals.push_back(std::move(ml));
                             }
                         }
                     }

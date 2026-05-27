@@ -278,12 +278,38 @@ bool writePdb(const std::string& path,
                 frame, alloc, codeview::CodeViewContainer::Pdb));
 
             for (const auto& v : fn.locals) {
+                if (v.register_id != 0) {
+                    // Variable lives in a CPU register for the whole
+                    // function range. Emit S_LOCAL + S_DEFRANGE_REGISTER
+                    // covering [fn.offset, fn.offset + fn.size).
+                    codeview::LocalSym loc(
+                        codeview::SymbolRecordKind::LocalSym);
+                    loc.Type  = codeview::TypeIndex::VoidPointer64();
+                    loc.Flags = v.is_param
+                                ? codeview::LocalSymFlags::IsParameter
+                                : codeview::LocalSymFlags::None;
+                    loc.Name  = v.name;
+                    m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
+                        loc, alloc, codeview::CodeViewContainer::Pdb));
+
+                    codeview::DefRangeRegisterSym dr(
+                        codeview::SymbolRecordKind::DefRangeRegisterSym);
+                    dr.Hdr.Register = v.register_id;
+                    dr.Hdr.MayHaveNoName = 0;
+                    dr.Range.OffsetStart = fn.offset;
+                    dr.Range.ISectStart  = fn.segment;
+                    dr.Range.Range = static_cast<std::uint16_t>(
+                        std::min<std::uint32_t>(fn.size,
+                            codeview::MaxDefRange));
+                    m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
+                        dr, alloc, codeview::CodeViewContainer::Pdb));
+                    continue;
+                }
                 if (v.optimized_out) {
                     // S_LOCAL alone (no S_DEFRANGE_*) tells the
                     // debugger the variable exists at this scope but
                     // has no known runtime location. cppvsdbg surfaces
-                    // it as `<optimized away>` in Locals -- better
-                    // than emitting a garbage S_REGREL32.
+                    // it as `<optimized away>` in Locals.
                     codeview::LocalSym loc(
                         codeview::SymbolRecordKind::LocalSym);
                     loc.Type  = codeview::TypeIndex::VoidPointer64();
