@@ -278,6 +278,23 @@ bool writePdb(const std::string& path,
                 frame, alloc, codeview::CodeViewContainer::Pdb));
 
             for (const auto& v : fn.locals) {
+                if (v.optimized_out) {
+                    // S_LOCAL alone (no S_DEFRANGE_*) tells the
+                    // debugger the variable exists at this scope but
+                    // has no known runtime location. cppvsdbg surfaces
+                    // it as `<optimized away>` in Locals -- better
+                    // than emitting a garbage S_REGREL32.
+                    codeview::LocalSym loc(
+                        codeview::SymbolRecordKind::LocalSym);
+                    loc.Type  = codeview::TypeIndex::VoidPointer64();
+                    loc.Flags = v.is_param
+                                ? codeview::LocalSymFlags::IsParameter
+                                : codeview::LocalSymFlags::None;
+                    loc.Name  = v.name;
+                    m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
+                        loc, alloc, codeview::CodeViewContainer::Pdb));
+                    continue;
+                }
                 codeview::RegRelativeSym reg(
                     codeview::SymbolRecordKind::RegRelativeSym);
                 reg.Offset   = static_cast<std::uint32_t>(v.offset);

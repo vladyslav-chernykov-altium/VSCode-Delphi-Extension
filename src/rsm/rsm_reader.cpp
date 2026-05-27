@@ -29,6 +29,9 @@ constexpr std::uint8_t kFunctionEndMarker   = 0x63;
 constexpr std::uint8_t kFunctionSubTag0     = 0xA0;   // vs vars' 0x66
 constexpr std::uint8_t kFunctionSubTag1     = 0xE0;
 constexpr std::uint8_t kFunctionSubTag2     = 0x80;
+constexpr std::uint8_t kFunctionSubTag3     = 0x20;   // user-code methods
+                                                       // (Delphi 10.x emits
+                                                       //  this for TClass.X)
 constexpr std::uint8_t kRecordTerminator    = 0xFF;
 constexpr std::uint8_t kTypeIdMarker0       = 0x9C;
 constexpr std::uint8_t kTypeIdMarker1       = 0x13;
@@ -312,7 +315,8 @@ bool Reader::open(const std::string& path) {
             const auto fnSubTag = static_cast<std::uint8_t>(buf[headEnd]);
             if ((fnSubTag != kFunctionSubTag0
                  && fnSubTag != kFunctionSubTag1
-                 && fnSubTag != kFunctionSubTag2) ||
+                 && fnSubTag != kFunctionSubTag2
+                 && fnSubTag != kFunctionSubTag3) ||
                 static_cast<std::uint8_t>(buf[headEnd + 1]) != 0x00 ||
                 static_cast<std::uint8_t>(buf[headEnd + 2]) != 0x00) {
                 ++pi;
@@ -325,7 +329,18 @@ bool Reader::open(const std::string& path) {
                 continue;
             }
 
-            const std::uint32_t shifted = readU32LE(buf.data() + headEnd + 7);
+            // VA encoding differs by subtag.
+            //   0x80/0xA0/0xE0: a 4-byte name-hash precedes the VA;
+            //                   VA bytes at headEnd + 7.
+            //   0x20:           no hash, VA bytes immediately follow
+            //                   the subtag triple; VA bytes at headEnd + 3.
+            // Both forms store the VA as a u32 left-shifted by 4
+            // (low nibble unused). The shorter 0x20 layout is what
+            // modern Delphi (10.x) emits for user-code class methods.
+            const std::size_t va_off = (fnSubTag == kFunctionSubTag3)
+                                       ? headEnd + 3
+                                       : headEnd + 7;
+            const std::uint32_t shifted = readU32LE(buf.data() + va_off);
             const std::uint64_t va = static_cast<std::uint64_t>(shifted) >> 4;
 
             // The trailer between the VA and the first sub-record (or
@@ -337,7 +352,7 @@ bool Reader::open(const std::string& path) {
             //   - a real 0x63 end marker (whose next byte starts a
             //     recognizable record; bare 0x63 bytes inside the
             //     trailer are common false positives).
-            const std::size_t scanFrom = headEnd + 11;
+            const std::size_t scanFrom = va_off + 4;
             const std::size_t scanCap  = buf.size() > 8 ? buf.size() - 8 : 0;
             const std::size_t scanTo   = std::min(scanFrom + 96, scanCap);
             std::size_t firstSub = SIZE_MAX;

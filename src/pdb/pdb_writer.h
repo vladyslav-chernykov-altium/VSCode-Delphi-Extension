@@ -41,11 +41,15 @@ struct CoffSection {
 };
 
 // One parameter or local variable inside a function. Emits as
-// S_REGREL32 between S_GPROC32 and S_END.
+// S_REGREL32 (located on the stack via RBP) when `optimized_out` is
+// false, or S_LOCAL with no location range when true -- the latter
+// surfaces in the Locals panel as "<optimized away>" rather than a
+// confusing garbage value.
 struct ModuleLocal {
     std::string  name;
-    std::int32_t offset = 0;     // signed, relative to RBP
-    bool         is_param = false;  // informational; CV doesn't distinguish
+    std::int32_t offset = 0;          // signed, relative to RBP
+    bool         is_param = false;    // informational; CV doesn't distinguish
+    bool         optimized_out = false;  // emit S_LOCAL, no defrange
 };
 
 // Function inside a Pascal compile unit. Emits as S_GPROC32 + S_END

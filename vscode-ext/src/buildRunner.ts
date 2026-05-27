@@ -316,6 +316,15 @@ async function runMsbuild(
     `  /p:DCC_DebugInformation=2 ^\r\n` +
     `  /p:DCC_LocalDebugSymbols=true ^\r\n` +
     `  /p:DCC_DebugInfoInExe=false ^\r\n` +
+    // Force every method to set up its own RBP frame and to spill
+    // register-passed args onto the stack. Without these flags tiny
+    // override thunks (e.g. 48-byte virtual delegates) reuse the
+    // caller's RBP and keep args in RCX/RDX, so S_REGREL32 records
+    // resolve to whatever happens to live at the caller's rbp+32/+40.
+    //   DCC_Optimize=false    -> equivalent to {$O-} (no peephole)
+    //   DCC_StackFrames=true  -> equivalent to {$W+} (frame ptr always)
+    `  /p:DCC_Optimize=false ^\r\n` +
+    `  /p:DCC_StackFrames=true ^\r\n` +
     `  /nologo /v:normal /clp:Summary;NoItemAndPropertyList\r\n`;
   output.appendLine(`\n--- msbuild wrapper ---\n${script.replace(/\r/g, '')}---`);
   return runViaBatchFile(script, dprojDir, output, 'msbuild', diagAcc, dprojDir);

@@ -1231,20 +1231,63 @@ int main(int argc, char** argv) {
                     // CodeView S_REGREL32.Offset = 16 + rsm_offset/2,
                     // matching the DWARF emitter's frame_base = rbp+16
                     // convention (see model::Variable docs).
+                    //
+                    // RSM proc-record offset encoding (empirical from
+                    // examples/04_locals reverse engineering):
+                    //   - Standalone procs / functions: every param +
+                    //     local stack_offset is the real signed offset
+                    //     from the frame anchor; formula `16 + off/2`
+                    //     gives the correct rbp-relative byte offset.
+                    //   - Class methods: `Self` is encoded with a
+                    //     sentinel `+26` (constant across methods) --
+                    //     decode would give rbp+29 which is wrong.
+                    //     All OTHER params and locals carry real
+                    //     offsets and decode via the same formula.
+                    //     Override Self alone to the Delphi x64 ABI
+                    //     slot rbp+32.
+                    //   - Collisions among multiple vars after decode
+                    //     indicate a frameless proc (tiny override
+                    //     thunk); mark every var optimized_out so
+                    //     cppvsdbg shows "<optimized away>" instead
+                    //     of reading garbage.
                     if (have_rsm) {
                         const auto* pr =
                             rsm_reader.findProcedureAt(r.va);
                         if (pr) {
-                            auto pushVar = [&](const rsm2pdb::rsm::Variable& v,
-                                               bool is_param) {
+                            std::vector<rsm2pdb::pdb::ModuleLocal> tentative;
+                            for (const auto& p : pr->params) {
                                 rsm2pdb::pdb::ModuleLocal ml;
-                                ml.name     = v.name;
-                                ml.is_param = is_param;
-                                ml.offset   = 16 + (v.stack_offset / 2);
-                                mf_out.locals.push_back(std::move(ml));
-                            };
-                            for (const auto& p : pr->params) pushVar(p, true);
-                            for (const auto& l : pr->locals) pushVar(l, false);
+                                ml.name     = p.name;
+                                ml.is_param = true;
+                                ml.offset   = (p.name == "Self")
+                                              ? 32
+                                              : 16 + (p.stack_offset / 2);
+                                tentative.push_back(std::move(ml));
+                            }
+                            for (const auto& l : pr->locals) {
+                                rsm2pdb::pdb::ModuleLocal ml;
+                                ml.name     = l.name;
+                                ml.is_param = false;
+                                ml.offset   = 16 + (l.stack_offset / 2);
+                                tentative.push_back(std::move(ml));
+                            }
+
+                            std::unordered_map<std::int32_t, int> off_count;
+                            for (const auto& ml : tentative) {
+                                ++off_count[ml.offset];
+                            }
+                            bool collided = false;
+                            for (const auto& kv : off_count) {
+                                if (kv.second > 1) { collided = true; break; }
+                            }
+                            if (!collided) {
+                                mf_out.locals = std::move(tentative);
+                            } else {
+                                for (auto& ml : tentative) {
+                                    ml.optimized_out = true;
+                                    mf_out.locals.push_back(std::move(ml));
+                                }
+                            }
                         }
                     }
 
