@@ -80,8 +80,12 @@ enum class SymbolKind {
 };
 
 // One formal parameter or local variable belonging to a function.
-// `stack_offset` is byte-signed relative to the subprogram's frame base
-// (DW_AT_frame_base). The DWARF emitter wraps it as DW_OP_fbreg.
+// `stack_offset` is the signed byte offset relative to RBP (the
+// subprogram's frame base, emitted as DW_AT_frame_base = DW_OP_breg6 0).
+// Populated by compose::resolveFunction after the Delphi-x64 frame
+// layout has been decoded from the prologue + RSM record (sub_rsp +
+// extra_pushes + Self / static-link special cases). For the per-byte
+// formula see src/compose/frame.h.
 struct LocalVar {
     std::string  name;
     TypeId       type = kNoType;

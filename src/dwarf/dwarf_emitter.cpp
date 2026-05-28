@@ -656,29 +656,21 @@ void writeCompileUnit(BytesBuf& info,
             } else {
                 // Subprogram with children + frame_base.
                 //
-                // Delphi Win64 debug prologue:
-                //     push rbp
-                //     sub  rsp, 0x10
-                //     mov  rbp, rsp
-                // The new rbp points at the bottom of the local-area
-                // allocation. The natural "frame pointer" expected by
-                // RSM's offset encoding is rbp+16 (= old saved rbp).
-                //
-                // RSM encodes stack offsets in 2-byte units relative to
-                // a frame anchor 16 bytes above the actual rbp:
-                //     real_byte_offset = (rsm_offset / 2) + 16
-                //
-                // We emit DW_AT_frame_base = (rbp + 16) and then per-var
-                // DW_OP_fbreg (rsm_offset / 2). gdb resolves the address
-                // as (rbp+16) + (rsm/2) = real_byte_offset ✓.
+                // model::LocalVar::stack_offset is the already-resolved
+                // signed byte offset from RBP, computed by
+                // compose::resolveFunction from the prologue's sub_rsp +
+                // extra_pushes plus the RSM record (Self / static-link
+                // special cases). We just need to tell gdb that
+                // DW_AT_frame_base = RBP and DW_OP_fbreg(N) means [rbp+N].
                 info.uleb128(kAbbrevSubprogramWithKids);
                 info.cstr(sym.name);
                 info.u64(sym.address);
                 info.u64(end);
                 info.u8(1);                       // external
-                // frame_base exprloc: DW_OP_breg6 sleb128(+16)
+                // frame_base exprloc: DW_OP_breg6 sleb128(0) -- frame
+                // base is RBP itself; each var is `[rbp + stack_offset]`.
                 {
-                    auto leb = sleb128Bytes(16);
+                    auto leb = sleb128Bytes(0);
                     info.uleb128(1 + leb.size());
                     info.u8(DW_OP_breg6);
                     info.raw(leb.data(), leb.size());
@@ -694,9 +686,10 @@ void writeCompileUnit(BytesBuf& info,
                     info.uleb128(abbrev_code);
                     info.cstr(v.name);
                     info.u32(type_off);
-                    // Location: DW_OP_fbreg sleb128(rsm_offset / 2)
-                    const std::int64_t fbreg = v.stack_offset / 2;
-                    auto leb = sleb128Bytes(fbreg);
+                    // Location: DW_OP_fbreg sleb128(stack_offset).
+                    // stack_offset is already rbp-relative real byte
+                    // offset (post-compose); no scaling needed.
+                    auto leb = sleb128Bytes(v.stack_offset);
                     info.uleb128(1 + leb.size());
                     info.u8(DW_OP_fbreg);
                     info.raw(leb.data(), leb.size());
