@@ -1041,6 +1041,65 @@ delivered together. Remaining sub-milestones below are deferred.
 [ ] 20   Sets, variants, dynamic arrays, interfaces, classes.
          Major design effort - revisit once core path is solid.
 
+[ ] 21   Interface-adjuster-thunk naming + .natstepfilter generation
+         (VS2022 step-into UX parity with our VSCode hybrid mode).
+
+         Context: when stepping into an interface method, Delphi
+         routes the call through a tiny adjuster thunk
+             add rcx, -ofs
+             jmp TClass.Method
+         that has no source mapping in RSM. Our VSCode extension
+         walks through it via `skipUnknownSourceMode = "hybrid"`
+         (2 stepIns) and lands the user in the method body. VS2022
+         IDE doesn't load our extension, so the user there sees
+         "Source Not Available" + disassembly until they press F11
+         a few more times manually.
+
+         Approach: pure rsm2pdb-side fix that also benefits cdb /
+         cppvsdbg by giving the thunk a meaningful name.
+
+           a) Thunk detection in the PE.
+              Heuristic: a function with exactly two instructions
+              matching the pattern
+                  48 83 C1 NN          ; add rcx, imm8 (sign-ext)
+                  E9 NN NN NN NN       ; jmp rel32
+              (5 + 4 bytes total; sometimes 4 + 5 with REX flip).
+              Walk all proc bytes between the lowest .map function
+              VA and the highest, look for those byte patterns.
+              Cross-reference the jmp target against the .map: if
+              it lands on a real class-method, this is an adjuster
+              thunk for THAT method.
+
+           b) Synthesise a S_GPROC32 + S_PUB32 entry for the thunk
+              in the PDB. Suggested naming:
+                  <Class>.<Method>$Adjust_<Hex>
+              e.g. iface.TMyClass.MyMethod$Adjust_FFFFFFE0
+              Public name surfaces in Call Stack instead of the
+              current `iface...TMyClass+0xa`.
+
+           c) Generate <pdb-base>.natstepfilter alongside the PDB:
+                  <?xml version="1.0" encoding="utf-8"?>
+                  <StepFilter ...>
+                    <Function>
+                      <Name>.*\$Adjust_[0-9A-F]+$</Name>
+                      <Action>NoStepInto</Action>
+                    </Function>
+                  </StepFilter>
+              VS2022 reads this from the directory next to the
+              PDB. Step Into through the thunk then tail-call-skips
+              to the real method, exactly like our hybrid does.
+
+           d) cppvsdbg picks up .natstepfilter the same way -- the
+              VSCode hybrid-mode auto-skip becomes redundant for
+              this specific case, but kept as fallback for RTL
+              functions that natstepfilter can't easily express.
+
+         Effort: ~half a day. Touches src/pdb/, src/cli/cli_cmd_pdb,
+         needs no compose-side changes.
+
+         Bonus: cleaner Call Stack -- adjuster thunks named
+         meaningfully, not as offsets.
+
 ================================================================================
   KEY DECISIONS LOG
 ================================================================================
