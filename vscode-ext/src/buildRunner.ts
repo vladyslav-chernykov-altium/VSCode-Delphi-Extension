@@ -9,6 +9,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 
 import type { DprojSettings, Platform } from './dprojParser';
+import { isProjectUpToDate } from './upToDateCheck';
 
 export interface BuildResult {
   ok: boolean;
@@ -192,6 +193,32 @@ export async function runBuild(
       error: 'tool paths not resolvable; see Output for details',
       outputPath: '',
     };
+  }
+
+  // ----- 0. up-to-date pre-check (Make only) -----
+  // Delphi's MSBuild always re-links on Make, even when nothing
+  // changed, which costs ~30s on AdvPCB-scale and then poisons our
+  // downstream rsm2pdb mtime-skip (touched .exe -> rsm2pdb re-runs).
+  // Do a fast source-mtime walk ourselves and skip the whole pipeline
+  // if every source predates the existing build output.
+  if (plan.target === 'Make') {
+    output.appendLine(`${stamp()} up-to-date check (walking sources)...`);
+    const utd = await isProjectUpToDate({
+      dprojPath: plan.dprojPath,
+      settings: plan.settings,
+      rsm2pdbExe: tools.rsm2pdbExe,
+    });
+    output.appendLine(
+      `${stamp()} ${utd.reason} ` +
+        `(${utd.filesScanned} files, ${utd.scanMs}ms)`,
+    );
+    if (utd.upToDate) {
+      output.appendLine(
+        `${stamp()} skipping msbuild + rsm2pdb (sources unchanged) -> ` +
+          plan.settings.outputFullPath,
+      );
+      return { ok: true, outputPath: plan.settings.outputFullPath };
+    }
   }
 
   // ----- 1+2. msbuild via rsvars -----
