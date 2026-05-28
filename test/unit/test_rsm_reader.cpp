@@ -496,6 +496,48 @@ TEST_CASE("rsm::Reader decodes enum entries from records.rsm") {
     CHECK(findOrd("clYellow") == 3);
 }
 
+TEST_CASE("rsm::Reader sets pascal_type for non-primitive globals") {
+    // Phase B.2: every non-primitive global whose inline_type_id
+    // resolves to an aggregate gets its pascal_type set to the
+    // aggregate's name. Variables that fall through (RTL types we
+    // don't decode, etc.) stay with empty pascal_type and the
+    // downstream typing falls back to byte[N].
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kRecords));
+
+    const auto findVarByName = [&](const std::string& nm) -> const rsm2pdb::rsm::Variable* {
+        for (const auto& v : r.variables()) {
+            if (v.name == nm) return &v;
+        }
+        return nullptr;
+    };
+
+    // User globals: 10 typed aggregates. Each should resolve to its
+    // Pascal type name via the aggregate path.
+    struct Expect { const char* name; const char* type; };
+    const Expect cases[] = {
+        {"GPoint",  "TPoint"},
+        {"GPerson", "TPerson"},
+        {"GBox",    "TBox"},
+        {"GPacked", "TPacked"},
+        {"GColor",  "TColor"},
+        {"GColors", "TColors"},
+        {"GShape",  "TShape"},
+        {"GCircle", "TCircle"},
+        {"GBag",    "TBag"},
+        {"GBig",    "TBig"},
+    };
+    for (const auto& c : cases) {
+        const auto* v = findVarByName(c.name);
+        REQUIRE_MESSAGE(v != nullptr, "missing global " << c.name);
+        CHECK_MESSAGE(!v->is_primitive,
+                      "global " << c.name << " unexpectedly primitive");
+        CHECK_MESSAGE(v->pascal_type == c.type,
+                      "global " << c.name << " pascal_type='" << v->pascal_type
+                                          << "', expected '" << c.type << "'");
+    }
+}
+
 TEST_CASE("rsm::Reader links variables to aggregates by inline_type_id") {
     // Globals in records.rsm carry inline_type_id == aggregate own_hash.
     // findAggregateByHash() should round-trip cleanly.

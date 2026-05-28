@@ -1222,6 +1222,33 @@ bool Reader::open(const std::string& path) {
                      fields_total, entries_total);
     }
 
+    // -- Aggregate-based type resolution (Phase B.2) -----------------
+    //
+    // Non-primitive variables carry their type's own_hash in
+    // inline_type_id (see Variable::inline_type_id in rsm_reader.h).
+    // Resolve to Pascal-type name via findAggregateByHash; the
+    // existing primitive-typed-via-0x66 path (above) is left alone.
+    //
+    // Procedure params / locals are NOT yet covered here -- their
+    // sub-record parser (parseSub) currently treats the 2-byte hash
+    // as a marker+offset pair and returns garbage. Wiring them up is
+    // Phase B.3 (requires extending parseSub's discriminator).
+    {
+        std::size_t typed_via_aggr = 0;
+        for (auto& v : variables_) {
+            if (v.is_primitive) continue;
+            if (v.inline_type_id == 0) continue;
+            if (!v.pascal_type.empty()) continue;  // already resolved
+            const auto* a = findAggregateByHash(v.inline_type_id);
+            if (a == nullptr) continue;
+            v.pascal_type = a->name;
+            ++typed_via_aggr;
+        }
+        std::fprintf(stderr,
+                     "[rsm] aggregate-typed globals: %zu\n",
+                     typed_via_aggr);
+    }
+
     return true;
 }
 
