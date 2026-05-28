@@ -14,6 +14,14 @@ enum class PrimitiveKind {
     Int8, Int16, Int32, Int64,
     UInt8, UInt16, UInt32, UInt64,
     Float32, Float64, Float80,
+    // 8-byte pointers to character data. Used for Pascal string
+    // family: `string`/`UnicodeString`/`WideString` -> PWChar (the
+    // pointer addresses a UTF-16 char sequence with a hidden ref-
+    // count / length header just below); `AnsiString`/`UTF8String`/
+    // `PAnsiChar` -> PChar (1-byte chars). pdb_writer renders these
+    // as CodeView pointer-to-char simple types so cdb/VS show them
+    // as `"hello"` instead of an opaque address.
+    PChar, PWChar,
 };
 
 using TypeId = std::uint32_t;

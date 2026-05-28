@@ -480,6 +480,14 @@ PrimitiveDescriptor describePrimitive(model::PrimitiveKind k) {
     case model::PrimitiveKind::Float32: return {"Single",   4, DW_ATE_float};
     case model::PrimitiveKind::Float64: return {"Double",   8, DW_ATE_float};
     case model::PrimitiveKind::Float80: return {"Extended", 10, DW_ATE_float};
+    // String-pointer primitives. DWARF has no built-in
+    // pointer-to-char "string display" flag, so we describe them as
+    // 8-byte unsigned addresses (the gdb pretty-printer can still
+    // dereference manually). The PDB backend renders them as native
+    // CodeView pointer-to-char simple types where cdb auto-displays
+    // them as `"..."`.
+    case model::PrimitiveKind::PChar:   return {"PAnsiChar", 8, DW_ATE_address};
+    case model::PrimitiveKind::PWChar:  return {"PWideChar", 8, DW_ATE_address};
     }
     return {"unknown", 1, DW_ATE_unsigned};
 }

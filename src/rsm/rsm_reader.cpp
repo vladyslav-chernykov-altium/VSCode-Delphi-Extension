@@ -64,35 +64,51 @@ struct PrimitiveDesc {
     std::uint16_t        byte_size;
 };
 
-constexpr std::array<PrimitiveDesc, 28> kPrimitiveTable = {{
-    {"Boolean",    model::PrimitiveKind::Bool,    1},
-    {"ByteBool",   model::PrimitiveKind::Bool,    1},
-    {"WordBool",   model::PrimitiveKind::Bool,    2},
-    {"LongBool",   model::PrimitiveKind::Bool,    4},
-    {"AnsiChar",   model::PrimitiveKind::Char,    1},
-    {"Char",       model::PrimitiveKind::WChar,   2},
-    {"WideChar",   model::PrimitiveKind::WChar,   2},
-    {"ShortInt",   model::PrimitiveKind::Int8,    1},
-    {"SmallInt",   model::PrimitiveKind::Int16,   2},
-    {"Integer",    model::PrimitiveKind::Int32,   4},
-    {"LongInt",    model::PrimitiveKind::Int32,   4},
-    {"Int64",      model::PrimitiveKind::Int64,   8},
-    {"NativeInt",  model::PrimitiveKind::Int64,   8},
-    {"Comp",       model::PrimitiveKind::Int64,   8},
-    {"Byte",       model::PrimitiveKind::UInt8,   1},
-    {"Word",       model::PrimitiveKind::UInt16,  2},
-    {"Cardinal",   model::PrimitiveKind::UInt32,  4},
-    {"LongWord",   model::PrimitiveKind::UInt32,  4},
-    {"UInt64",     model::PrimitiveKind::UInt64,  8},
-    {"NativeUInt", model::PrimitiveKind::UInt64,  8},
-    {"Single",     model::PrimitiveKind::Float32, 4},
-    {"Real",       model::PrimitiveKind::Float64, 8},
-    {"Real48",     model::PrimitiveKind::Float64, 6},
-    {"Double",     model::PrimitiveKind::Float64, 8},
-    {"Extended",   model::PrimitiveKind::Float64, 8},
-    {"Extended80", model::PrimitiveKind::Float80, 10},
-    {"Currency",   model::PrimitiveKind::Int64,   8},
-    {"Pointer",    model::PrimitiveKind::UInt64,  8},
+constexpr std::array<PrimitiveDesc, 36> kPrimitiveTable = {{
+    {"Boolean",       model::PrimitiveKind::Bool,    1},
+    {"ByteBool",      model::PrimitiveKind::Bool,    1},
+    {"WordBool",      model::PrimitiveKind::Bool,    2},
+    {"LongBool",      model::PrimitiveKind::Bool,    4},
+    {"AnsiChar",      model::PrimitiveKind::Char,    1},
+    {"Char",          model::PrimitiveKind::WChar,   2},
+    {"WideChar",      model::PrimitiveKind::WChar,   2},
+    {"ShortInt",      model::PrimitiveKind::Int8,    1},
+    {"SmallInt",      model::PrimitiveKind::Int16,   2},
+    {"Integer",       model::PrimitiveKind::Int32,   4},
+    {"LongInt",       model::PrimitiveKind::Int32,   4},
+    {"Int64",         model::PrimitiveKind::Int64,   8},
+    {"NativeInt",     model::PrimitiveKind::Int64,   8},
+    {"Comp",          model::PrimitiveKind::Int64,   8},
+    {"Byte",          model::PrimitiveKind::UInt8,   1},
+    {"Word",          model::PrimitiveKind::UInt16,  2},
+    {"Cardinal",      model::PrimitiveKind::UInt32,  4},
+    {"LongWord",      model::PrimitiveKind::UInt32,  4},
+    {"UInt64",        model::PrimitiveKind::UInt64,  8},
+    {"NativeUInt",    model::PrimitiveKind::UInt64,  8},
+    {"Single",        model::PrimitiveKind::Float32, 4},
+    {"Real",          model::PrimitiveKind::Float64, 8},
+    {"Real48",        model::PrimitiveKind::Float64, 6},
+    {"Double",        model::PrimitiveKind::Float64, 8},
+    {"Extended",      model::PrimitiveKind::Float64, 8},
+    {"Extended80",    model::PrimitiveKind::Float80, 10},
+    {"Currency",      model::PrimitiveKind::Int64,   8},
+    {"Pointer",       model::PrimitiveKind::UInt64,  8},
+    // String family. Delphi's modern `string`/`UnicodeString` and
+    // `WideString` are 8-byte pointers to UTF-16 char sequences (with
+    // a hidden RTL header just below); `AnsiString`/`UTF8String` are
+    // pointers to 1-byte char sequences. `PChar`/`PAnsiChar`/
+    // `PWideChar` are the raw pointer aliases (PChar = PWideChar on
+    // modern Delphi). `ShortString` is NOT pointer-based (it's an
+    // inline length-prefixed byte array, default 256 bytes) so we
+    // leave it out -- the size-based fallback emits it as byte[N].
+    {"UnicodeString", model::PrimitiveKind::PWChar,  8},
+    {"WideString",    model::PrimitiveKind::PWChar,  8},
+    {"AnsiString",    model::PrimitiveKind::PChar,   8},
+    {"UTF8String",    model::PrimitiveKind::PChar,   8},
+    {"PChar",         model::PrimitiveKind::PWChar,  8},
+    {"PWideChar",     model::PrimitiveKind::PWChar,  8},
+    {"PAnsiChar",     model::PrimitiveKind::PChar,   8},
+    {"string",        model::PrimitiveKind::PWChar,  8},
 }};
 
 const PrimitiveDesc* lookupPrimitiveDesc(std::string_view name) {

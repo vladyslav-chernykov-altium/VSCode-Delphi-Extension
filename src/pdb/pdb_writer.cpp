@@ -191,6 +191,18 @@ bool writePdb(const std::string& path,
             // Float80 (Pascal Extended on x86) has no CodeView simple
             // type; emit as a 10-byte hex array.
             case K::Float80: return typeForSize(v.byte_size);
+            // Pointer-to-char primitives -- CodeView lets us encode
+            // these as a SimpleTypeKind paired with a 64-bit pointer
+            // mode, no LF_POINTER TPI record needed. cdb / VS render
+            // the pointee as a string starting at the address.
+            case K::PChar:
+                return codeview::TypeIndex(
+                    codeview::SimpleTypeKind::NarrowCharacter,
+                    codeview::SimpleTypeMode::NearPointer64);
+            case K::PWChar:
+                return codeview::TypeIndex(
+                    codeview::SimpleTypeKind::WideCharacter,
+                    codeview::SimpleTypeMode::NearPointer64);
         }
         return typeForSize(v.byte_size);
     };
