@@ -425,9 +425,18 @@ async function runRsm2pdb(
     const uniqDirs = Array.from(new Set(searchDirs));
     const args = ['pdb', mapPath, exePath, pdbPath];
     for (const d of uniqDirs) { args.push('--src-search', d); }
+    // Strip Delphi RTL / framework symbols from the PDB by default.
+    // Without rsm2pdb.includeRtlSymbols=true, we pass no flag and
+    // rsm2pdb's own default (strip) takes effect; with the setting
+    // on, we add --include-rtl so System.* / SysInit / Winapi.* /
+    // Vcl.* publics + modules get kept.
+    const includeRtl = vscode.workspace.getConfiguration('rsm2pdb')
+      .get<boolean>('includeRtlSymbols') ?? false;
+    if (includeRtl) args.push('--include-rtl');
     output.appendLine(
       `\n$ "${tools.rsm2pdbExe}" pdb "${mapPath}" "${exePath}" "${pdbPath}" ` +
-        `(${uniqDirs.length} --src-search dirs)`,
+        `(${uniqDirs.length} --src-search dirs` +
+        `${includeRtl ? ', --include-rtl' : ''})`,
     );
     return spawnAndPipe(
       tools.rsm2pdbExe, args, outDir, output, 'rsm2pdb pdb',

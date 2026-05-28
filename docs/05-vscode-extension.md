@@ -342,6 +342,38 @@ Safety:
 - Per-thread / per-session budget; resets on `terminated` /
   thread change.
 
+## RTL / framework symbol stripping
+
+Driven by `rsm2pdb.includeRtlSymbols` (default `false`). When the
+setting is `false`, `rsm2pdb pdb` is invoked without
+`--include-rtl`, and the converter drops every public + module
+whose qualified Pascal name starts with one of these prefixes:
+
+```
+System  SysInit  Winapi  Vcl  Fmx  Soap  Datasnap  Data
+Inet    IBX      REST    Bde  IndySystem
+```
+
+On examples/05_types the savings are dramatic:
+
+```
+publics: 40 emitted (was 2386 -- 2346 RTL-filtered)
+modules: 1 (RTL-filtered 12)
+PDB size: ~60 KB (was ~250 KB+)
+```
+
+Real-world projects scale linearly: an AdvPCB-sized PDB drops from
+hundreds of MB to tens. Step Into into a stripped RTL function
+lands at an offset with no symbol, our auto-step-skip kicks in
+(source-path is empty + symbol name is empty) and we Step Out
+straight back to the user-code caller.
+
+Flip the setting to `true` if you really want RTL stepping; just
+make sure the Embarcadero install's `source/rtl/*.pas` is on
+`--src-search` (configured via the .dproj's unit / include search
+paths or the project's `DCCReference` list), otherwise the
+debugger will still complain about missing source.
+
 ## Up-to-date check
 
 Before each `rsm2pdb pdb` / `rsm2pdb dwarf` invocation, the build

@@ -80,6 +80,7 @@ appears as a toast and in the Debug Console.
 | `rsm2pdb.backend` | `pdb` | `"pdb"` (cppvsdbg, default) or `"dwarf"` (cppdbg + gdb). |
 | `rsm2pdb.console` | `integrated` | Where debuggee stdout/stderr appears. `integrated` → VSCode Terminal / Debug Console. `external` → separate Windows console window. |
 | `rsm2pdb.skipUnknownSourceMode` | `out` | Auto-skip stops in code without source. `"off"` / `"out"` (stepOut chain, safe) / `"hybrid"` (try stepIn first, may bypass breakpoints). |
+| `rsm2pdb.includeRtlSymbols` | `false` | When `false` (default), `rsm2pdb pdb` strips Delphi RTL / framework publics + modules (`System.*`, `SysInit`, `Winapi.*`, `Vcl.*`, `Fmx.*`, `Soap.*`, etc.). PDB shrinks ~50x on real projects; Call Stack stays clean. Set `true` if you genuinely want to debug into RTL. |
 
 ## What the pipeline does
 

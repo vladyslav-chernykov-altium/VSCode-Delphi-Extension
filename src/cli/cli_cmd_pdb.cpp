@@ -35,9 +35,12 @@ int cmdPdb(int argc, char** argv) {
     const std::string& output_exe = input_exe;  // in-place injection
     const std::string output_pdb(argv[4]);
     std::vector<std::string> src_search_dirs;
+    bool include_rtl = false;   // default: strip RTL / framework symbols
     for (int i = 5; i < argc; ++i) {
         if (std::strcmp(argv[i], "--src-search") == 0 && i + 1 < argc) {
             src_search_dirs.emplace_back(argv[++i]);
+        } else if (std::strcmp(argv[i], "--include-rtl") == 0) {
+            include_rtl = true;
         } else {
             std::fprintf(stderr, "error: unknown pdb arg: %s\n", argv[i]);
             return 1;
@@ -46,6 +49,39 @@ int cmdPdb(int argc, char** argv) {
     if (extLower(map_path) != "map") {
         std::fprintf(stderr, "error: first argument must be a .map file\n");
         return 1;
+    }
+
+    // Predicate: does this Pascal-qualified name (unit or unit-dot-
+    // member, e.g. "System.SysUtils.Format") belong to a Delphi
+    // built-in framework unit we have no proper debug info for and
+    // therefore have no reason to publish in the PDB? Match prefixes
+    // anchored at the start of the qualified name; we accept both
+    // bare-unit ("System") and dotted-member ("System.X.Y") forms.
+    //
+    // Coverage = canonical Delphi-shipped frameworks. Third-party
+    // libraries (Indy variants are sometimes called Idxxx) stay
+    // visible -- those are normally what a user actually wants when
+    // stepping into someone else's code.
+    auto isRtlQName = [](std::string_view q) -> bool {
+        static constexpr std::string_view roots[] = {
+            "System",  "SysInit", "Winapi",   "Vcl",
+            "Fmx",     "Soap",    "Datasnap", "Data",
+            "Inet",    "IBX",     "REST",     "Bde",
+            "IndySystem",
+        };
+        for (auto r : roots) {
+            if (q.size() < r.size()) continue;
+            if (q.compare(0, r.size(), r) != 0) continue;
+            // Bare unit name match or dotted continuation.
+            if (q.size() == r.size()) return true;
+            if (q[r.size()] == '.') return true;
+        }
+        return false;
+    };
+    if (!include_rtl) {
+        std::fputs("rtl filter: ON (use --include-rtl to keep "
+                   "System.* / SysInit / Winapi.* / Vcl.* / ...)\n",
+                   stdout);
     }
 
     // Per-phase timings; AdvPCB scale (~88 MB .text / ~500 MB .rsm)
@@ -166,8 +202,10 @@ int cmdPdb(int argc, char** argv) {
     }
 
     std::size_t skipped = 0;
+    std::size_t skipped_rtl = 0;
     inputs.publics.reserve(mf.publics.size());
     for (const auto& p : mf.publics) {
+        if (!include_rtl && isRtlQName(p.name)) { ++skipped_rtl; continue; }
         const std::uint64_t rva = rvaOfPublic(p);
         const std::uint16_t seg_idx = findPeSection(rva);
         if (seg_idx == 0) { ++skipped; continue; }
@@ -179,8 +217,9 @@ int cmdPdb(int argc, char** argv) {
         ps.is_function = seg_is_code[p.segment_id];
         inputs.publics.push_back(std::move(ps));
     }
-    std::fprintf(stdout, "publics: %zu emitted, %zu skipped (no PE section)\n",
-                 inputs.publics.size(), skipped);
+    std::fprintf(stdout,
+                 "publics: %zu emitted, %zu no-PE-section, %zu RTL-filtered\n",
+                 inputs.publics.size(), skipped, skipped_rtl);
 
     // Optional: parse sibling .rsm for procedure records (params +
     // locals). When present, each function's locals[] gets
@@ -317,7 +356,12 @@ int cmdPdb(int argc, char** argv) {
         for (const auto& lt : mf.line_tables) unit_names.insert(lt.module_name);
 
         std::size_t total_fns = 0, total_lines = 0;
+        std::size_t skipped_modules = 0;
         for (const auto& uname : unit_names) {
+            if (!include_rtl && isRtlQName(uname)) {
+                ++skipped_modules;
+                continue;
+            }
             rsm2pdb::pdb::Module pdb_mod;
             pdb_mod.name = uname;
             auto it_lts = by_name.find(uname);
@@ -424,8 +468,8 @@ int cmdPdb(int argc, char** argv) {
             inputs.modules.push_back(std::move(pdb_mod));
         }
         std::fprintf(stdout,
-            "modules: %zu, S_GPROC32: %zu, line entries: %zu\n",
-            inputs.modules.size(), total_fns, total_lines);
+            "modules: %zu (RTL-filtered %zu), S_GPROC32: %zu, line entries: %zu\n",
+            inputs.modules.size(), skipped_modules, total_fns, total_lines);
     }
 
     stamp("phase: write PDB (LLVM streams)");

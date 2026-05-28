@@ -401,6 +401,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "**Deprecated:** use `#rsm2pdb.skipUnknownSourceMode#` instead. When this is set explicitly, `false` maps to `mode = off` and `true` maps to `mode = out`."
+        },
+        "rsm2pdb.includeRtlSymbols": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When **false** (default), the PDB writer strips Delphi RTL / framework publics + modules (`System.*`, `SysInit`, `Winapi.*`, `Vcl.*`, `Fmx.*`, `Soap.*`, `Datasnap.*`, `Data.*`, `Inet.*`, `IBX.*`, `REST.*`, `Bde`, `IndySystem`). Cuts PDB size by ~50x on real projects and removes the noise from Call Stack -- nothing useful for stepping anyway since we don't have RSM proc-records for RTL units.\n\nSet **true** if you do want to debug into RTL (will require Embarcadero install source to be on disk and added to `--src-search`). Passes `--include-rtl` to `rsm2pdb pdb`."
         }
       }
     }
