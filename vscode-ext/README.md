@@ -27,15 +27,47 @@ Working today against real Delphi projects (incl. Altium's AdvPCB:
 
 | Key | Command | What |
 |---|---|---|
-| `Ctrl+B` | `rsm2pdb.build` | **Make** — incremental build + DWARF inject |
-| `Ctrl+Shift+B` | `rsm2pdb.rebuild` | **Full rebuild** + DWARF inject |
-| `Ctrl+F9` | `rsm2pdb.buildAndDebug` | Make + Run (launch cppdbg) |
-| `Ctrl+Shift+F9` | `rsm2pdb.debugLast` | Launch last build (no rebuild) |
-| `Ctrl+Shift+C` | `rsm2pdb.cancelBuild` | Cancel running build (kills tree) |
+| `Ctrl+B` | `rsm2pdb.build` | **Make** — incremental build + debug-info inject |
+| `Ctrl+Shift+B` | `rsm2pdb.rebuild` | **Full rebuild** + debug-info inject |
+| `Ctrl+F9` | `rsm2pdb.debugLast` | **Run** — launch last build, no build step |
+| `Ctrl+Shift+F9` | `rsm2pdb.buildAndDebug` | **Make+Run** — Make + launch debugger |
+| `Ctrl+F2` | `rsm2pdb.cancelBuild` | Cancel running build (kills tree) |
+| _Ctrl+Shift+P_ | `rsm2pdb.pickActiveProject` | Switch the active `.dproj` |
+| _Ctrl+Shift+P_ | `rsm2pdb.pickActiveConfig` | Switch the active (Config, Platform) |
+| _Ctrl+Shift+P_ | `rsm2pdb.pickActive` | Pick project + config in one step |
 | _Ctrl+Shift+P_ | `rsm2pdb.inspectProject` | Parse a `.dproj` and dump its configs |
-| _Ctrl+Shift+P_ | `rsm2pdb.pickProject` | List discovered `.dproj` files |
 
 `F9` itself stays as VSCode's default (toggle breakpoint).
+
+## Status-bar UI
+
+Bottom-left, always visible when a `.dproj` is in the workspace:
+
+```
+[📦 ProjectName] [⚙ Debug Win64] [🔧 Build] [🔄 Rebuild]
+                                 [▶ Run] [⟳ Make+Run] [⊘ Cancel]
+```
+
+- **Project / Config pills** — click to swap. Build / Rebuild /
+  Make+Run use the active pick without re-prompting.
+- **Cancel pill** — turns orange/yellow while a build is running so
+  the kill switch is impossible to miss.
+- All four build/run buttons are pure UI for the same commands as
+  the keybindings above.
+
+## "View as ..." (debug variables)
+
+Right-click a variable in the Variables or Watch panel during a
+debug session for an `rsm2pdb: View as ...` submenu:
+
+- **Strings**: `String (UnicodeString)`, `AnsiString`, `WideString`
+- **Ints**: `Integer`, `Cardinal`, `Int64`, `UInt64`, `Byte`, `Word`
+- **Floats**: `Single`, `Double`
+- **Byte arrays**: `Byte[16]`, `Byte[64]` (hex dump)
+
+Useful when a variable comes through as `void*` or native-int
+because the type table didn't carry enough info — the cast result
+appears as a toast and in the Debug Console.
 
 ## Settings
 
@@ -45,6 +77,9 @@ Working today against real Delphi projects (incl. Altium's AdvPCB:
 | `rsm2pdb.executable` | `${workspaceFolder}/build/src/rsm2pdb.exe` | Path to `rsm2pdb.exe`. Auto-falls-back to the extension's sibling `build/src/rsm2pdb.exe` during dev. |
 | `rsm2pdb.gdbPath` | `C:/Dev/Tools/msys64/mingw64/bin/gdb.exe` | mingw-w64 gdb used by cppdbg. |
 | `rsm2pdb.defaultPlatform` | `Win64` | Reserved; only Win64 is supported by rsm2pdb today. |
+| `rsm2pdb.backend` | `pdb` | `"pdb"` (cppvsdbg, default) or `"dwarf"` (cppdbg + gdb). |
+| `rsm2pdb.console` | `integrated` | Where debuggee stdout/stderr appears. `integrated` → VSCode Terminal / Debug Console. `external` → separate Windows console window. |
+| `rsm2pdb.skipUnknownSourceMode` | `out` | Auto-skip stops in code without source. `"off"` / `"out"` (stepOut chain, safe) / `"hybrid"` (try stepIn first, may bypass breakpoints). |
 
 ## What the pipeline does
 

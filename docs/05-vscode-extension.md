@@ -235,22 +235,129 @@ Encoded in `package.json contributes.keybindings`:
     "when": "workspaceFolderCount > 0 && !inputFocus" },
   { "command": "rsm2pdb.rebuild",       "key": "ctrl+shift+b",
     "when": "workspaceFolderCount > 0" },
-  { "command": "rsm2pdb.buildAndDebug", "key": "ctrl+f9",
+  { "command": "rsm2pdb.debugLast",     "key": "ctrl+f9",
     "when": "workspaceFolderCount > 0" },
-  { "command": "rsm2pdb.cancelBuild",   "key": "ctrl+shift+c",
+  { "command": "rsm2pdb.cancelBuild",   "key": "ctrl+f2",
     "when": "workspaceFolderCount > 0" },
-  { "command": "rsm2pdb.debugLast",     "key": "ctrl+shift+f9",
+  { "command": "rsm2pdb.buildAndDebug", "key": "ctrl+shift+f9",
     "when": "workspaceFolderCount > 0" }
 ]
 ```
 
 `Ctrl+B` carries the `!inputFocus` guard so the editor's normal
-typing of `Ctrl+B` still works inside text inputs. Other keys are
-unconditional because their conflicts (`Ctrl+Shift+B` = VSCode's
-Run Build Task, `F9` = toggle breakpoint) are exactly what we want
-to override (Ctrl+Shift+B) or NOT want to override (we use Ctrl+F9
-and Ctrl+Shift+F9 instead of plain F9 specifically to preserve
-breakpoint-toggle).
+typing of `Ctrl+B` still works inside text inputs. `Ctrl+F2` was
+picked for Cancel because the obvious `Ctrl+Shift+C` collides with
+VSCode's `Terminal: Open New External Terminal`. `F9` itself stays
+free for breakpoint-toggle; build+run uses `Ctrl+Shift+F9` and
+relaunch-without-build uses `Ctrl+F9`.
+
+## Status-bar UI
+
+A horizontal cluster of pills sits in the bottom-left of the status
+bar whenever a `.dproj` is present in the workspace (priorities are
+descending left-to-right):
+
+```
+[📦 ProjectName] [⚙ Debug Win64] [🔧 Build] [🔄 Rebuild]
+                                 [▶ Run] [⟳ Make+Run] [⊘ Cancel]
+```
+
+- **`📦 Project pill`** -- shows the active `.dproj`'s base name.
+  Click to swap (`rsm2pdb.pickActiveProject`).
+- **`⚙ Config pill`** -- shows the active (Config name, Platform)
+  tuple. Click to swap (`rsm2pdb.pickActiveConfig`) -- lists the
+  configurations of the currently-active project.
+- **`🔧 Build`** -- `rsm2pdb.build` (Make incremental, no launch).
+- **`🔄 Rebuild`** -- `rsm2pdb.rebuild` (full clean rebuild, no
+  launch).
+- **`▶ Run`** -- `rsm2pdb.debugLast` (launch last build, no build
+  step).
+- **`⟳ Make+Run`** -- `rsm2pdb.buildAndDebug` (Make + launch).
+- **`⊘ Cancel`** -- `rsm2pdb.cancelBuild`. Background flips to
+  `statusBarItem.warningBackground` (orange/yellow) while a build
+  is in progress so the kill switch is visually impossible to miss.
+
+The active-pick state is persisted in `context.workspaceState` under
+`'rsm2pdb.lastPick'` so it survives reloads. Build / Rebuild /
+Make+Run read the saved pick without re-prompting; the first invocation
+in a clean workspace falls back to the picker flow and saves the
+choice.
+
+## "View as ..." context menu
+
+Right-click a variable in the Variables panel (or an entry in the
+Watch panel) and the `rsm2pdb: View as ...` submenu offers
+on-the-fly reinterpretation:
+
+```
+View as String (UnicodeString)        -> (wchar_t*)(var)
+View as AnsiString (char*)            -> (char*)(var)
+View as WideString (wchar_t*)         -> (wchar_t*)(var)
+View as Integer (Int32)               -> *(int*)&(var)
+View as Cardinal (UInt32)             -> *(unsigned int*)&(var)
+View as Int64                         -> *(__int64*)&(var)
+View as UInt64                        -> *(unsigned __int64*)&(var)
+View as Byte                          -> *(unsigned char*)&(var)
+View as Word (UInt16)                 -> *(unsigned short*)&(var)
+View as Single (float)                -> *(float*)&(var)
+View as Double                        -> *(double*)&(var)
+View as Byte[16] (hex dump)           -> *(unsigned char(*)[16])&(var)
+View as Byte[64] (hex dump)           -> *(unsigned char(*)[64])&(var)
+```
+
+The chosen expression is evaluated against the current stack frame
+via DAP `evaluate`. The result lands in two places: a toast
+notification (immediate feedback) and the Debug Console (so the user
+has a scrollable history, can re-evaluate by editing).
+
+Useful when a variable comes through as `void*` / native-int because
+the per-unit type table didn't carry enough info -- the user can
+peek through to "what would this look like if it were a wide-char
+string". Equivalent to manually adding `(wchar_t*)var` to Watch but
+one click instead of typing.
+
+## Skip-stops-in-source-less code
+
+Configured by `rsm2pdb.skipUnknownSourceMode` (default `"out"`):
+
+- `"out"` -- after each step that lands in a frame whose source file
+  we can't locate on disk, issue `stepOut` until we surface in
+  source-bearing code. Budget 30 attempts. This is the safe default:
+  `stepOut` sets a temp BP at the return address, so it can't bypass
+  a user breakpoint sitting in the same function.
+- `"hybrid"` -- try `stepIn` first (50 attempts), then fall back to
+  `stepOut` (30). Catches the case where RTL code calls a user
+  callback. **Warning**: `stepIn` chains run through user code that
+  may contain breakpoints, and some debug adapters report such hits
+  as `reason: 'step'` -- we mitigate via the `hitBreakpointIds`
+  check below, but the safer `"out"` default exists for a reason.
+- `"off"` -- disable; debug as-is.
+
+Safety:
+- Triggers only on `reason: 'step'` stops -- breakpoint / pause /
+  exception / entry stops are honoured verbatim.
+- Aborts immediately if the `stopped` event carries
+  `hitBreakpointIds` (user BP was actually hit, debugger
+  miscategorised the reason).
+- Per-thread / per-session budget; resets on `terminated` /
+  thread change.
+
+## Up-to-date check
+
+Before each `rsm2pdb pdb` / `rsm2pdb dwarf` invocation, the build
+runner compares output mtime against (`.exe`, `.map`, `.rsm`,
+`rsm2pdb.exe`) mtimes. If output is newer than every input the step
+is skipped with a `[skip rsm2pdb pdb: name.pdb is up to date]`
+line in the Output channel.
+
+- PDB backend: the `.pdb` file itself is the stamp.
+- DWARF backend: a sibling `.<base>.dwarf-stamp` file is touched
+  after each successful inject (because DWARF mutates the exe
+  in-place, so the exe can't be its own stamp).
+
+This makes "Run" (debugLast) and "Make+Run" cheap when nothing
+changed: msbuild finishes its no-op Make in ~0.5s and rsm2pdb is
+skipped entirely.
 
 ## Activation
 
@@ -267,11 +374,13 @@ the workspace. No background activity in other workspaces.
 
 - A real XML parser. The regex approach handles every .dproj shape
   we've seen, with zero dependencies.
-- A status-bar item or progress notifications. The Output channel
-  is enough; bells and whistles can come later.
+- Progress-notification widgets. The Output channel + status-bar
+  pills + Problems panel cover the user-facing surface.
 - Persistent `.vscode/launch.json` entries. Composed dynamically.
 - Workspace-scope settings UI. Use VSCode's regular settings
-  editor; the four `rsm2pdb.*` keys cover the configurable surface.
+  editor; the few `rsm2pdb.*` keys cover the configurable surface
+  (`bdsPath`, `executable`, `gdbPath`, `backend`, `console`,
+  `skipUnknownSourceMode`).
 
 ## Known limitations
 

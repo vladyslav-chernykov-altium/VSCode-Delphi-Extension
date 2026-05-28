@@ -17,38 +17,126 @@
     "commands": [
       {
         "command": "rsm2pdb.buildAndDebug",
-        "title": "rsm2pdb: Make + Run (incremental build + debug)",
-        "category": "rsm2pdb"
+        "title": "Make + Run (incremental build + debug)",
+        "category": "rsm2pdb",
+        "icon": "$(debug-start)"
       },
       {
         "command": "rsm2pdb.build",
-        "title": "rsm2pdb: Make (incremental build, no launch)",
-        "category": "rsm2pdb"
+        "title": "Make (incremental build, no launch)",
+        "category": "rsm2pdb",
+        "icon": "$(tools)"
       },
       {
         "command": "rsm2pdb.rebuild",
-        "title": "rsm2pdb: Rebuild (full clean build, no launch)",
-        "category": "rsm2pdb"
+        "title": "Rebuild (full clean build, no launch)",
+        "category": "rsm2pdb",
+        "icon": "$(refresh)"
       },
       {
         "command": "rsm2pdb.pickProject",
-        "title": "rsm2pdb: Pick the active .dproj",
+        "title": "Pick the active .dproj",
         "category": "rsm2pdb"
       },
       {
+        "command": "rsm2pdb.pickActive",
+        "title": "Pick active project + config (used by Build / Rebuild / Run)",
+        "category": "rsm2pdb",
+        "icon": "$(package)"
+      },
+      {
+        "command": "rsm2pdb.pickActiveProject",
+        "title": "Switch active project (.dproj)",
+        "category": "rsm2pdb",
+        "icon": "$(package)"
+      },
+      {
+        "command": "rsm2pdb.pickActiveConfig",
+        "title": "Switch active configuration (Debug/Release × Win64/Win32)",
+        "category": "rsm2pdb",
+        "icon": "$(gear)"
+      },
+      {
         "command": "rsm2pdb.inspectProject",
-        "title": "rsm2pdb: Inspect project (parse .dproj, list configs)",
+        "title": "Inspect project (parse .dproj, list configs)",
         "category": "rsm2pdb"
       },
       {
         "command": "rsm2pdb.cancelBuild",
-        "title": "rsm2pdb: Cancel current build",
-        "category": "rsm2pdb"
+        "title": "Cancel current build",
+        "category": "rsm2pdb",
+        "icon": "$(stop-circle)"
       },
       {
         "command": "rsm2pdb.debugLast",
-        "title": "rsm2pdb: Debug last build (no rebuild)",
-        "category": "rsm2pdb"
+        "title": "Debug last build (no rebuild)",
+        "category": "rsm2pdb",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "rsm2pdb.viewAsString",
+        "title": "View as String (UnicodeString)",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsAnsiString",
+        "title": "View as AnsiString (char*)",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsWideString",
+        "title": "View as WideString (wchar_t*)",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsByte",
+        "title": "View as Byte",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsWord",
+        "title": "View as Word (UInt16)",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsInteger",
+        "title": "View as Integer (Int32)",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsCardinal",
+        "title": "View as Cardinal (UInt32)",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsInt64",
+        "title": "View as Int64",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsUInt64",
+        "title": "View as UInt64",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsSingle",
+        "title": "View as Single (float)",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsDouble",
+        "title": "View as Double",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsByteArray16",
+        "title": "View as Byte[16] (hex dump)",
+        "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.viewAsByteArray64",
+        "title": "View as Byte[64] (hex dump)",
+        "category": "rsm2pdb: View as"
       }
     ],
     "keybindings": [
@@ -63,21 +151,197 @@
         "when": "workspaceFolderCount > 0"
       },
       {
-        "command": "rsm2pdb.buildAndDebug",
+        "command": "rsm2pdb.debugLast",
         "key": "ctrl+f9",
         "when": "workspaceFolderCount > 0"
       },
       {
         "command": "rsm2pdb.cancelBuild",
-        "key": "ctrl+shift+c",
+        "key": "ctrl+f2",
         "when": "workspaceFolderCount > 0"
       },
       {
-        "command": "rsm2pdb.debugLast",
+        "command": "rsm2pdb.buildAndDebug",
         "key": "ctrl+shift+f9",
         "when": "workspaceFolderCount > 0"
       }
     ],
+    "submenus": [
+      {
+        "id": "rsm2pdb.menu",
+        "label": "rsm2pdb"
+      }
+    ],
+    "menus": {
+      "menubar/run": [
+        {
+          "submenu": "rsm2pdb.menu",
+          "group": "z_rsm2pdb@1"
+        }
+      ],
+      "rsm2pdb.menu": [
+        {
+          "command": "rsm2pdb.build",
+          "group": "1_build@1"
+        },
+        {
+          "command": "rsm2pdb.rebuild",
+          "group": "1_build@2"
+        },
+        {
+          "command": "rsm2pdb.buildAndDebug",
+          "group": "2_debug@1"
+        },
+        {
+          "command": "rsm2pdb.debugLast",
+          "group": "2_debug@2"
+        },
+        {
+          "command": "rsm2pdb.cancelBuild",
+          "group": "3_cancel@1"
+        },
+        {
+          "command": "rsm2pdb.pickActiveProject",
+          "group": "0_active@1"
+        },
+        {
+          "command": "rsm2pdb.pickActiveConfig",
+          "group": "0_active@2"
+        },
+        {
+          "command": "rsm2pdb.pickActive",
+          "group": "0_active@3"
+        },
+        {
+          "command": "rsm2pdb.pickProject",
+          "group": "9_meta@1"
+        },
+        {
+          "command": "rsm2pdb.inspectProject",
+          "group": "9_meta@2"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "rsm2pdb.buildAndDebug",
+          "when": "resourceExtname == .pas || resourceExtname == .dpr || resourceExtname == .dproj",
+          "group": "navigation@1"
+        },
+        {
+          "command": "rsm2pdb.debugLast",
+          "when": "resourceExtname == .pas || resourceExtname == .dpr || resourceExtname == .dproj",
+          "group": "navigation@2"
+        }
+      ],
+      "debug/variables/context": [
+        {
+          "command": "rsm2pdb.viewAsString",
+          "group": "rsm2pdbViewAs_strings@1"
+        },
+        {
+          "command": "rsm2pdb.viewAsAnsiString",
+          "group": "rsm2pdbViewAs_strings@2"
+        },
+        {
+          "command": "rsm2pdb.viewAsWideString",
+          "group": "rsm2pdbViewAs_strings@3"
+        },
+        {
+          "command": "rsm2pdb.viewAsInteger",
+          "group": "rsm2pdbViewAs_ints@1"
+        },
+        {
+          "command": "rsm2pdb.viewAsCardinal",
+          "group": "rsm2pdbViewAs_ints@2"
+        },
+        {
+          "command": "rsm2pdb.viewAsInt64",
+          "group": "rsm2pdbViewAs_ints@3"
+        },
+        {
+          "command": "rsm2pdb.viewAsUInt64",
+          "group": "rsm2pdbViewAs_ints@4"
+        },
+        {
+          "command": "rsm2pdb.viewAsByte",
+          "group": "rsm2pdbViewAs_ints@5"
+        },
+        {
+          "command": "rsm2pdb.viewAsWord",
+          "group": "rsm2pdbViewAs_ints@6"
+        },
+        {
+          "command": "rsm2pdb.viewAsSingle",
+          "group": "rsm2pdbViewAs_floats@1"
+        },
+        {
+          "command": "rsm2pdb.viewAsDouble",
+          "group": "rsm2pdbViewAs_floats@2"
+        },
+        {
+          "command": "rsm2pdb.viewAsByteArray16",
+          "group": "rsm2pdbViewAs_bytes@1"
+        },
+        {
+          "command": "rsm2pdb.viewAsByteArray64",
+          "group": "rsm2pdbViewAs_bytes@2"
+        }
+      ],
+      "debug/watch/context": [
+        {
+          "command": "rsm2pdb.viewAsString",
+          "group": "rsm2pdbViewAs_strings@1"
+        },
+        {
+          "command": "rsm2pdb.viewAsAnsiString",
+          "group": "rsm2pdbViewAs_strings@2"
+        },
+        {
+          "command": "rsm2pdb.viewAsWideString",
+          "group": "rsm2pdbViewAs_strings@3"
+        },
+        {
+          "command": "rsm2pdb.viewAsInteger",
+          "group": "rsm2pdbViewAs_ints@1"
+        },
+        {
+          "command": "rsm2pdb.viewAsCardinal",
+          "group": "rsm2pdbViewAs_ints@2"
+        },
+        {
+          "command": "rsm2pdb.viewAsInt64",
+          "group": "rsm2pdbViewAs_ints@3"
+        },
+        {
+          "command": "rsm2pdb.viewAsUInt64",
+          "group": "rsm2pdbViewAs_ints@4"
+        },
+        {
+          "command": "rsm2pdb.viewAsByte",
+          "group": "rsm2pdbViewAs_ints@5"
+        },
+        {
+          "command": "rsm2pdb.viewAsWord",
+          "group": "rsm2pdbViewAs_ints@6"
+        },
+        {
+          "command": "rsm2pdb.viewAsSingle",
+          "group": "rsm2pdbViewAs_floats@1"
+        },
+        {
+          "command": "rsm2pdb.viewAsDouble",
+          "group": "rsm2pdbViewAs_floats@2"
+        },
+        {
+          "command": "rsm2pdb.viewAsByteArray16",
+          "group": "rsm2pdbViewAs_bytes@1"
+        },
+        {
+          "command": "rsm2pdb.viewAsByteArray64",
+          "group": "rsm2pdbViewAs_bytes@2"
+        }
+      ]
+    },
     "configuration": {
       "title": "rsm2pdb",
       "properties": {
@@ -107,6 +371,23 @@
           "enum": ["pdb", "dwarf"],
           "default": "pdb",
           "description": "Debug-info backend. 'pdb' injects a CodeView/PDB and uses VS native debug (cppvsdbg) -- recommended on Windows. 'dwarf' injects DWARF v5 and uses mingw gdb (cppdbg)."
+        },
+        "rsm2pdb.console": {
+          "type": "string",
+          "enum": ["integrated", "external"],
+          "default": "integrated",
+          "description": "Where the debuggee's stdout / stderr appear during a debug session. 'integrated' (default) routes them through VSCode's integrated Terminal panel (cppvsdbg) or Debug Console (cppdbg) -- no extra window pops up. 'external' opens a separate Windows console for the debuggee."
+        },
+        "rsm2pdb.skipUnknownSourceMode": {
+          "type": "string",
+          "enum": ["off", "out", "hybrid"],
+          "default": "out",
+          "markdownDescription": "How to handle Step Into / Step Out that lands in a function whose source file isn't on disk (typically Delphi RTL).\n\n- `out` *(default)*: keep issuing Step Out until execution returns to user code. Safe -- never executes past a user breakpoint.\n- `hybrid`: first descend with Step In up to 50 times to catch deeper user-code callbacks (event handlers, virtual overrides, lambdas) invoked from RTL, then fall back to Step Out. Catches more cases but the descend phase may bypass user breakpoints that live in the stepped-through region.\n- `off`: disable; stop wherever the debugger says.\n\nIn all modes, hitting any breakpoint immediately cancels auto-stepping."
+        },
+        "rsm2pdb.skipUnknownSource": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**Deprecated:** use `#rsm2pdb.skipUnknownSourceMode#` instead. When this is set explicitly, `false` maps to `mode = off` and `true` maps to `mode = out`."
         }
       }
     }

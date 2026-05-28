@@ -91,6 +91,28 @@ let currentChild: cp.ChildProcess | undefined;
 let currentChildLabel: string = '';
 let cancelled = false;
 
+// Lightweight observer hook for UI elements (status-bar Cancel button,
+// progress notifications) that want to react to build start / finish
+// without having to poll. Callbacks are fired synchronously inside the
+// runBuild flow so UI sees the transition in the same event-loop tick.
+type BuildStateListener = (running: boolean) => void;
+const buildStateListeners: BuildStateListener[] = [];
+export function onBuildStateChange(cb: BuildStateListener): vscode.Disposable {
+    buildStateListeners.push(cb);
+    return new vscode.Disposable(() => {
+        const idx = buildStateListeners.indexOf(cb);
+        if (idx >= 0) buildStateListeners.splice(idx, 1);
+    });
+}
+export function isBuildRunning(): boolean {
+    return currentChild !== undefined;
+}
+function notifyBuildState(running: boolean): void {
+    for (const cb of buildStateListeners) {
+        try { cb(running); } catch {}
+    }
+}
+
 /**
  * Cancel the running build, if any. Kills the spawned process AND its
  * entire process tree (msbuild spawns dcc64.exe; killing just cmd.exe
@@ -361,8 +383,35 @@ async function runRsm2pdb(
   const backend = vscode.workspace.getConfiguration('rsm2pdb')
     .get<string>('backend') ?? 'pdb';
 
+  // Up-to-date check: skip the rsm2pdb step entirely when its output
+  // is already fresher than every input. msbuild's incremental Make
+  // produces no .exe / .map / .rsm changes when nothing recompiled,
+  // so re-running rsm2pdb against identical inputs is pure overhead
+  // (and rewrites the PDB / re-injects DWARF for no reason).
+  //
+  // Inputs we watch: the build artifact (.exe / .dll), the .map, the
+  // .rsm (when present), and rsm2pdb.exe itself -- if the user just
+  // rebuilt the converter we want to re-emit even with unchanged
+  // Delphi sources.
+  const safeMtime = (p: string): number => {
+    try { return fs.statSync(p).mtimeMs; } catch { return 0; }
+  };
+  const inputs = [exePath, mapPath, tools.rsm2pdbExe];
+  if (fs.existsSync(rsmPath)) inputs.push(rsmPath);
+  const inputsMax = Math.max(0, ...inputs.map(safeMtime));
+
   if (backend === 'pdb') {
     const pdbPath = path.join(outDir, base + '.pdb');
+    // PDB file itself is a natural stamp -- it's what rsm2pdb writes.
+    // If it's newer than every input, the previous pdb run is still
+    // valid.
+    const pdbMtime = safeMtime(pdbPath);
+    if (pdbMtime > 0 && pdbMtime >= inputsMax) {
+      output.appendLine(
+        `\n[skip rsm2pdb pdb: ${path.basename(pdbPath)} is up to date]`,
+      );
+      return true;
+    }
     // Pass the .dproj's source search directories so rsm2pdb can
     // resolve the bare basenames Delphi writes in .map (e.g.
     // "Geometry.pas") to absolute paths inside the PDB. Without this,
@@ -386,16 +435,38 @@ async function runRsm2pdb(
   }
 
   // DWARF (in-place injection: input = output).
+  // DWARF injection modifies the .exe in place, so the .exe's mtime
+  // can't act as its own stamp -- after a successful inject our own
+  // write bumps it past every input, and we'd never re-inject even
+  // after a rebuild. Use a sidecar stamp file instead.
+  const dwarfStampPath = path.join(outDir, '.' + base + '.dwarf-stamp');
+  const dwarfStampMtime = safeMtime(dwarfStampPath);
+  if (dwarfStampMtime > 0 && dwarfStampMtime >= inputsMax) {
+    output.appendLine(
+      `\n[skip rsm2pdb dwarf: ${path.basename(exePath)} already injected]`,
+    );
+    return true;
+  }
   output.appendLine(
     `\n$ "${tools.rsm2pdbExe}" dwarf "${mapPath}" "${exePath}" "${exePath}"`,
   );
-  return spawnAndPipe(
+  const dwarfOk = await spawnAndPipe(
     tools.rsm2pdbExe,
     ['dwarf', mapPath, exePath, exePath],
     outDir,
     output,
     'rsm2pdb dwarf',
   );
+  if (dwarfOk) {
+    // Refresh the stamp so the next no-op build skips this step.
+    try {
+      fs.writeFileSync(dwarfStampPath,
+                       new Date().toISOString() + '\n');
+    } catch {
+      // Best-effort -- worst case we re-run rsm2pdb next time.
+    }
+  }
+  return dwarfOk;
 }
 
 /**
@@ -433,6 +504,7 @@ function spawnAndPipe(
     const child = cp.spawn(command, args, { cwd, shell: false });
     currentChild = child;
     currentChildLabel = label ?? path.basename(command);
+    notifyBuildState(true);
 
     // Buffer stdout/stderr by lines so the diagnostic regex sees
     // complete messages. (Chunks can split mid-line otherwise.)
@@ -476,11 +548,13 @@ function spawnAndPipe(
     child.stderr.on('data', (b: Buffer) => handle(b.toString(), true));
     child.on('error', (e) => {
       currentChild = undefined;
+      notifyBuildState(false);
       output.appendLine(`\nspawn error: ${e.message}`);
       resolve(false);
     });
     child.on('close', (code) => {
       currentChild = undefined;
+      notifyBuildState(false);
       // Flush any trailing partial-line via the handler.
       if (stdoutBuf) handle('\n', false);
       if (stderrBuf) handle('\n', true);
