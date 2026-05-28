@@ -112,8 +112,10 @@ from scratch. Currently parses:
   `actual = stored >> 4`.
 - **Procedure records** (tag 0x28): name + VA + return-type marker
   + parameter sub-records (tag 0x21) + local sub-records (tag 0x20)
-  + end marker (0x63). Stack offsets encoded in 2-byte stride units
-  relative to `rbp+16`; conversion `real = (rsm/2) + 16`.
+  + end marker (0x63). Stack offsets carried in two forms (1-byte
+  signed i8 LSB=0, 2-byte signed i16 LSB=1). The frame interpretation
+  -- mapping the raw RSM offset onto a real rbp-relative address --
+  lives entirely in `src/compose/` (see below).
 
 VA-keyed lookup indexes (`unordered_map<VA, idx>`) for variables and
 procedures keep cross-referencing O(1) at million-symbol scale.
@@ -132,10 +134,46 @@ output emitters:
 
 - `Type` variant (Primitive, Pointer, Array, Record, Enum)
 - `Symbol` (name, address, size, type id, params, locals)
-- `LocalVar` (name, type id, stack_offset)
+- `LocalVar` (name, type id, **`stack_offset` = rbp-relative real
+  byte offset**, populated by `compose::resolveFunction`; not the
+  raw RSM value)
 - `LineEntry` (address, file id, line)
 - `CompileUnit` (source path, symbols, lines)
 - `Module` (units, source files, type pool)
+
+### src/compose/ — Delphi-x64 frame interpreter (single source of truth)
+
+Takes a `rsm::ProcedureRecord` + the function's PE bytes and returns
+a `ResolvedFunction { sub_rsp, extra_pushes, vector<ResolvedVar> }`.
+Each `ResolvedVar` carries the variable's **rbp-relative real byte
+offset**, byte width, optional Pascal `PrimitiveKind`, and flags
+(`is_param`, `is_self`, `is_static_link`).
+
+What it implements once, for everyone:
+
+- Prologue decode (`src/pe/prologue.h`): handles both the simple
+  `push rbp; sub rsp, imm; mov rbp, rsp` shape and multi-push
+  prologues (`push rbp; push rdi; push rsi; sub rsp, imm`). Returns
+  `{sub_rsp, extra_pushes}`.
+- The frame formula:
+  - `real_local = sub_rsp + RSM/2`
+  - `real_param = sub_rsp + 8*extra_pushes + RSM/2`
+  - `real_self  = sub_rsp + 8*extra_pushes + 16` (Self lives in
+    the rcx-shadow slot regardless of the sentinel RSM offset
+    attached to markers 0x29 / 0x31 / 0xD5)
+- Static-link synthesis: when the procedure record was tagged as
+  `has_static_link` (RSM subtag 0x41 = Pascal nested function),
+  a `__frame_outer__` slot is prepended pointing at the first
+  shadow position (where the parent's rbp gets spilled).
+- Three-tier size resolution: Pascal type via the per-unit type
+  table (best) > marker-size aggregate from globals > disasm
+  sniffer (`pe::sniffStackVarSizes`) of the first memory touch >
+  unknown.
+
+Both backends (`src/cli/cli_cmd_pdb.cpp`, `src/cli/cli_cmd_dwarf.cpp`)
+consume `ResolvedFunction` directly. No backend re-derives any of
+the above. This is enforced by convention -- see CLAUDE.md
+"Architecture rules".
 
 ### src/dwarf/ — DWARF v5 emitter
 
@@ -152,9 +190,11 @@ and length-field backpatching. Per `CompileUnit`:
   types.
 - `DW_TAG_subprogram` per function. If the function has parameters
   or locals, the variant abbrev with `CHILDREN_yes` and
-  `DW_AT_frame_base = DW_OP_breg6 +16` (rbp + 16) is used.
+  `DW_AT_frame_base = DW_OP_breg6(0)` (= RBP itself) is used.
   - `DW_TAG_formal_parameter` children, each with
-    `DW_OP_fbreg <rsm_offset / 2>`.
+    `DW_OP_fbreg <stack_offset>` where `stack_offset` is the
+    rbp-relative real byte offset that `compose::resolveFunction`
+    already computed -- no further scaling.
   - `DW_TAG_variable` (typed local) children, same shape.
 - `DW_TAG_variable` per global, with `DW_AT_location =
   DW_OP_addr <VA>`. Either typed (with `DW_AT_type` ref_addr) or
@@ -185,6 +225,30 @@ Mechanical byte rewriting of the input PE:
 
 Does NOT use `llvm::object::COFFObjectFile`. Plain `<windows.h>`
 structs plus careful arithmetic.
+
+### src/cli/ — subcommand layer
+
+`main.cpp` is dispatch only (~40 lines). Each `rsm2pdb <verb>` lives
+in its own translation unit:
+
+| File | Subcommand |
+|---|---|
+| `cli_cmd_dump.cpp` | `rsm2pdb dump <input.rsm \| input.map>` |
+| `cli_cmd_diff_procs.cpp` | `rsm2pdb diff-procs <map> <rsm>` |
+| `cli_cmd_probe_procs.cpp` | `rsm2pdb probe-procs <map> <rsm>` |
+| `cli_cmd_analyze_procs.cpp` | `rsm2pdb analyze-procs <map> <rsm>` |
+| `cli_cmd_dwarf_emit.cpp` | `rsm2pdb dwarf-emit <map> <out-dir>` |
+| `cli_cmd_dwarf.cpp` | `rsm2pdb dwarf <map> <input.exe> <output.exe>` |
+| `cli_cmd_pdb.cpp` | `rsm2pdb pdb <map> <exe-in-place> <pdb> [--src-search ...]` |
+| `cli_usage.cpp` | usage text |
+
+`cli.h` is the declaration surface (one `int cmd<Name>(...)` per
+subcommand, returning a process exit code). Shared helpers in
+`cli/util.h` (`extLower`) and `cli/source_path.h` (`resolveSourcePath`).
+
+Adding a subcommand: create the `.cpp`, add its declaration to
+`cli.h`, add a dispatch case in `main.cpp`, register the .cpp in
+`src/CMakeLists.txt`. Never extend `main.cpp`'s body.
 
 ### vscode-ext/ — TypeScript extension
 

@@ -52,10 +52,12 @@ body. `git log --oneline` for the recent history.
 | `README.md` | User-facing capabilities + "how to use on your own Delphi project". |
 | `src/map/` | Delphi .map text parser + populate() adapter. Has pre-bucketed publics for scale. |
 | `src/rsm/` | Delphi .rsm binary parser. Header + primitive table + variable records + procedure records (params/locals). |
-| `src/model/` | Debugger-agnostic intermediate IR. |
-| `src/dwarf/` | DWARF v5 emitter (hand-rolled, LLVM for constants only). Includes subprogram-with-kids, base_type, array_type, formal_parameter. |
-| `src/pdb/` | PDB writer (LLVM-backed via `PDBFileBuilder` + `SymbolSerializer`). Emits Info/DBI/TPI/IPI/GSI streams, S_PUB32 publics, S_GDATA32 globals, per-module S_GPROC32+S_FRAMEPROC+S_REGREL32+S_END, C13 line subsections, SectionHdr DbgStream, SectionContribs. All vars typed Int32 until TPI follow-up. |
-| `src/pe/` | PE section injector. `pe_injector.cpp` writes DWARF sections; `pe_pdb_injector.cpp` adds the RSDS Debug Directory entry pointing at the .pdb and patches `DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG]`. |
+| `src/model/` | Debugger-agnostic intermediate IR. `LocalVar::stack_offset` is the **rbp-relative real byte offset**, populated by `compose::resolveFunction` -- not raw RSM. |
+| **`src/compose/`** | **Single source-of-truth Delphi-x64 frame interpreter.** Takes a `rsm::ProcedureRecord` + the function's PE bytes and returns `ResolvedFunction{sub_rsp, extra_pushes, vector<ResolvedVar>}`. Both PDB and DWARF emitters consume this. The frame formula (`real = sub_rsp + RSM/2` for locals, `+ 8*extra_pushes` shift for params/Self, Self at rcx-shadow, static-link synthesis) lives **only** here -- backends must not re-derive it. |
+| `src/dwarf/` | DWARF v5 emitter (hand-rolled, LLVM for constants only). Consumes `model::Symbol::params/locals` whose `stack_offset` is already rbp-relative; emits `DW_AT_frame_base = DW_OP_breg6(0)` + `DW_OP_fbreg(stack_offset)`. |
+| `src/pdb/` | PDB writer (LLVM-backed via `PDBFileBuilder` + `SymbolSerializer`). Emits Info/DBI/TPI/IPI/GSI streams, S_PUB32 publics, S_GDATA32 globals, per-module S_GPROC32+S_FRAMEPROC+S_REGREL32+S_END, C13 line subsections, SectionHdr DbgStream, SectionContribs. `ModuleLocal::offset` is rbp-relative real (post-compose). |
+| `src/pe/` | PE section injector + tiny disassembler helpers. `pe_injector.cpp` writes DWARF sections; `pe_pdb_injector.cpp` adds the RSDS Debug Directory entry pointing at the .pdb. `prologue.h` decodes Delphi-x64 prologues (`{sub_rsp, extra_pushes}`); `size_sniffer.h` walks the body for `mov [rbp+disp], reg` widths. Both feed `compose`. |
+| **`src/cli/`** | **One subcommand per file.** `cli.h` declares all entry points; `cli_cmd_<name>.cpp` implements one. `main.cpp` is dispatch only (~40 lines). Shared helpers in `util.h` (`extLower`) and `source_path.h` (`resolveSourcePath`). Adding a subcommand = new `cli_cmd_*.cpp` + a line in `cli.h` + a dispatch case in `main.cpp` -- never extend `main.cpp` body. |
 | `examples/01_hello/` | Single-file Delphi sample. |
 | `examples/02_two_units/` | Multi-unit (Geometry + App.Colors + dpr). Primary local-debug fixture. |
 | `examples/03_primitives/` | 13 user globals across 12 distinct primitive types. Used to RE the type-marker encoding. |
@@ -108,6 +110,62 @@ body. `git log --oneline` for the recent history.
     simple stuff; for CMake builds we go through `cmd.exe /C` with
     `vcvars64.bat` because that's how MSVC's environment works.
 11. **`scripts/check-vs.cmd` was deleted** — don't recreate it.
+
+---
+
+## Architecture rules (binding for all future work)
+
+These were locked in by the three-stage refactor on 2026-05-28
+(commits `a8768f1`, `9cd88f8`, `1d6338b`). Future contributions
+must follow them; if a future task seems to require breaking one,
+update this section first and explain why in the commit message.
+
+1. **The Delphi-x64 frame interpreter is `src/compose/` and only
+   `src/compose/`.** `compose::resolveFunction` takes a
+   `rsm::ProcedureRecord` + the function's PE bytes and returns a
+   `ResolvedFunction` with rbp-relative offsets, byte sizes, and
+   `PrimitiveKind`s for every param / local / Self / static-link.
+   PDB (`cli_cmd_pdb`) and DWARF (`cli_cmd_dwarf`) both consume it.
+
+   - Backends must not re-derive `sub_rsp` / `extra_pushes` /
+     `param_shift` / `Self`-rcx-shadow / `__frame_outer__` synthesis
+     on their own. If a new fact needs encoding (e.g. a new Self
+     marker variant, a new prologue shape), add it to `compose`,
+     not the backend.
+   - `pe::parsePrologue` and `pe::sniffStackVarSizes` are
+     compose's helpers; they're public so tests can use them but
+     are not consumed directly by any backend.
+
+2. **`model::LocalVar::stack_offset` is the rbp-relative real
+   byte offset**, post-`compose::resolveFunction`. Not the raw RSM
+   value. The legacy `(rsm/2) + 16` formula is gone from both
+   backends -- don't reintroduce it.
+
+3. **`src/cli/` holds one subcommand per file.** `cli.h` is the
+   declaration surface; each `cli_cmd_<name>.cpp` implements
+   exactly one `cli::cmd<Name>(...)` entry point. `main.cpp` is
+   pure dispatch (~40 lines) -- never extend its body with new
+   subcommand logic.
+
+   - Adding a subcommand: create `src/cli/cli_cmd_<name>.cpp`, add
+     its declaration to `cli.h`, add a dispatch case in
+     `main.cpp`, register the .cpp in `src/CMakeLists.txt`.
+   - Shared cross-subcommand helpers live in `src/cli/util.h` /
+     `src/cli/source_path.h` (header-only). Things shared across
+     more than just CLI go to their natural module (`src/pe/`,
+     `src/compose/`, ...).
+
+4. **Tests stay green at every commit.** The compose + cli split
+   was kept regression-free by re-running the cdb + gdb checks
+   after each stage. Future structural changes follow the same
+   rule: build + `rsm2pdb_tests` + at least one cdb / gdb
+   verification before committing.
+
+5. **Per-emitter divergence on frame layout is a regression.** If
+   PDB and DWARF show different values for the same local at the
+   same line, the bug is in `compose` (or in one of the backend's
+   adapters around it), never in "the other backend's formula" --
+   because there is no other formula.
 
 ---
 
@@ -501,11 +559,14 @@ keep them — they're invaluable for future RSM RE):
 
 ---
 
-*Last updated: 2026-05-27, after the Pascal-primitive-typing wave
-(per-unit type-table RE + signed 2-byte stack-offset form + multi-
-push prologue parser + Delphi-x64 frame RE). All 21 primitive /
-string locals in `examples/05_types ProbeLocals` resolve in cdb
-with native CodeView types (`bool true`, `wchar_t 'Z'`,
-`wchar_t * "unicode"`, etc.). 04_locals regressions clean. 51 unit
-tests green. Remaining UX gaps are records / classes / enums (Step
-11b) and closure auto-deref (Step 12).*
+*Last updated: 2026-05-28, after the three-stage architectural
+refactor (a8768f1 + 9cd88f8 + 1d6338b). All Delphi-x64 frame logic
+now lives in `src/compose/`; PDB and DWARF backends both consume
+`ResolvedFunction` from it. main.cpp is dispatch-only (~40 lines);
+each subcommand has its own `src/cli/cli_cmd_*.cpp`. gdb on the
+DWARF output now matches cdb on the PDB output to the byte (verified
+on examples/04_locals GlobalProc2). 59 unit tests green. Binding
+architecture rules captured above; future work must follow them.
+Remaining UX gaps are Step 11b (records / classes / enums via TPI
+struct synth) and Step 12 (closure auto-deref reusing the same
+machinery).*

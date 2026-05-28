@@ -851,6 +851,42 @@ M3   PDB backend (deferred)
      Step: 19.
 
 
+----- Architectural refactor (DONE 2026-05-28) -----
+
+Three-stage cleanup that locked in this session's RE work:
+
+Stage 1 (a8768f1): Extracted src/compose/ -- the single Delphi-x64
+  frame interpreter consumed by both PDB and DWARF backends.
+  `ResolvedFunction { sub_rsp, extra_pushes, vector<ResolvedVar> }`.
+  PDB cmd migrated; 8 new unit tests.
+
+Stage 2 (9cd88f8): main.cpp 1535 -> 42 lines. One subcommand per
+  file under src/cli/ (cli_cmd_dump / diff_procs / probe_procs /
+  analyze_procs / dwarf_emit / dwarf / pdb). Shared helpers in
+  cli/util.h + cli/source_path.h. Dispatch table is the entire spec
+  of what the binary does.
+
+Stage 3 (1d6338b): DWARF emitter wired through compose. gdb users
+  now get every fix the cdb workflow had since efdc7c1 -- signed
+  2-byte form, multi-push prologue, Self / static-link. Verified:
+
+      Thread 1 hit Breakpoint 1, locals.GlobalProc2 (pA=1, pB=2)
+          at locals.dpr:48
+      pA = 1, pB = 2, lA = 1, lB = 2
+
+  `model::LocalVar::stack_offset` semantic flipped from "raw RSM"
+  to "rbp-relative real byte offset"; dwarf_emitter uses
+  `DW_AT_frame_base = DW_OP_breg6(0)` + `DW_OP_fbreg(stack_offset)`.
+
+Binding rules for future work: see CLAUDE.md "Architecture rules"
+section (added in afef23b / 2026-05-28 follow-up). Short form:
+  - All Delphi-x64 frame logic lives in src/compose/, nowhere else.
+  - main.cpp stays dispatch-only; new subcommands get new files.
+  - model::LocalVar::stack_offset is rbp-relative real (not RSM).
+  - PDB / DWARF divergence on frame layout is a bug in compose,
+    never in a backend.
+
+
 ----- Methodology -----
 
 Two parsers feed the same model::Module:
