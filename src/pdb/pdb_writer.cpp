@@ -258,6 +258,51 @@ bool writePdb(const std::string& path,
         };
 
     for (const auto& a : inputs.aggregates) {
+        // Phase F+ Sets: Pascal `set of TColor` becomes an LF_STRUCTURE
+        // of LF_BITFIELD members, one bit per enumerator. The bit's
+        // BitOffset = enumerator ordinal, BitSize = 1. cdb / VS show
+        // each enumerator's state (`clRed: 0y1, clBlue: 0y1, ...`)
+        // instead of an opaque hex byte. Set width matches Delphi's
+        // power-of-two rounding (1/2/4/8 bytes), so the underlying
+        // integer width is taken from a.byte_size.
+        if (a.kind == AggregateKind::Set) {
+            const codeview::TypeIndex underlying =
+                  a.byte_size == 1 ? codeview::TypeIndex::UnsignedCharacter()
+                : a.byte_size == 2 ? codeview::TypeIndex::UInt16Short()
+                : a.byte_size == 4 ? codeview::TypeIndex::UInt32()
+                                   : codeview::TypeIndex::UInt64();
+            codeview::ContinuationRecordBuilder sb;
+            sb.begin(codeview::ContinuationRecordKind::FieldList);
+            for (const auto& e : a.enumerators) {
+                codeview::BitFieldRecord bfr(
+                    underlying,
+                    /*BitSize=*/ 1,
+                    /*BitOffset=*/ static_cast<std::uint8_t>(e.value));
+                const auto bf_ti = tpi_table.writeLeafType(bfr);
+                codeview::DataMemberRecord dmr(
+                    codeview::MemberAccess::Public,
+                    bf_ti,
+                    /*offset=*/ 0,
+                    e.name);
+                sb.writeMemberType(dmr);
+            }
+            const auto set_fl_ti = tpi_table.insertRecord(sb);
+            codeview::ClassRecord sr(
+                codeview::TypeRecordKind::Struct,
+                static_cast<std::uint16_t>(a.enumerators.size()),
+                codeview::ClassOptions::None,
+                set_fl_ti,
+                codeview::TypeIndex::None(),
+                codeview::TypeIndex::None(),
+                a.byte_size,
+                a.name,
+                std::string{});
+            const auto set_ti = tpi_table.writeLeafType(sr);
+            aggregate_inner_ti.push_back(set_ti);
+            aggregate_var_ti.push_back(set_ti);  // value type
+            continue;
+        }
+
         // Phase F: enum types take a different shape -- LF_ENUM
         // wrapping an LF_FIELDLIST of LF_ENUMERATEs (one per
         // enumerator). The underlying integer type is picked from

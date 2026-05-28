@@ -460,10 +460,32 @@ int cmdPdb(int argc, char** argv) {
                a->kind == rsm2pdb::rsm::AggregateKind::Class;
         const bool is_enum =
                a->kind == rsm2pdb::rsm::AggregateKind::Enum;
-        if (!is_record && !is_class && !is_enum) {
-            // Sets / Unknowns -- still on the byte[N] fallback. The
-            // encoding doesn't carry enough metadata for sets to be
-            // first-class without name-based base-enum inference.
+
+        // Set detection -- RSM doesn't carry an explicit "set of X"
+        // marker on the type record, so we infer from a name-suffix
+        // heuristic: an aggregate with kind Unknown (no fields, no
+        // enum entries, no class header) whose name is a registered
+        // Enum's name plus a trailing `s`. Hits TColors -> TColor,
+        // TKeys -> TKey, etc. False positives are rare because the
+        // base-enum lookup must succeed in the SAME unit.
+        const rsm2pdb::rsm::AggregateType* set_base = nullptr;
+        if (a->kind == rsm2pdb::rsm::AggregateKind::Unknown
+            && a->name.size() > 1
+            && a->name.back() == 's') {
+            const std::string base_name(a->name.data(), a->name.size() - 1);
+            for (const auto& cand : rsm_reader.aggregates()) {
+                if (cand.unit_anchor_offset != a->unit_anchor_offset) continue;
+                if (cand.kind != rsm2pdb::rsm::AggregateKind::Enum) continue;
+                if (cand.name != base_name) continue;
+                set_base = &cand;
+                break;
+            }
+        }
+        const bool is_set = (set_base != nullptr);
+
+        if (!is_record && !is_class && !is_enum && !is_set) {
+            // Sets we couldn't pin down + Unknowns -- still on the
+            // byte[N] fallback.
             return std::nullopt;
         }
         const std::pair<std::uint64_t, std::uint16_t> key{
@@ -497,10 +519,35 @@ int cmdPdb(int argc, char** argv) {
                         ? rsm2pdb::pdb::AggregateKind::Class
                         : is_enum
                             ? rsm2pdb::pdb::AggregateKind::Enum
-                            : rsm2pdb::pdb::AggregateKind::Record;
+                            : is_set
+                                ? rsm2pdb::pdb::AggregateKind::Set
+                                : rsm2pdb::pdb::AggregateKind::Record;
         rec.name      = a->name;
         rec.byte_size = a->total_size;
         rec.base      = base_idx;
+        if (is_set) {
+            // Borrow the base enum's enumerator names (one bit each).
+            // Set width: Delphi rounds to the smallest power-of-two
+            // byte count that fits all enumerators; floor at 1 byte.
+            // For 4-value TColor we get 1 byte; for 33+ enumerators
+            // it'd be 8 bytes. AdvPCB rarely needs >4.
+            rec.enumerators.reserve(set_base->enum_entries.size());
+            std::int64_t max_ord = 0;
+            for (const auto& e : set_base->enum_entries) {
+                rsm2pdb::pdb::AggregateEnumerator ae;
+                ae.name  = e.name;
+                ae.value = e.ordinal;
+                rec.enumerators.push_back(std::move(ae));
+                if (e.ordinal > max_ord) max_ord = e.ordinal;
+            }
+            rec.byte_size =
+                  max_ord <= 7   ? 1
+                : max_ord <= 15  ? 2
+                : max_ord <= 31  ? 4
+                                 : 8;
+            inputs.aggregates.push_back(std::move(rec));
+            return idx;
+        }
         if (is_enum) {
             // Enum size follows Delphi's default rule: max ordinal
             // <= 0xFF -> 1 byte, <= 0xFFFF -> 2 bytes, else 4.

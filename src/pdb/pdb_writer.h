@@ -49,11 +49,15 @@ struct AggregateField {
 // and are referenced by value; classes emit as LF_CLASS + a
 // synthesised LF_POINTER (Pascal class instances live on the heap);
 // enums emit as LF_ENUM and are referenced by value (1-, 2- or
-// 4-byte integer slot depending on the ordinal range).
+// 4-byte integer slot depending on the ordinal range); sets emit
+// as LF_STRUCTURE of LF_BITFIELD members named after the enumerators
+// (one bit per enumerator) so debuggers show which elements are in
+// the set instead of an opaque integer.
 enum class AggregateKind : std::uint8_t {
     Record,
     Class,
     Enum,
+    Set,
 };
 
 // One enumerator inside an AggregateRecord with kind == Enum.
@@ -71,8 +75,11 @@ struct AggregateRecord {
     AggregateKind kind = AggregateKind::Record;
     std::string   name;
     std::uint32_t byte_size = 0;
-    std::vector<AggregateField> fields;       // record / class only
-    std::vector<AggregateEnumerator> enumerators;  // enum only
+    std::vector<AggregateField> fields;             // record / class only
+    std::vector<AggregateEnumerator> enumerators;   // enum / set only
+                                                    //   (sets borrow them
+                                                    //   from their base enum
+                                                    //   to name the bits)
     // Index into PdbInputs::aggregates of the immediate base class
     // (Phase E inheritance). Only meaningful when kind == Class;
     // nullopt for records and for classes whose only base is the
