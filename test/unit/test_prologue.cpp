@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <vector>
 
+using rsm2pdb::pe::parsePrologue;
 using rsm2pdb::pe::parsePrologueSubRsp;
 
 TEST_CASE("parsePrologueSubRsp: classic procedure shape (sub rsp, 0x30)") {
@@ -68,6 +69,49 @@ TEST_CASE("parsePrologueSubRsp: push rbp but no sub returns 0") {
         0xB8, 0x00, 0x00, 0x00, 0x00,     // mov eax, 0
     };
     CHECK(parsePrologueSubRsp(code.data(), code.size()) == 0);
+}
+
+TEST_CASE("parsePrologue: multi-push prolog (ProbeLocals shape)") {
+    // examples/05_types ProbeLocals real prologue:
+    //   55                       push rbp
+    //   57                       push rdi
+    //   56                       push rsi
+    //   48 81 EC C0 01 00 00     sub  rsp, 0x1C0
+    //   48 8B EC                 mov  rbp, rsp
+    const std::vector<std::uint8_t> code = {
+        0x55, 0x57, 0x56,
+        0x48, 0x81, 0xEC, 0xC0, 0x01, 0x00, 0x00,
+        0x48, 0x8B, 0xEC,
+    };
+    const auto p = parsePrologue(code.data(), code.size());
+    CHECK(p.sub_rsp == 0x1C0);
+    CHECK(p.extra_pushes == 2u);
+}
+
+TEST_CASE("parsePrologue: REX.B push r8..r15 counts as an extra push") {
+    // push rbp; push r12; push r13; sub rsp, 0x40; mov rbp, rsp
+    const std::vector<std::uint8_t> code = {
+        0x55,
+        0x41, 0x54,        // push r12
+        0x41, 0x55,        // push r13
+        0x48, 0x83, 0xEC, 0x40,
+        0x48, 0x8B, 0xEC,
+    };
+    const auto p = parsePrologue(code.data(), code.size());
+    CHECK(p.sub_rsp == 0x40);
+    CHECK(p.extra_pushes == 2u);
+}
+
+TEST_CASE("parsePrologue: simple shape has zero extra pushes") {
+    // GlobalProc2 shape, no callee-saved spills.
+    const std::vector<std::uint8_t> code = {
+        0x55,
+        0x48, 0x83, 0xEC, 0x30,
+        0x48, 0x8B, 0xEC,
+    };
+    const auto p = parsePrologue(code.data(), code.size());
+    CHECK(p.sub_rsp == 0x30);
+    CHECK(p.extra_pushes == 0u);
 }
 
 TEST_CASE("parsePrologueSubRsp: null and short buffers are safe") {

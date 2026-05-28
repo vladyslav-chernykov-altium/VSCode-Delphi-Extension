@@ -785,53 +785,69 @@ bool Reader::open(const std::string& path) {
         }
     }
 
-    // Scan all 0x66 runs (>=3 entries) as candidate type tables.
+    // Build a primary type table per unit anchor by scanning the
+    // bytes between this anchor and the next one. The unit's type
+    // table is a sequence of `0x66 <namelen> <name> <4-byte hash>`
+    // records interleaved with `0x67`-tagged function / import
+    // references (same record shape, different tag) -- we collect
+    // the 0x66's in source-declaration order and skip past the 0x67's.
+    // marker N (always even, >= 0x02) is the (N/2)-th entry.
     struct TypeTable {
         std::size_t              start;
         std::vector<std::string> names;
     };
-    std::vector<TypeTable> type_tables;
-    for (std::size_t t = kVarPayloadHdr; t + 10 < buf.size(); ) {
-        if (static_cast<std::uint8_t>(buf[t]) != kVarPayloadSubTag0) {
-            ++t; continue;
-        }
-        const auto nl = static_cast<std::uint8_t>(buf[t + 1]);
-        if (nl < 2 || nl > 40 ||
-            t + 2 + nl + 4 > buf.size() ||
-            !isPrintAscii(buf.data() + t + 2, nl)) {
-            ++t; continue;
-        }
-        // Walk forward collecting consecutive 0x66 records.
+    std::vector<TypeTable> primary_tables;
+    primary_tables.reserve(unit_anchors.size());
+    for (std::size_t ua = 0; ua < unit_anchors.size(); ++ua) {
+        const std::size_t lo = unit_anchors[ua].file_offset;
+        const std::size_t hi = (ua + 1 < unit_anchors.size())
+            ? unit_anchors[ua + 1].file_offset
+            : buf.size();
+
+        // Hunt for the first 0x66 / 0x67 record after the anchor's
+        // unit-name + source-file headers (skip the first ~250 bytes
+        // of fixed-shape headers so we don't latch onto stray 0x66
+        // bytes inside the path string).
         TypeTable tab;
-        tab.start = t;
-        std::size_t cur = t;
-        while (cur + 10 < buf.size() &&
-               static_cast<std::uint8_t>(buf[cur]) == kVarPayloadSubTag0) {
+        tab.start = lo;
+        const std::size_t scan_lo = lo + 0x20;  // past unit name etc.
+        for (std::size_t cur = scan_lo; cur + 10 < hi; ) {
+            const auto b0 = static_cast<std::uint8_t>(buf[cur]);
+            // Both 0x66 and 0x67 records share the
+            // `<tag> <namelen> <name> <4-byte hash>` shape.
+            if (b0 != kVarPayloadSubTag0 && b0 != 0x67) {
+                // First record we don't recognise -- either we
+                // haven't reached the table yet (try next byte) or
+                // we ran off the end (give up after ~500 bytes
+                // without finding a 0x66 entry).
+                if (!tab.names.empty()) break;
+                if (cur - scan_lo > 500) break;
+                ++cur;
+                continue;
+            }
             const auto c_nl = static_cast<std::uint8_t>(buf[cur + 1]);
-            if (c_nl < 2 || c_nl > 40 ||
-                cur + 2 + c_nl + 4 > buf.size() ||
-                !isPrintAscii(buf.data() + cur + 2, c_nl)) break;
-            tab.names.emplace_back(buf.data() + cur + 2, c_nl);
+            if (c_nl < 2 || c_nl > 80 ||
+                cur + 2 + c_nl + 4 > hi ||
+                !isPrintAscii(buf.data() + cur + 2, c_nl)) {
+                if (!tab.names.empty()) break;
+                ++cur;
+                continue;
+            }
+            if (b0 == kVarPayloadSubTag0) {
+                tab.names.emplace_back(buf.data() + cur + 2, c_nl);
+            }
             cur += 2 + c_nl + 4;
         }
-        if (tab.names.size() >= 3) {
-            type_tables.push_back(std::move(tab));
-            t = cur;
-        } else {
-            ++t;
-        }
+        primary_tables.push_back(std::move(tab));
     }
 
-    // For each unit anchor, primary type table = first table whose
-    // start > anchor's file_offset.
+    // Map anchor offset -> primary table (by index in primary_tables;
+    // unit_anchors and primary_tables are kept aligned).
     std::unordered_map<std::size_t /*anchor offset*/,
                        const TypeTable*> primary_table;
-    for (const auto& ua : unit_anchors) {
-        auto it = std::upper_bound(
-            type_tables.begin(), type_tables.end(), ua.file_offset,
-            [](std::size_t v, const TypeTable& t) { return v < t.start; });
-        if (it != type_tables.end()) {
-            primary_table[ua.file_offset] = &*it;
+    for (std::size_t k = 0; k < unit_anchors.size(); ++k) {
+        if (!primary_tables[k].names.empty()) {
+            primary_table[unit_anchors[k].file_offset] = &primary_tables[k];
         }
     }
 
@@ -862,9 +878,9 @@ bool Reader::open(const std::string& path) {
         for (auto& v : p.locals) resolvePascalType(v);
     }
     std::fprintf(stderr,
-                 "[rsm] type tables: %zu anchors, %zu tables, "
+                 "[rsm] type tables: %zu anchors, %zu primaries, "
                  "%zu globals typed\n",
-                 unit_anchors.size(), type_tables.size(),
+                 unit_anchors.size(), primary_table.size(),
                  [&] {
                      std::size_t n = 0;
                      for (const auto& v : variables_)

@@ -1351,9 +1351,20 @@ int main(int argc, char** argv) {
                                 code = pe_bytes.data() + fn_fo;
                                 code_len = mf_out.size;
                             }
-                            const std::int32_t sub_rsp =
-                                rsm2pdb::pe::parsePrologueSubRsp(
+                            const auto prologue =
+                                rsm2pdb::pe::parsePrologue(
                                     code, code_len);
+                            const std::int32_t sub_rsp = prologue.sub_rsp;
+                            // Each callee-saved push between `push rbp`
+                            // and `sub rsp` lives in the 8-byte slot
+                            // immediately above the local area, so
+                            // saved-rbp / return-addr / rcx-shadow all
+                            // shift up by 8 * extra_pushes. Locals
+                            // themselves (which sit at rbp + 0 .. rbp
+                            // + sub_rsp) don't move.
+                            const std::int32_t param_shift =
+                                8 * static_cast<std::int32_t>(
+                                    prologue.extra_pushes);
                             // Disasm-derived rbp-relative widths.
                             // Used as fallback when the RSM marker
                             // table doesn't carry a size for a given
@@ -1407,7 +1418,7 @@ int main(int argc, char** argv) {
                                 // to evaluate `?? $foo`.
                                 sl.name      = "__frame_outer__";
                                 sl.is_param  = true;
-                                sl.offset    = sub_rsp + 16;
+                                sl.offset    = sub_rsp + 16 + param_shift;
                                 sl.byte_size = 8;
                                 mf_out.locals.push_back(std::move(sl));
                             }
@@ -1432,8 +1443,9 @@ int main(int argc, char** argv) {
                                 ml.name     = p.name;
                                 ml.is_param = true;
                                 ml.offset   = isSelf(p)
-                                              ? sub_rsp + 16
-                                              : sub_rsp + (p.stack_offset / 2);
+                                              ? sub_rsp + 16 + param_shift
+                                              : sub_rsp + param_shift
+                                                  + (p.stack_offset / 2);
                                 ml.byte_size = resolveSize(p, ml.offset);
                                 applyPascalType(ml, p);
                                 mf_out.locals.push_back(std::move(ml));
