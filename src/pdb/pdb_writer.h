@@ -9,8 +9,11 @@
 // The PDB's GUID + age are caller-supplied so the RSDS Debug Directory
 // entry in the target PE matches what the debugger reads from the PDB.
 
+#include "model/model.h"
+
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,6 +30,11 @@ struct PublicSymbol {
     std::uint16_t segment = 0;
     std::uint32_t offset  = 0;
     bool is_function      = false;   // sets PublicSymFlags::Function
+    // For data symbols (is_function==false), the byte width + optional
+    // Pascal primitive kind drive the S_GDATA32 TypeIndex selection
+    // exactly like ModuleLocal below. Functions ignore both fields.
+    std::uint32_t byte_size = 0;
+    std::optional<model::PrimitiveKind> prim_kind;
 };
 
 // Subset of IMAGE_SECTION_HEADER fields the SectionMap needs. The
@@ -55,14 +63,21 @@ struct ModuleLocal {
     bool          is_param = false;    // informational; CV doesn't distinguish
     bool          optimized_out = false;
     std::uint16_t register_id = 0;     // CodeView RegisterId (0 = not in reg)
-    // Width of the variable as observed in machine code / RSM. Maps to:
+    // Width of the variable as observed in machine code / RSM. When
+    // `prim_kind` is unset (Pascal type not resolved), this drives an
+    // unsigned-integer fallback chain:
     //   1 -> UChar, 2 -> UShort, 4 -> UInt32, 8 -> UInt64,
     //   other N -> LF_ARRAY of UChar with count=N (TPI record),
     //   0 -> void* (8-byte hex), used when size couldn't be inferred.
-    // Everything is treated as raw hex on purpose: until we ship a real
-    // Pascal type map (M3 follow-up), surfacing accurate byte counts is
-    // more useful than mislabelling things as Integer.
     std::uint32_t byte_size = 0;
+    // Resolved Pascal primitive kind. When present overrides the
+    // size-based mapping above so signed vs unsigned ints, integer vs
+    // float of the same width, booleans, chars, etc. each get their
+    // own CodeView simple type (Int32 vs UInt32 vs Real32, Bool8 vs
+    // UChar, WChar vs UShort, ...). Resolved upstream from the RSM
+    // per-unit type table; nullopt for variables that fall back to
+    // pure size-based hex.
+    std::optional<model::PrimitiveKind> prim_kind;
 };
 
 // Function inside a Pascal compile unit. Emits as S_GPROC32 + S_END

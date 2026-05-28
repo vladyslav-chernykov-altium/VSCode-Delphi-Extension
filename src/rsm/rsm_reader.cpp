@@ -691,6 +691,171 @@ bool Reader::open(const std::string& path) {
         }
     }
 
+    // -- Per-unit type tables -----------------------------------------
+    //
+    // Variables / params / locals carry a per-unit `type_marker` (an
+    // even byte, 0x02 / 0x04 / 0x06 / ...) that indexes the unit's
+    // primary type table -- a run of records, one per distinct Pascal
+    // type used in the unit, in source-declaration order:
+    //
+    //   0x66 <namelen u8> <Pascal name> <4-byte hash>
+    //
+    // The first record's `name` corresponds to marker 0x02, the second
+    // to 0x04, etc. (so `index = marker/2 - 1`, `marker = 2*(index+1)`).
+    //
+    // Locating each unit's primary table:
+    //   1. Find every "unit anchor" -- `02 <namelen> <unit name>`
+    //      followed (within ~200 bytes) by `02 70 <namelen> <source
+    //      file ending in .pas / .dpr / .inc / .tmp>`.
+    //   2. For each anchor, the next-following 0x66-run is the unit's
+    //      primary type table.
+    //   3. For each variable, the enclosing unit is the closest-prior
+    //      anchor; look up its primary table and decode the marker.
+    //
+    // Variables / functions in units whose anchor we don't find (some
+    // RTL units use a layout the strict heuristic above doesn't match)
+    // simply get no `pascal_type` -- callers fall back to byte-size-
+    // based typing for those.
+    auto isPrintAscii = [&](const char* p, std::size_t n) {
+        for (std::size_t k = 0; k < n; ++k) {
+            const auto c = static_cast<std::uint8_t>(p[k]);
+            if (c < 0x20 || c >= 0x7F) return false;
+        }
+        return true;
+    };
+    auto endsWith = [](const char* p, std::size_t n, const char* suf,
+                       std::size_t sufN) {
+        return n >= sufN &&
+               std::memcmp(p + n - sufN, suf, sufN) == 0;
+    };
+
+    struct UnitAnchor { std::size_t file_offset; std::string name; };
+    std::vector<UnitAnchor> unit_anchors;
+    const std::size_t kVarPayloadHdr = 0x420;
+    for (std::size_t a = kVarPayloadHdr; a + 60 < buf.size(); ) {
+        if (static_cast<std::uint8_t>(buf[a]) != 0x02) { ++a; continue; }
+        const auto nl = static_cast<std::uint8_t>(buf[a + 1]);
+        if (nl < 2 || nl > 40 ||
+            !isPrintAscii(buf.data() + a + 2, nl)) {
+            ++a; continue;
+        }
+        // Look for `02 70 <fnl> <printable>.{pas,dpr,inc,tmp}` within
+        // the next 200 bytes -- the source-file signature.
+        const std::size_t scan_lo = a + 2 + nl;
+        const std::size_t scan_hi = std::min(buf.size(), scan_lo + 200);
+        bool matched = false;
+        for (std::size_t s = scan_lo; s + 8 < scan_hi; ++s) {
+            if (static_cast<std::uint8_t>(buf[s]) != 0x02 ||
+                static_cast<std::uint8_t>(buf[s + 1]) != 0x70) continue;
+            const auto fnl = static_cast<std::uint8_t>(buf[s + 2]);
+            if (fnl < 4 || fnl > 80) continue;
+            if (s + 3 + fnl > buf.size()) continue;
+            const char* fp = buf.data() + s + 3;
+            if (!isPrintAscii(fp, fnl)) continue;
+            if (endsWith(fp, fnl, ".pas", 4) ||
+                endsWith(fp, fnl, ".dpr", 4) ||
+                endsWith(fp, fnl, ".inc", 4) ||
+                endsWith(fp, fnl, ".tmp", 4)) {
+                matched = true;
+                break;
+            }
+        }
+        if (matched) {
+            unit_anchors.push_back({
+                a, std::string(buf.data() + a + 2, nl)});
+            a += 2 + nl;
+        } else {
+            ++a;
+        }
+    }
+
+    // Scan all 0x66 runs (>=3 entries) as candidate type tables.
+    struct TypeTable {
+        std::size_t              start;
+        std::vector<std::string> names;
+    };
+    std::vector<TypeTable> type_tables;
+    for (std::size_t t = kVarPayloadHdr; t + 10 < buf.size(); ) {
+        if (static_cast<std::uint8_t>(buf[t]) != kVarPayloadSubTag0) {
+            ++t; continue;
+        }
+        const auto nl = static_cast<std::uint8_t>(buf[t + 1]);
+        if (nl < 2 || nl > 40 ||
+            t + 2 + nl + 4 > buf.size() ||
+            !isPrintAscii(buf.data() + t + 2, nl)) {
+            ++t; continue;
+        }
+        // Walk forward collecting consecutive 0x66 records.
+        TypeTable tab;
+        tab.start = t;
+        std::size_t cur = t;
+        while (cur + 10 < buf.size() &&
+               static_cast<std::uint8_t>(buf[cur]) == kVarPayloadSubTag0) {
+            const auto c_nl = static_cast<std::uint8_t>(buf[cur + 1]);
+            if (c_nl < 2 || c_nl > 40 ||
+                cur + 2 + c_nl + 4 > buf.size() ||
+                !isPrintAscii(buf.data() + cur + 2, c_nl)) break;
+            tab.names.emplace_back(buf.data() + cur + 2, c_nl);
+            cur += 2 + c_nl + 4;
+        }
+        if (tab.names.size() >= 3) {
+            type_tables.push_back(std::move(tab));
+            t = cur;
+        } else {
+            ++t;
+        }
+    }
+
+    // For each unit anchor, primary type table = first table whose
+    // start > anchor's file_offset.
+    std::unordered_map<std::size_t /*anchor offset*/,
+                       const TypeTable*> primary_table;
+    for (const auto& ua : unit_anchors) {
+        auto it = std::upper_bound(
+            type_tables.begin(), type_tables.end(), ua.file_offset,
+            [](std::size_t v, const TypeTable& t) { return v < t.start; });
+        if (it != type_tables.end()) {
+            primary_table[ua.file_offset] = &*it;
+        }
+    }
+
+    // Resolve pascal_type for one Variable using its enclosing unit's
+    // primary table.
+    auto resolvePascalType = [&](Variable& v) {
+        if (!v.is_primitive || v.type_marker == 0
+            || (v.type_marker & 1) != 0) return;
+        const std::size_t idx =
+            static_cast<std::size_t>(v.type_marker) / 2;
+        if (idx == 0) return;
+        auto it = std::upper_bound(
+            unit_anchors.begin(), unit_anchors.end(), v.file_offset,
+            [](std::size_t v_, const UnitAnchor& a) {
+                return v_ < a.file_offset;
+            });
+        if (it == unit_anchors.begin()) return;
+        --it;
+        auto pit = primary_table.find(it->file_offset);
+        if (pit == primary_table.end() || pit->second == nullptr) return;
+        const auto& names = pit->second->names;
+        if (idx > names.size()) return;
+        v.pascal_type = names[idx - 1];
+    };
+    for (auto& v : variables_) resolvePascalType(v);
+    for (auto& p : procedures_) {
+        for (auto& v : p.params) resolvePascalType(v);
+        for (auto& v : p.locals) resolvePascalType(v);
+    }
+    std::fprintf(stderr,
+                 "[rsm] type tables: %zu anchors, %zu tables, "
+                 "%zu globals typed\n",
+                 unit_anchors.size(), type_tables.size(),
+                 [&] {
+                     std::size_t n = 0;
+                     for (const auto& v : variables_)
+                         if (!v.pascal_type.empty()) ++n;
+                     return n;
+                 }());
+
     // Build VA -> index maps for O(1) lookup. Skipping addresses below
     // the legacy image base catches the bogus VAs that the variable
     // scanner picks up from procedure-internal byte sequences.
@@ -705,6 +870,14 @@ bool Reader::open(const std::string& path) {
     }
 
     return true;
+}
+
+std::optional<Reader::ResolvedPrimitive>
+Reader::resolvePrimitive(std::string_view pascal_name) {
+    if (auto* d = lookupPrimitiveDesc(pascal_name)) {
+        return ResolvedPrimitive{d->kind, d->byte_size};
+    }
+    return std::nullopt;
 }
 
 const Primitive* Reader::findPrimitive(const std::string& name) const {

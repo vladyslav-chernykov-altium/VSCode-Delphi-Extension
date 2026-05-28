@@ -138,6 +138,68 @@ bool writePdb(const std::string& path,
         byte_array_cache.emplace(size, ti);
         return ti;
     };
+    // Pick a CodeView TypeIndex for a Pascal primitive kind. Falls
+    // back to size-based selection when the kind is unset or doesn't
+    // map cleanly (e.g. Float80 which CodeView doesn't have a simple
+    // type for -- emit as 10-byte array).
+    auto typeForKindParts =
+        [&](std::uint32_t byte_size,
+            const std::optional<model::PrimitiveKind>& prim_kind)
+            -> codeview::TypeIndex {
+        if (!prim_kind) return typeForSize(byte_size);
+        // Local shim so the existing kind-switch below keeps reading
+        // off a `v.byte_size` / `*v.prim_kind` pair unchanged.
+        struct V {
+            std::uint32_t                       byte_size;
+            std::optional<model::PrimitiveKind> prim_kind;
+        };
+        const V v{byte_size, prim_kind};
+        using K = model::PrimitiveKind;
+        switch (*v.prim_kind) {
+            // Booleans: CodeView's Boolean8/16/32 simple types render
+            // as `true`/`false` rather than 0/1, matching Pascal's
+            // expected display.
+            case K::Bool:
+                switch (v.byte_size) {
+                    case 1: return codeview::TypeIndex(
+                                codeview::SimpleTypeKind::Boolean8);
+                    case 2: return codeview::TypeIndex(
+                                codeview::SimpleTypeKind::Boolean16);
+                    case 4: return codeview::TypeIndex(
+                                codeview::SimpleTypeKind::Boolean32);
+                    case 8: return codeview::TypeIndex(
+                                codeview::SimpleTypeKind::Boolean64);
+                    default: return typeForSize(v.byte_size);
+                }
+            // AnsiChar -> NarrowCharacter (T_CHAR, 1 byte).
+            case K::Char:  return codeview::TypeIndex::NarrowCharacter();
+            // Char / WideChar -> WideCharacter (T_WCHAR, 2 byte).
+            case K::WChar: return codeview::TypeIndex::WideCharacter();
+            // Signed integers.
+            case K::Int8:  return codeview::TypeIndex::SignedCharacter();
+            case K::Int16: return codeview::TypeIndex::Int16Short();
+            case K::Int32: return codeview::TypeIndex::Int32();
+            case K::Int64: return codeview::TypeIndex::Int64Quad();
+            // Unsigned integers.
+            case K::UInt8:  return codeview::TypeIndex::UnsignedCharacter();
+            case K::UInt16: return codeview::TypeIndex::UInt16Short();
+            case K::UInt32: return codeview::TypeIndex::UInt32();
+            case K::UInt64: return codeview::TypeIndex::UInt64();
+            // Floats.
+            case K::Float32: return codeview::TypeIndex::Float32();
+            case K::Float64: return codeview::TypeIndex::Float64();
+            // Float80 (Pascal Extended on x86) has no CodeView simple
+            // type; emit as a 10-byte hex array.
+            case K::Float80: return typeForSize(v.byte_size);
+        }
+        return typeForSize(v.byte_size);
+    };
+    auto typeForKind = [&](const ModuleLocal& v) -> codeview::TypeIndex {
+        return typeForKindParts(v.byte_size, v.prim_kind);
+    };
+    auto typeForKindPublic = [&](const PublicSymbol& p) -> codeview::TypeIndex {
+        return typeForKindParts(p.byte_size, p.prim_kind);
+    };
 
     // -- GSI: publish caller-supplied publics
     auto& gsi = builder.getGsiBuilder();
@@ -187,7 +249,7 @@ bool writePdb(const std::string& path,
         for (const auto& p : inputs.publics) {
             if (p.is_function) continue;
             codeview::DataSym data(codeview::SymbolRecordKind::GlobalData);
-            data.Type       = codeview::TypeIndex::VoidPointer64();
+            data.Type       = typeForKindPublic(p);
             data.DataOffset = p.offset;
             data.Segment    = p.segment;
             data.Name       = global_unqualified[idx++];
@@ -319,7 +381,7 @@ bool writePdb(const std::string& path,
                     // covering [fn.offset, fn.offset + fn.size).
                     codeview::LocalSym loc(
                         codeview::SymbolRecordKind::LocalSym);
-                    loc.Type  = typeForSize(v.byte_size);
+                    loc.Type  = typeForKind(v);
                     loc.Flags = v.is_param
                                 ? codeview::LocalSymFlags::IsParameter
                                 : codeview::LocalSymFlags::None;
@@ -347,7 +409,7 @@ bool writePdb(const std::string& path,
                     // it as `<optimized away>` in Locals.
                     codeview::LocalSym loc(
                         codeview::SymbolRecordKind::LocalSym);
-                    loc.Type  = typeForSize(v.byte_size);
+                    loc.Type  = typeForKind(v);
                     loc.Flags = v.is_param
                                 ? codeview::LocalSymFlags::IsParameter
                                 : codeview::LocalSymFlags::None;
@@ -359,7 +421,7 @@ bool writePdb(const std::string& path,
                 codeview::RegRelativeSym reg(
                     codeview::SymbolRecordKind::RegRelativeSym);
                 reg.Offset   = static_cast<std::uint32_t>(v.offset);
-                reg.Type     = typeForSize(v.byte_size);
+                reg.Type     = typeForKind(v);
                 reg.Register = codeview::RegisterId::RBP;
                 reg.Name     = v.name;
                 m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(

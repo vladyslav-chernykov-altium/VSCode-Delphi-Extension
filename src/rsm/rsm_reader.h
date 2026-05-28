@@ -79,6 +79,14 @@ struct Variable {
     bool          is_primitive;
     bool          has_trailer;        // true for the 12-byte primitive-extended form
     std::uint64_t file_offset;
+    // Pascal type name resolved through the variable's enclosing unit's
+    // primary type table. Empty string if the resolver couldn't find a
+    // matching table entry (e.g. RTL globals whose marker indexes a
+    // table we don't decode). When non-empty this is the canonical
+    // Pascal name -- "Integer", "Cardinal", "Single", "Boolean", "Char",
+    // "string" / "UnicodeString", etc. -- and lookupPrimitiveDesc()
+    // resolves it to {kind, byte_size}.
+    std::string   pascal_type;
 };
 
 // A function / procedure record (tag 0x28) with its parameter and
@@ -144,6 +152,18 @@ public:
     // Lookup a primitive by its Pascal name (case-sensitive). Returns
     // nullptr when no such primitive was located in the RSM type table.
     const Primitive* findPrimitive(const std::string& name) const;
+
+    // Resolve a Pascal type name to its (kind, byte width) pair using
+    // the built-in Win64 primitive table. Returns nullopt for unknown
+    // names. Accepts canonical Delphi names ("Integer", "Cardinal",
+    // "Single", "Boolean", "Char", "UnicodeString", etc.) -- the same
+    // strings that Variable::pascal_type carries after open().
+    struct ResolvedPrimitive {
+        model::PrimitiveKind kind;
+        std::uint16_t        byte_size;
+    };
+    static std::optional<ResolvedPrimitive>
+        resolvePrimitive(std::string_view pascal_name);
 
     // Lookup a variable by its absolute VA (the .map cross-reference key).
     const Variable* findVariableAt(std::uint64_t address) const;

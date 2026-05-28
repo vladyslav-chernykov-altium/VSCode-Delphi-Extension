@@ -1111,6 +1111,36 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Enrich already-emitted globals with their resolved Pascal
+        // primitive (kind + width), so the S_GDATA32 records carry
+        // proper CodeView types (Int32 / Cardinal / Single / Boolean
+        // / WChar / ...) instead of generic void*. Variable resolution
+        // is by absolute VA -- reconstruct it from the PublicSymbol's
+        // segment + offset coords (mirrors rvaOfPublic going the other
+        // way). Only data symbols are affected; functions skip.
+        if (have_rsm) {
+            std::size_t typed_globals = 0;
+            for (auto& ps : inputs.publics) {
+                if (ps.is_function) continue;
+                if (ps.segment == 0 || ps.segment > inputs.sections.size())
+                    continue;
+                const auto& pe_sec = inputs.sections[ps.segment - 1];
+                const std::uint64_t va =
+                    image_base + pe_sec.virtual_address + ps.offset;
+                const auto* v = rsm_reader.findVariableAt(va);
+                if (!v || v->pascal_type.empty()) continue;
+                if (auto rp = rsm2pdb::rsm::Reader::resolvePrimitive(
+                        v->pascal_type)) {
+                    ps.byte_size = rp->byte_size;
+                    ps.prim_kind = rp->kind;
+                    ++typed_globals;
+                }
+            }
+            std::fprintf(stdout,
+                         "globals typed via RSM pascal_type: %zu / %zu\n",
+                         typed_globals, inputs.publics.size());
+        }
+
         // Build a per-marker byte-size table from RSM globals. RSM
         // stores each variable's `type_marker` (a per-unit primitive
         // type id) but never the byte width directly; we recover the
@@ -1381,6 +1411,22 @@ int main(int argc, char** argv) {
                                 sl.byte_size = 8;
                                 mf_out.locals.push_back(std::move(sl));
                             }
+                            // When RSM resolved a Pascal type name for
+                            // the variable (via the per-unit type
+                            // table), translate it to a kind+size pair
+                            // and override the size-based fallback so
+                            // pdb_writer emits the precise simple type
+                            // (Int32 vs UInt32 vs Real32, Bool8 vs
+                            // UChar, WChar vs UShort, ...).
+                            auto applyPascalType = [](rsm2pdb::pdb::ModuleLocal& ml,
+                                                      const rsm2pdb::rsm::Variable& v) {
+                                if (v.pascal_type.empty()) return;
+                                if (auto rp = rsm2pdb::rsm::Reader::resolvePrimitive(
+                                        v.pascal_type)) {
+                                    ml.prim_kind = rp->kind;
+                                    ml.byte_size = rp->byte_size;
+                                }
+                            };
                             for (const auto& p : pr->params) {
                                 rsm2pdb::pdb::ModuleLocal ml;
                                 ml.name     = p.name;
@@ -1389,6 +1435,7 @@ int main(int argc, char** argv) {
                                               ? sub_rsp + 16
                                               : sub_rsp + (p.stack_offset / 2);
                                 ml.byte_size = resolveSize(p, ml.offset);
+                                applyPascalType(ml, p);
                                 mf_out.locals.push_back(std::move(ml));
                             }
                             for (const auto& l : pr->locals) {
@@ -1397,6 +1444,7 @@ int main(int argc, char** argv) {
                                 ml.is_param = false;
                                 ml.offset   = sub_rsp + (l.stack_offset / 2);
                                 ml.byte_size = resolveSize(l, ml.offset);
+                                applyPascalType(ml, l);
                                 mf_out.locals.push_back(std::move(ml));
                             }
                         }
