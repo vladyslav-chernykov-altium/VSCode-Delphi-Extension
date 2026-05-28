@@ -15,7 +15,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -435,8 +437,89 @@ int cmdPdb(int argc, char** argv) {
     // is by absolute VA -- reconstruct it from the PublicSymbol's
     // segment + offset coords (mirrors rvaOfPublic going the other
     // way). Only data symbols are affected; functions skip.
+    // Aggregate-type registrar (Phase D). Translates an RSM
+    // AggregateType into a PdbInputs::aggregates entry on first
+    // encounter, returning its index for reuse. Recurses through
+    // composite-typed fields so nested types (TBox -> TPoint) get
+    // emitted before their containers.
+    //
+    // For Phase D we ONLY emit records; classes / enums / sets fall
+    // back to the existing byte[N] route (Phase E / F will lift them
+    // by reusing this same registrar with kind-aware emission).
+    std::map<std::pair<std::uint64_t, std::uint16_t>,
+             std::size_t> aggr_idx_cache;
+    std::function<std::optional<std::size_t>(
+        const rsm2pdb::rsm::AggregateType*)> registerAggr;
+    registerAggr = [&](const rsm2pdb::rsm::AggregateType* a)
+            -> std::optional<std::size_t> {
+        if (a == nullptr) return std::nullopt;
+        if (a->kind != rsm2pdb::rsm::AggregateKind::Record
+            && a->kind != rsm2pdb::rsm::AggregateKind::PackedRecord) {
+            return std::nullopt;  // Phase E / F territory
+        }
+        const std::pair<std::uint64_t, std::uint16_t> key{
+            a->unit_anchor_offset, a->own_hash};
+        if (auto it = aggr_idx_cache.find(key);
+            it != aggr_idx_cache.end()) {
+            return it->second;
+        }
+        // Reserve slot first so cyclic references (rare in Pascal
+        // records but theoretically possible via TArray<T>) terminate.
+        const auto idx = inputs.aggregates.size();
+        aggr_idx_cache[key] = idx;
+        rsm2pdb::pdb::AggregateRecord rec;
+        rec.name      = a->name;
+        rec.byte_size = a->total_size;
+        rec.fields.reserve(a->fields.size());
+        for (const auto& fe : a->fields) {
+            rsm2pdb::pdb::AggregateField f;
+            f.name        = fe.name;
+            f.byte_offset = fe.offset;
+            if (fe.type_hash != 0) {
+                // Composite field. Same-unit first, then last-wins.
+                const rsm2pdb::rsm::AggregateType* sub =
+                    rsm_reader.findAggregateInUnit(
+                        a->unit_anchor_offset, fe.type_hash);
+                if (sub == nullptr) {
+                    sub = rsm_reader.findAggregateByHash(fe.type_hash);
+                }
+                f.nested_aggregate = registerAggr(sub);
+            } else if (fe.primitive_marker != 0) {
+                if (const auto* nm = rsm_reader.primitiveNameForMarker(
+                        a->unit_anchor_offset, fe.primitive_marker)) {
+                    if (auto rp = rsm2pdb::rsm::Reader::resolvePrimitive(
+                            *nm)) {
+                        f.prim_kind = rp->kind;
+                        f.byte_size = rp->byte_size;
+                    }
+                }
+                // f.prim_kind stays nullopt when the marker's name
+                // isn't a known primitive (e.g. ShortString or an
+                // RTL-only type we don't decode) -- writer falls
+                // back to UChar.
+            }
+            rec.fields.push_back(std::move(f));
+        }
+        inputs.aggregates.push_back(std::move(rec));
+        return idx;
+    };
+    auto lookupAggrIdx = [&](const rsm2pdb::rsm::Variable& v)
+            -> std::optional<std::size_t> {
+        if (v.is_primitive || v.inline_type_id == 0) return std::nullopt;
+        const rsm2pdb::rsm::AggregateType* a = nullptr;
+        if (v.unit_anchor_offset != 0) {
+            a = rsm_reader.findAggregateInUnit(
+                v.unit_anchor_offset, v.inline_type_id);
+        }
+        if (a == nullptr) {
+            a = rsm_reader.findAggregateByHash(v.inline_type_id);
+        }
+        return registerAggr(a);
+    };
+
     if (have_rsm) {
-        std::size_t typed_globals = 0;
+        std::size_t typed_globals  = 0;
+        std::size_t aggr_globals   = 0;
         for (auto& ps : inputs.publics) {
             if (ps.is_function) continue;
             if (ps.segment == 0 || ps.segment > inputs.sections.size())
@@ -445,17 +528,35 @@ int cmdPdb(int argc, char** argv) {
             const std::uint64_t va =
                 image_base + pe_sec.virtual_address + ps.offset;
             const auto* v = rsm_reader.findVariableAt(va);
-            if (!v || v->pascal_type.empty()) continue;
-            if (auto rp = rsm2pdb::rsm::Reader::resolvePrimitive(
-                    v->pascal_type)) {
-                ps.byte_size = rp->byte_size;
-                ps.prim_kind = rp->kind;
-                ++typed_globals;
+            if (!v) continue;
+            // Primitive globals: resolve via Pascal-name -> primitive.
+            if (!v->pascal_type.empty()) {
+                if (auto rp = rsm2pdb::rsm::Reader::resolvePrimitive(
+                        v->pascal_type)) {
+                    ps.byte_size = rp->byte_size;
+                    ps.prim_kind = rp->kind;
+                    ++typed_globals;
+                    continue;
+                }
+            }
+            // Non-primitive globals: route through aggregate registrar.
+            // Records get LF_STRUCTURE in the PDB; classes / enums
+            // stay on the byte[N] fallback for now.
+            if (auto idx = lookupAggrIdx(*v)) {
+                ps.aggregate_index = idx;
+                ps.byte_size       =
+                    inputs.aggregates[*idx].byte_size != 0
+                        ? inputs.aggregates[*idx].byte_size
+                        : ps.byte_size;
+                ++aggr_globals;
             }
         }
         std::fprintf(stdout,
-                     "globals typed via RSM pascal_type: %zu / %zu\n",
-                     typed_globals, inputs.publics.size());
+                     "globals typed via RSM pascal_type: %zu / %zu "
+                     "(records routed via TPI: %zu, %zu aggregates "
+                     "registered)\n",
+                     typed_globals, inputs.publics.size(),
+                     aggr_globals, inputs.aggregates.size());
     }
 
     // Per-marker byte-size aggregate from RSM globals; reused by
@@ -614,6 +715,30 @@ int cmdPdb(int argc, char** argv) {
                             ml.offset    = rv.rbp_offset;
                             ml.byte_size = rv.byte_size;
                             ml.prim_kind = rv.prim_kind;
+                            // Phase D: route record-typed locals
+                            // through the aggregate registrar so they
+                            // emit LF_STRUCTURE-backed TypeIndex
+                            // instead of byte[N]. compose stamps
+                            // aggregate_hash + unit_anchor_offset on
+                            // the resolved var; we look the aggregate
+                            // up and register it (no-op if already
+                            // seen).
+                            if (rv.aggregate_hash != 0) {
+                                const rsm2pdb::rsm::AggregateType* a =
+                                    rsm_reader.findAggregateInUnit(
+                                        rv.unit_anchor_offset,
+                                        rv.aggregate_hash);
+                                if (a == nullptr) {
+                                    a = rsm_reader.findAggregateByHash(
+                                        rv.aggregate_hash);
+                                }
+                                if (auto idx = registerAggr(a)) {
+                                    ml.aggregate_index = idx;
+                                    if (inputs.aggregates[*idx].byte_size)
+                                        ml.byte_size =
+                                            inputs.aggregates[*idx].byte_size;
+                                }
+                            }
                             mf_out.locals.push_back(std::move(ml));
                         }
                     }

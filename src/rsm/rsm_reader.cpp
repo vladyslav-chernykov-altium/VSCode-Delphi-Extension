@@ -1351,6 +1351,23 @@ bool Reader::open(const std::string& path) {
                      fields_total, entries_total);
     }
 
+    // Stamp unit_anchor_offset onto every Variable so downstream
+    // pipelines (compose / PDB) don't have to re-run upper_bound.
+    // This must happen AFTER unit_anchor_offsets_ is populated and
+    // BEFORE the aggregate-based type resolution below (which we
+    // also lift through the stamped field).
+    for (auto& v : variables_) {
+        v.unit_anchor_offset = unitAnchorFor(v.file_offset);
+    }
+    for (auto& p : procedures_) {
+        for (auto& v : p.params) {
+            v.unit_anchor_offset = unitAnchorFor(v.file_offset);
+        }
+        for (auto& v : p.locals) {
+            v.unit_anchor_offset = unitAnchorFor(v.file_offset);
+        }
+    }
+
     // -- Aggregate-based type resolution (Phase B.2 + B.3) -----------
     //
     // Non-primitive variables / params / locals carry their type's

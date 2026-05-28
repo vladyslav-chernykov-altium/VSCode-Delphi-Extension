@@ -10,6 +10,7 @@
 #include "llvm/DebugInfo/CodeView/Line.h"
 #include "llvm/DebugInfo/CodeView/SymbolRecord.h"
 #include "llvm/DebugInfo/CodeView/SymbolSerializer.h"
+#include "llvm/DebugInfo/CodeView/ContinuationRecordBuilder.h"
 #include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/MSF/MSFBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/DbiModuleDescriptorBuilder.h"
@@ -206,11 +207,87 @@ bool writePdb(const std::string& path,
         }
         return typeForSize(v.byte_size);
     };
+    // -- LF_FIELDLIST + LF_STRUCTURE for every user aggregate ---------
+    //
+    // Phase D scope: we emit a CodeView Struct (kind = TpiV80
+    // Structure) for each record in PdbInputs::aggregates. Locals /
+    // publics carrying `aggregate_index` then route through the
+    // resulting TypeIndex instead of falling back to byte[N], so
+    // cdb's `dt` shows the variable field-by-field.
+    //
+    // Two-pass emission to satisfy CodeView's "referenced types
+    // must come before referrers" rule (the AppendingTypeTableBuilder
+    // doesn't sort): first pass emits a placeholder LF_STRUCTURE for
+    // every aggregate so its TypeIndex is reservable for nested
+    // refs; second pass walks fields, builds the LF_FIELDLIST, and
+    // emits the final LF_STRUCTURE that references it.
+    //
+    // For Phase D we just do a single pass -- nested refs are
+    // backward (TBox declared AFTER TPoint in source order), and
+    // cli_cmd_pdb's registrar walks composite refs depth-first so
+    // children are registered before their containers. If a future
+    // fixture introduces a true forward ref (mutual record refs
+    // through pointers) we'd switch to the two-pass scheme.
+    std::vector<codeview::TypeIndex> aggregate_ti;
+    aggregate_ti.reserve(inputs.aggregates.size());
+    // Resolve a field's TypeIndex. Done before we know if all later
+    // aggregates have been emitted -- the registrar enforces forward
+    // safety today; nullopt nested_aggregate falls back to UCHAR.
+    auto fieldTypeIndex =
+        [&](const AggregateField& f) -> codeview::TypeIndex {
+            if (f.nested_aggregate) {
+                const auto idx = *f.nested_aggregate;
+                if (idx < aggregate_ti.size()) return aggregate_ti[idx];
+                // Forward ref not supported in Phase D; fall back
+                // to UCHAR-sized hex rather than emitting an invalid
+                // TypeIndex (would crash the debugger).
+                return codeview::TypeIndex::UnsignedCharacter();
+            }
+            return typeForKindParts(
+                f.byte_size != 0 ? f.byte_size : 4u, f.prim_kind);
+        };
+    for (const auto& a : inputs.aggregates) {
+        codeview::ContinuationRecordBuilder crb;
+        crb.begin(codeview::ContinuationRecordKind::FieldList);
+        for (const auto& f : a.fields) {
+            codeview::DataMemberRecord dmr(
+                codeview::MemberAccess::Public,
+                fieldTypeIndex(f),
+                f.byte_offset,
+                f.name);
+            crb.writeMemberType(dmr);
+        }
+        const auto field_list_ti = tpi_table.insertRecord(crb);
+        codeview::ClassRecord cr(
+            codeview::TypeRecordKind::Struct,
+            static_cast<std::uint16_t>(a.fields.size()),
+            codeview::ClassOptions::None,
+            field_list_ti,
+            codeview::TypeIndex::None(),   // no derivation list
+            codeview::TypeIndex::None(),   // no vshape (records)
+            a.byte_size,
+            a.name,
+            std::string{});                // empty unique-name
+        aggregate_ti.push_back(tpi_table.writeLeafType(cr));
+    }
+
+    // Route a (byte_size, prim_kind, optional aggregate_index) tuple
+    // to the right TypeIndex. aggregate_index wins when set.
+    auto resolveTypeIndex =
+        [&](std::uint32_t byte_size,
+            const std::optional<model::PrimitiveKind>& prim_kind,
+            const std::optional<std::size_t>& aggregate_index)
+            -> codeview::TypeIndex {
+            if (aggregate_index && *aggregate_index < aggregate_ti.size()) {
+                return aggregate_ti[*aggregate_index];
+            }
+            return typeForKindParts(byte_size, prim_kind);
+        };
     auto typeForKind = [&](const ModuleLocal& v) -> codeview::TypeIndex {
-        return typeForKindParts(v.byte_size, v.prim_kind);
+        return resolveTypeIndex(v.byte_size, v.prim_kind, v.aggregate_index);
     };
     auto typeForKindPublic = [&](const PublicSymbol& p) -> codeview::TypeIndex {
-        return typeForKindParts(p.byte_size, p.prim_kind);
+        return resolveTypeIndex(p.byte_size, p.prim_kind, p.aggregate_index);
     };
 
     // -- GSI: publish caller-supplied publics

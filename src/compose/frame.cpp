@@ -96,6 +96,18 @@ void applyPascalType(ResolvedVar& rv, const rsm::Variable& v) {
     }
 }
 
+// Carry the aggregate-type identifier (own_hash + the unit anchor it
+// belongs to) through to the resolved var so the PDB pipeline can
+// look it up and synthesise an LF_STRUCTURE referencing TypeIndex.
+// Both fields come straight from the Variable (the reader stamps
+// unit_anchor_offset onto every variable during open()).
+void applyAggregateRef(ResolvedVar& rv, const rsm::Variable& v) {
+    if (v.is_primitive) return;
+    if (v.inline_type_id == 0) return;
+    rv.aggregate_hash      = v.inline_type_id;
+    rv.unit_anchor_offset  = v.unit_anchor_offset;
+}
+
 } // namespace
 
 ResolvedFunction resolveFunction(
@@ -149,6 +161,7 @@ ResolvedFunction resolveFunction(
         rv.byte_size = resolveSize(p, rv.rbp_offset,
                                    marker_sizes, sniffed);
         applyPascalType(rv, p);
+        applyAggregateRef(rv, p);
         out.vars.push_back(std::move(rv));
     }
     for (const auto& l : proc.locals) {
@@ -159,6 +172,7 @@ ResolvedFunction resolveFunction(
         rv.byte_size = resolveSize(l, rv.rbp_offset,
                                    marker_sizes, sniffed);
         applyPascalType(rv, l);
+        applyAggregateRef(rv, l);
         out.vars.push_back(std::move(rv));
     }
     return out;

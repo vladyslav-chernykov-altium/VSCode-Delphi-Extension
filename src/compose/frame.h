@@ -49,6 +49,14 @@ struct ResolvedVar {
     // slot holds the parent function's rbp (passed in rcx and
     // spilled to the first shadow slot).
     bool                                 is_static_link = false;
+    // Set when the variable's RSM record carries a non-primitive
+    // type_hash (own_hash of an aggregate in the variable's unit).
+    // PDB pipeline (Phase D) uses these two fields to look up the
+    // aggregate and route the symbol's TypeIndex through an
+    // LF_STRUCTURE. unit_anchor_offset is needed because hash is
+    // per-unit; both are zero for primitive-typed vars.
+    std::uint16_t                        aggregate_hash = 0;
+    std::uint64_t                        unit_anchor_offset = 0;
 };
 
 struct ResolvedFunction {

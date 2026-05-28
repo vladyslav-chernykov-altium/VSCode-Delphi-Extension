@@ -87,6 +87,12 @@ struct Variable {
     // "string" / "UnicodeString", etc. -- and lookupPrimitiveDesc()
     // resolves it to {kind, byte_size}.
     std::string   pascal_type;
+    // The closest-prior unit anchor's file_offset. Stamped after
+    // pass 1 so consumers (compose / PDB pipeline) can look up the
+    // variable's aggregate scope without re-running upper_bound.
+    // 0 means "no enclosing anchor" (rare; matches the same
+    // sentinel AggregateType uses).
+    std::uint64_t unit_anchor_offset = 0;
 };
 
 // A function / procedure record (tag 0x28) with its parameter and
