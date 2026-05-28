@@ -1590,25 +1590,143 @@ open risks from the first write-up.
        attach in a second pass after the type-record cluster has
        been fully walked.
 
-Open risks still left (need either a fixture extension or a sample
-from AdvPCB.rsm):
+---------------------------------------------------------------------------
+2026-05-28 (continued) -- Phase A risk clearance: R4 + R6 closed
+---------------------------------------------------------------------------
 
-  R4. Class with a COMPOSITE-typed field
-      (e.g. `TBag = class fPos: TPoint; end;`). All 0x2c records
-      for classes in the current fixture use primitive type refs
-      only. If the encoding for "class field with record type" is
-      identical to "record field with record type", the existing
-      "2-byte hash vs 1-byte primitive marker" branch handles it
-      without changes -- but worth confirming empirically.
+Cleared the last two risks (R4: class with composite-typed field;
+R6: 2-byte offset form) on TWO independent samples -- the extended
+examples/07_records fixture (adding TBag class with TPoint fields
+and TBig record with 40 Integer fields) AND a probe pass over
+AdvPCB.rsm (576 MB real-world build).
 
-  R6. Offset > 127 / 2-byte offset form. All offsets in the
-      fixture are <= 0x40 (* 2 -> 32 bytes), well within u8
-      range. Variable stack offsets are known to switch to a
-      2-byte signed form when the value exceeds u8 -- the same
-      may or may not hold for field offsets. A record with at
-      least one field at byte offset >= 128 would settle this.
+[FACT] R4 closed -- class-field-with-composite-type uses identical
+       encoding to record-field-with-composite-type. From TBag's
+       fields:
 
-Both are small fixture extensions (add TBag and TBig types). Can
-also be cleared by probing AdvPCB.rsm for any class type whose
-field list contains a 2-byte hash at the type-ref position.
+         2c 04 fPos  00 02 00  71 1a  10 9c 01 59 1d 07 00 00 08  99 1a ff
+         2c 05 fSlot 00 02 00  71 1a  20 9c 01 5d 1d 07 00 00 08  99 1a ff
+         2c 04 fTag  00 02 00  02  30 9c 09 61 1d ed 03 01 61 1d 07 00 00 08  99 1a ff
+                              ^^^^^^                                          ^^^^^
+                              TPoint hash                                     TBag parent
+                       offset_x2: 10 (real 8 -- after vtable),
+                                  20 (real 16), 30 (real 24)
+
+       Same 2-byte hash type-ref, same 8-byte internals trailer,
+       same `<parent_hash u16> ff` terminator. No new parser branch
+       needed -- the existing primitive-vs-composite branch handles
+       it.
+
+[FACT] On AdvPCB.rsm: of 31,470 field records with the `00 02 00`
+       (public-record-or-class) prefix, 4,103 (13.0%) use the
+       2-byte composite hash type-ref. Format consistent across
+       all of them; sample at 0x47358 ("D4" field):
+         2c 02 44 34 00 02 00 bd 29 10 9c 01 95 89 07 00 00 08 70 ff
+                       ^^^^^^ ^^^^^ ^^                          ^^^^^^
+                       prefix hash  offset                      parent ff
+
+       Plus 4,496 protected (`00 04 00`) and 63,011 private
+       (`00 00 00`) class fields. So the storage byte really does
+       encode visibility:
+         0x00 = private
+         0x02 = public (records implicitly + class public)
+         0x04 = protected
+       For Step 11b's purposes (just rendering the field) we
+       carry but don't act on visibility.
+
+[FACT] R6 closed -- field offset has a 2-byte form, marked by
+       LSB=1 of the first offset byte. Same self-describing scheme
+       as stack offsets (D-018) but UNSIGNED (offsets are
+       non-negative). Decode formula:
+
+         If offset_byte & 1 == 0:
+             // 1-byte form (offset_x2 in u8, LSB always 0)
+             real_offset = offset_byte / 2;
+             consumed = 1;
+         else:
+             // 2-byte form (LSB of low byte = 1)
+             v = u16_le(offset_byte, next_byte);
+             real_offset = (v - 1) / 4;
+             consumed = 2;
+
+       Verified on every TBig field F00..F39 in records.rsm:
+         F00  byte: 00         -> real 0
+         F01  byte: 08         -> real 4
+         ...
+         F31  byte: F8         -> real 124   (last 1-byte form)
+         F32  bytes: 01 02     -> v=0x0201=513,  real (513-1)/4=128
+         F33  bytes: 11 02     -> v=0x0211=529,  real 132
+         F34  bytes: 21 02     -> v=0x0221=545,  real 136
+         F35  bytes: 31 02     -> v=0x0231=561,  real 140
+         F36  bytes: 41 02     -> v=0x0241=577,  real 144
+         F37  bytes: 51 02     -> v=0x0251=593,  real 148
+         F38  bytes: 61 02     -> v=0x0261=609,  real 152
+         F39  bytes: 71 02     -> v=0x0271=625,  real 156
+
+       (TBig: 40 Integer fields = 160 bytes, F39 at offset 156. The
+       compiler's "switch to 2-byte form" boundary in records.rsm
+       lands exactly at real=128 / offset_x2=256 -- the first value
+       that doesn't fit a u8.)
+
+[GUESS] AdvPCB has 5,182 `00 02 00`-prefix fields using the 2-byte
+       offset form. Sample "Overhead" at 0x4a0d6 decodes to real
+       offset 64 -- a value that WOULD have fit the 1-byte form
+       (byte 0x80). So Delphi's compiler doesn't strictly require
+       offset >= 128 to switch encoding; it sometimes emits 2-byte
+       even when 1-byte would do. Possibly governed by enclosing
+       record's total size, optimization level or compiler
+       version. Parser must accept either form irrespective of
+       value; the LSB marker is self-describing.
+
+[FACT] Field-record bytes-after-name, full canonical layout:
+
+       primitive type-ref + 1-byte offset:
+         00 <vis 1B> 00 <prim_marker 1B> <offset_x2 u8>
+         <internals 13B> <parent_hash u16 LE> ff
+         total: 21 bytes after name
+
+       primitive type-ref + 2-byte offset:
+         00 <vis 1B> 00 <prim_marker 1B> <offset_low u8>=odd <offset_high u8>
+         <internals 13B> <parent_hash u16 LE> ff
+         total: 22 bytes after name
+
+       composite hash-ref + 1-byte offset:
+         00 <vis 1B> 00 <type_hash u16 LE> <offset_x2 u8>
+         <internals 8B> <parent_hash u16 LE> ff
+         total: 17 bytes after name
+
+       composite hash-ref + 2-byte offset:
+         00 <vis 1B> 00 <type_hash u16 LE> <offset_low u8>=odd <offset_high u8>
+         <internals 8B> <parent_hash u16 LE> ff
+         total: 18 bytes after name
+
+       Parser robustness: don't rely on total length -- walk-to-ff
+       is the canonical stop. Internals can carry varying back-refs.
+
+[FACT] Disambiguating type-ref form (1-byte primitive marker vs
+       2-byte composite hash). Empirically:
+
+         - Primitive markers are small even bytes from the table
+           kPrimitiveTable (currently 36 entries; max marker
+           ~0x42). All bytes < 0x60.
+         - Composite hashes seen in records.rsm range 0x1a6d..
+           0x1aa1 in low byte (so low byte > 0x40 in this fixture),
+           with 0x1a or 0x1b as high byte. AdvPCB has hashes
+           starting at 0x29 (low) -- overlap with the primitive
+           marker range IS possible in principle.
+
+       Safe parser rule: at the type-ref position, attempt to
+       resolve the byte as an `own_hash` against the unit's
+       collected type-record map (and verify the NEXT byte is
+       consistent with the hash's expected high-byte). If yes,
+       it's a composite ref. If no, treat as 1-byte primitive
+       marker (and validate against kPrimitiveTable).
+
+[FACT] AdvPCB.rsm size: 576,706,973 bytes. Format-wise indistinguish-
+       able from our small records.rsm fixture -- same tag bytes,
+       same record shapes, same self-describing offset/type-ref
+       forms. Confidence for Step 11b implementation: HIGH.
+
+Step 11b is now unblocked. Phase B (parser extension) can proceed
+without speculative branches.
 

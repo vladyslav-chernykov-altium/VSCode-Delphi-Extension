@@ -90,6 +90,28 @@ type
     function Describe: string; override;
   end;
 
+  // --- Class with composite-typed field (clears risk R4) ---
+  // TBag holds a TPoint by value -- this is the case the current
+  // fixture doesn't cover: class field whose type is a user
+  // record, not a primitive.
+  TBag = class
+  public
+    fPos:   TPoint;
+    fSlot:  TPoint;
+    fTag:   Integer;
+  end;
+
+  // --- Big record forcing offset > 127 (clears risk R6) ---
+  // 40 Integer fields = 160 bytes; the last few sit at offsets
+  // 128 .. 156, well past u8 (127). If RSM's `<offset_x2>` byte
+  // ran out and switched to a 2-byte form, we'll see it here.
+  TBig = record
+    F00, F01, F02, F03, F04, F05, F06, F07, F08, F09: Integer;
+    F10, F11, F12, F13, F14, F15, F16, F17, F18, F19: Integer;
+    F20, F21, F22, F23, F24, F25, F26, F27, F28, F29: Integer;
+    F30, F31, F32, F33, F34, F35, F36, F37, F38, F39: Integer;
+  end;
+
 // ---------------- globals ----------------
 
 var
@@ -101,6 +123,8 @@ var
   GColors:  TColors;
   GShape:   TShape;
   GCircle:  TCircle;
+  GBag:     TBag;
+  GBig:     TBig;
 
 // ---------------- methods ----------------
 
@@ -147,6 +171,8 @@ var
   lColors: TColors;
   lShape:  TShape;
   lCircle: TCircle;
+  lBag:    TBag;
+  lBig:    TBig;
 begin
   // --- TPoint ---
   lPoint.X := 11;
@@ -180,6 +206,20 @@ begin
   lShape  := TShape.Create('PlainShape', 10.5);
   lCircle := TCircle.Create(78.5, 5.0);
 
+  // --- TBag (class with composite field, clears R4) ---
+  lBag := TBag.Create;
+  lBag.fPos.X  := 1001;
+  lBag.fPos.Y  := 1002;
+  lBag.fSlot.X := 2001;
+  lBag.fSlot.Y := 2002;
+  lBag.fTag    := 7777;
+
+  // --- TBig (big record forcing offset > 127, clears R6) ---
+  lBig.F00 := 100;
+  lBig.F19 := 119;
+  lBig.F32 := 132;
+  lBig.F39 := 139;
+
   // --- mirror into globals so we can also test global struct view ---
   GPoint  := lPoint;
   GPerson := lPerson;
@@ -189,6 +229,8 @@ begin
   GColors := lColors;
   GShape  := lShape;
   GCircle := lCircle;
+  GBag    := lBag;
+  GBig    := lBig;
 
   Writeln('locals + globals filled; ready to inspect.');
   SetBreakHere;
@@ -196,6 +238,7 @@ begin
 
   lShape.Free;
   lCircle.Free;
+  lBag.Free;
 end;
 
 begin
