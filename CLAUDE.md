@@ -321,6 +321,22 @@ body. `git log --oneline` for the recent history.
     bind BPs even with `sourceFileMap` set — its matcher is
     less flexible than gdb's.
 
+22. **`parsePrologueSubRsp` only recognises the simplest Delphi
+    prologue shape:** `push rbp; sub rsp, imm; mov rbp, rsp`. Larger
+    procedures emit callee-saved pushes between `push rbp` and
+    `sub rsp` (e.g. `push rbp; push rdi; push rsi; sub rsp, 0x1C0;
+    mov rbp, rsp` in `examples/05_types ProbeLocals`). The current
+    parser bails out on the second `push` and returns `sub_rsp = 0`,
+    so the `real_off = sub_rsp + RSM/2` formula collapses and every
+    param/local in the function lands at the wrong rbp offset.
+    Consequence: in PDB output the **TPI types are still correct**
+    (Integer / wchar_t* / etc. propagate through the resolver) but
+    cdb's Watch can't read the values because the addresses point at
+    unrelated stack words. Step 10.5 / a small `parsePrologueSubRsp`
+    extension (skip a run of `push <reg>` / `push <r8..r15>` between
+    `push rbp` and `sub rsp`) is the fix. Globals are unaffected --
+    they don't go through this path.
+
 ---
 
 ## How we maintain `todo.txt` and `rsm-format.txt`
