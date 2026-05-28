@@ -25,11 +25,13 @@ Status snapshot (auto-rotting; verify against the latest commit):
 | **M2A v2 — real-world proc-record format** (24.6× more procs decoded; gdb sees args+locals for ~125k methods) | ✅ done 2026-05-26 |
 | VSCode extension (build / debug / source nav, keybindings) | ✅ working end-to-end |
 | Step 10.4 — fix override-method `Self` offset | ✅ done (subsumed by Delphi-x64 frame RE: Self always at rbp+sub_rsp+16 via name + marker check) |
-| Step 10.5 — precise primitive typing (Cardinal vs Integer, Double vs Int64, ...) | ⏳ deferred |
-| Step 11 — full records / enums / classes | ⏳ deferred |
+| Step 10.5 — precise primitive typing (Cardinal vs Integer, Double vs Int64, Boolean, Char, ...) | ✅ done 2026-05-27 (RE'd per-unit type table → marker→Pascal name → CodeView SimpleTypeKind) |
+| Step 11a — string types (`string`, `AnsiString`, `WideString`, `UTF8String`, `PChar`, etc.) | ✅ done 2026-05-27 (CodeView SimpleTypeMode::NearPointer64 + pointer-to-char base; cdb auto-displays `"..."`) |
+| Step 11b — records / enums / classes (full TPI struct synthesis) | ⏳ deferred |
 | Synthesise line entries at begin/end (begin/end-line source nav) | ⏳ deferred |
 | **M3 — PDB backend (LLVM-backed)** — line BPs + step-into in .pas, S_GDATA32 globals + S_REGREL32 locals/params visible in cppvsdbg | ✅ done, user-verified |
-| M3 follow-up — real Pascal types in PDB TPI (currently every var typed Int32 as placeholder) | ⏳ deferred |
+| M3 follow-up — real Pascal types in PDB TPI | ✅ done 2026-05-27 (per-unit type-table RE + signed 2-byte form fix + multi-push prologue parser; all 21 ProbeLocals primitives + strings resolve in cdb) |
+| Step 12 — nested-function / lambda `static link` + closure capture visibility | ⏳ deferred (placeholder `__frame_outer__` works; auto-deref to outer's fields needs TPI struct synth) |
 
 Most current commit on `main` should explain the latest delta in its
 body. `git log --oneline` for the recent history.
@@ -243,13 +245,15 @@ body. `git log --oneline` for the recent history.
     marker:
       - 0x29 for base-class virtual / regular methods
       - 0x31 for override methods
-      - 0xD5 for anonymous-method closure Self
+      - 0xD5 for anonymous-method closure Self (ActRec.$0$Body)
     paired with sentinel offsets `+4109` (newer Delphi) or `+4`
     (older). Don't decode these via the general `sub_rsp + RSM/2`
     formula -- it lands well outside any real frame slot. Instead,
-    Self always lives at `rbp + sub_rsp + 16` (= the rcx-shadow
-    slot, where Delphi spills the implicit `this`-pointer). main.cpp
-    routes Self through this special case by checking
+    Self always lives at `rbp + sub_rsp + 16 + 8*extra_pushes` (=
+    the rcx-shadow slot, where Delphi spills the implicit `this`-
+    pointer; the extra_pushes term shifts it up if the prologue
+    pushed callee-saved regs between `push rbp` and `sub rsp`).
+    main.cpp routes Self through this special case by checking
     `name == "Self" || marker == 0x29 || marker == 0xD5` -- the
     name fallback also catches 0x31 (override) so we don't need to
     enumerate every marker variant. Verified on examples/04_locals
@@ -321,21 +325,101 @@ body. `git log --oneline` for the recent history.
     bind BPs even with `sourceFileMap` set — its matcher is
     less flexible than gdb's.
 
-22. **`parsePrologueSubRsp` only recognises the simplest Delphi
-    prologue shape:** `push rbp; sub rsp, imm; mov rbp, rsp`. Larger
-    procedures emit callee-saved pushes between `push rbp` and
-    `sub rsp` (e.g. `push rbp; push rdi; push rsi; sub rsp, 0x1C0;
-    mov rbp, rsp` in `examples/05_types ProbeLocals`). The current
-    parser bails out on the second `push` and returns `sub_rsp = 0`,
-    so the `real_off = sub_rsp + RSM/2` formula collapses and every
-    param/local in the function lands at the wrong rbp offset.
-    Consequence: in PDB output the **TPI types are still correct**
-    (Integer / wchar_t* / etc. propagate through the resolver) but
-    cdb's Watch can't read the values because the addresses point at
-    unrelated stack words. Step 10.5 / a small `parsePrologueSubRsp`
-    extension (skip a run of `push <reg>` / `push <r8..r15>` between
-    `push rbp` and `sub rsp`) is the fix. Globals are unaffected --
-    they don't go through this path.
+22. **Delphi-x64 prologue variants — `parsePrologue` handles
+    both.** The single-block shape `push rbp; sub rsp, imm;
+    mov rbp, rsp` is the common case (every proc in
+    `examples/04_locals`), but procs with managed locals or many
+    spills push callee-saved registers between `push rbp` and
+    `sub rsp`:
+
+        push rbp
+        push rdi          \  zero..many of these (typical pairs are
+        push rsi           > rdi+rsi, or r12..r15 via REX.B + 0x54..)
+        sub  rsp, 0x1C0   /
+        mov  rbp, rsp
+
+    `parsePrologue` returns `{sub_rsp, extra_pushes}`. Locals don't
+    shift (they live at `rbp+0 .. rbp+sub_rsp` regardless of
+    pushes), but params + Self shift up by 8 bytes per extra push:
+    `real_param = sub_rsp + 8*extra_pushes + RSM/2`. The pushes
+    occupy the slots immediately above the local-area, so the
+    rcx-shadow slot moves from `rbp + sub_rsp + 16` to `rbp +
+    sub_rsp + 16 + 8*extra_pushes`. Verified on
+    `examples/05_types ProbeLocals` (2 extra pushes -> all 21
+    primitive/string locals resolve correctly in cdb).
+
+23. **Per-unit type table layout (RSM unit metadata block).** Each
+    Pascal unit's metadata block in RSM starts with the unit anchor
+    `02 <namelen> <unit-name>` and is followed within ~200 bytes by
+    a source-file ref `02 70 <namelen> <file>.{pas,dpr,inc,tmp}`.
+    The primary type table is a sequence of `0x66` records (each
+    `0x66 <namelen> <pascal_name> <4-byte hash>`) in source-
+    declaration order, **interleaved with `0x67` records** that
+    reference imported functions / methods of the same `<tag>
+    <namelen> <name> <hash>` shape -- the scanner walks past them
+    without recording. Variable's `type_marker` (always even,
+    `0x02 / 0x04 / 0x06 / ...`) indexes the table: marker = `2 *
+    (index + 1)`. Looking name up in the hard-coded
+    `kPrimitiveTable` (in `rsm_reader.cpp`) gives `(PrimitiveKind,
+    byte_size)` -- the pair the pdb_writer needs for typed
+    S_REGREL32 / S_GDATA32 emission. False positives are avoided
+    by tying every collected table to its unit anchor (per-anchor
+    scan with a hard upper bound) rather than free-floating
+    "longest run of 0x66" detection, which used to mis-attribute
+    variables across units (every marker 0x02 in `examples/
+    04_locals` resolved as Boolean before this fix because the
+    "locals" unit's anchor-less table was discarded).
+
+24. **Stack-offset 2-byte encoding is SIGNED i16.** Sub-record
+    payloads carry the stack offset in either a 1-byte form (LSB=0,
+    decoded as `(int8) b0`) or a 2-byte form (LSB=1, two bytes
+    `b0, b1` forming a little-endian word). The 2-byte form must be
+    interpreted as a **signed** 16-bit value, then `stored_off =
+    ((int16) v - 1) / 2` to keep the downstream `sub_rsp + stored
+    / 2` formula working. Empirically:
+
+        v=0xFE61 (i16=-415)  -> stored=-208  -> real = sub_rsp + (-104)
+        v=0xF9A1 (i16=-1631) -> stored=-816  -> real = sub_rsp + (-408)
+
+    The earlier unsigned read gave `+32560 / +31952` which sent
+    these locals well past the end of any real frame. This bites
+    string / bool / char / pointer locals in any non-trivial proc
+    (their negative-from-top-of-frame offset doesn't fit a signed
+    i8). After the fix all 21 of `examples/05_types ProbeLocals`'s
+    primitives + strings resolve in cdb -- including
+    `lO=true / lCh='Z' / lS="unicode" / lAS="ansi" / ...`.
+
+25. **CodeView string display uses pointer-to-char *simple* types,
+    no LF_POINTER record needed.** Combining
+    `SimpleTypeKind::WideCharacter / NarrowCharacter` with
+    `SimpleTypeMode::NearPointer64` synthesises
+    `TypeIndex = T_64PWCHAR / T_64PRCHAR`. cdb and the VS native
+    debugger auto-display the pointee as a string starting at the
+    address until the first NUL. Pascal RTL conveniently puts char
+    data at the pointer's exact address (header bytes live just
+    below), so `UnicodeString` / `AnsiString` / `WideString` /
+    `UTF8String` / `PChar` / `PAnsiChar` / `PWideChar` all work
+    without any extra TPI work. `ShortString` is **not** a managed
+    pointer -- it's an inline length-prefixed byte array -- and
+    falls back to the size-based `void*` / `byte[N]` chain.
+    `WordBool` / `LongBool` use `SimpleTypeKind::Boolean16 /
+    Boolean32` which cdb refuses to render (reports "Type
+    information missing"); the bit values are still readable via
+    `dt` / `dd`. Cosmetic only.
+
+26. **Nested-function subtag is 0x41, not the usual `{A0,E0,80,
+    20}`** -- with 3 mystery bytes between subtag and VA (`02 10
+    00 <VA u32>`) rather than the usual `00 00 <hash u32> <VA
+    u32>`. Parser must accept it without the `00 00`-after-subtag
+    invariant. The static link (parent's rbp, passed in rcx) is
+    NOT carried as a sub-record; the parser sets
+    `ProcedureRecord.has_static_link = true` on subtag 0x41 so
+    main.cpp can synthesise a `__frame_outer__` placeholder local
+    at `rbp + sub_rsp + 16`. Lambda body procs
+    (`<Outer>$ActRec.$0$Body`) use the regular subtag but carry
+    Self with marker 0xD5 -- their captured fields live in
+    `[Self+0x10..]` and need TPI struct synth for auto-deref
+    (Step 12).
 
 ---
 
@@ -371,24 +455,28 @@ body. `git log --oneline` for the recent history.
 
 **Three candidate next steps:**
 
-1. **Closure visibility: TPI structs for nested + lambda frames**
-   (~half a day). nested static-link and lambda Self are emitted as
-   8-byte hex pointers (user can manually deref via
-   `dd poi(@rbp+0x20)+0x40`). Auto-deref needs synthesising a TPI
-   `ClassRecord` + `FieldList` + `PointerRecord` for outer's frame
-   and the ActRec class. Heuristic for nested: previous RSM record
-   in scan order = parent. For lambda: ActRec is a real RSM type
-   with discoverable layout. Same machinery for both.
+1. **Step 11b — records / classes / enums (full TPI struct synth)**
+   (~2-3 days). Biggest remaining UX win. RSM marks non-primitive
+   variables with `byref t=0xNNNN` (inline type id into the per-unit
+   type table); we currently fall back to `byte[N]` for these. With
+   TPI `ClassRecord` + `FieldList` synthesis, TPoint / classes /
+   user records would show field-by-field in Watch. Same machinery
+   also unblocks closure capture display (Step 12, lambdas' ActRec).
 
-2. **Step 11 — full records / enums / classes** (~2-3 days). Most
-   visible user UX win. Replaces `byte[N]` fallback for TPoint /
-   TColor / classes with proper field display. RSM has the data
-   (we saw the patterns); just needs decoding work.
+2. **Step 12 — closure visibility** (~half a day, depends on 11b).
+   Nested-function static-link and lambda-body Self are already
+   emitted as 8-byte pointers (`__frame_outer__` and `Self`
+   respectively); user can manually deref via
+   `dd poi(@rbp+0x20)+0x40` to reach outer's vars. Auto-deref
+   needs synthesising a TPI struct for the outer frame (or ActRec)
+   and re-typing the pointer; reuses the same machinery as 11b.
 
-3. **Step 10.5 — precise primitive typing** (~1-2 days). Lifts the
-   D-017 same-size-merge limit (Cardinal/Single/Double distinguishable
-   from Integer/Int64). Smaller win but unblocks step 11's type-ID
-   reasoning.
+3. **WordBool / LongBool display in cdb.** Cosmetic regression --
+   cdb doesn't render `SimpleTypeKind::Boolean16` / `Boolean32`
+   ("Type information missing"). The bit values are readable via
+   `dd`/`dt`. Could fall back to `UInt16` / `UInt32` and lose the
+   bool-as-`true/false` UX, or emit a tiny custom TPI enum. Low
+   priority; only affects 4-byte and 2-byte Pascal booleans (rare).
 
 If working on RSM RE, recall the offsets and conventions are
 documented in `docs/02-rsm-format-notes.md` (procedure-record
@@ -413,8 +501,11 @@ keep them — they're invaluable for future RSM RE):
 
 ---
 
-*Last updated: after the M2A v2 work (real-world proc-record format
-rules: scan-forward trailer + permissive subtags + graceful break on
-unknown sub-record tags). gdb now sees args+locals for ~125k methods
-on Altium AdvPCB; FileSave (override) shows 3 params correctly with
-the caveat that override-`Self` itself is at a sentinel offset.*
+*Last updated: 2026-05-27, after the Pascal-primitive-typing wave
+(per-unit type-table RE + signed 2-byte stack-offset form + multi-
+push prologue parser + Delphi-x64 frame RE). All 21 primitive /
+string locals in `examples/05_types ProbeLocals` resolve in cdb
+with native CodeView types (`bool true`, `wchar_t 'Z'`,
+`wchar_t * "unicode"`, etc.). 04_locals regressions clean. 51 unit
+tests green. Remaining UX gaps are records / classes / enums (Step
+11b) and closure auto-deref (Step 12).*

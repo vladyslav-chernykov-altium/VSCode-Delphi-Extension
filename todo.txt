@@ -883,23 +883,35 @@ delivered together. Remaining sub-milestones below are deferred.
          Non-Self params and locals are correct, so this is purely
          a Self-display fix for override methods.
 
-[ ] 10.5 (deferred) Precise primitive typing -- remove D-017 limits.
-         Currently same-size primitives (Cardinal vs Integer,
-         Single vs Cardinal, UInt64 vs Int64, Double vs Int64) are
-         merged in the displayed type because the bridge from per-unit
-         marker to primitive-table-id isn't decoded yet. Two paths:
-           a) Mine the unit-context block immediately before user
-              variable records (hex evidence in rsm-format.txt suggests
-              a per-unit type-binding table lives there).
-           b) Parse Delphi RTTI from the EXE's .rdata (authoritative,
-              independent of RSM).
-         Effort: ~1-2 days for either path.
+[x] 10.5 DONE 2026-05-27. Reverse-engineered the per-unit primary
+         type table (path "a" from the original plan): a sequence of
+         `0x66 <namelen> <pascal-name> <4-byte hash>` records in
+         source-declaration order, interleaved with `0x67` function /
+         import references (skipped). `marker = 2 * (index + 1)`.
+         Anchored per unit via `02 <namelen> <unit-name>` followed
+         by `02 70 <namelen> <file>.{pas,dpr,inc,tmp}` within ~200
+         bytes. Wired into pdb_writer via the existing
+         `kPrimitiveTable` name->kind lookup, then a kind->CodeView
+         SimpleTypeKind dispatch in `typeForKindParts`. Verified on
+         examples/05_types: Integer / Cardinal / Single / Double /
+         Boolean / Char / ShortInt / SmallInt / UInt64 / Int64 / ...
+         all resolve to their distinct CodeView types in cdb (e.g.
+         `?? gI` -> `int 0n-7`, `?? gC` -> `unsigned int 3`,
+         `?? gF` -> `float 1.5`). See gotchas #23-#24 in CLAUDE.md.
 
-[ ] 11   (deferred) Full type records: records, enums, classes
-         Decode RSM type-definition records for non-primitives. Emit
-         DW_TAG_structure_type / DW_TAG_enumeration_type / DW_TAG_member.
-         Replaces the byte[N] fallback used by step 10 with proper
-         types. Probably ~3-5 days when we get there.
+[~] 11   Partial DONE 2026-05-27. String types (path through
+         CodeView pointer-to-char simple types) implemented:
+         `string`/UnicodeString/WideString/PChar/PWideChar render as
+         `wchar_t * "..."` in cdb;
+         AnsiString/UTF8String/PAnsiChar as `char * "..."`.
+         ShortString stays on byte[N] (it's inline length-prefixed,
+         not a managed pointer). See gotcha #25 in CLAUDE.md.
+
+         Still deferred: full records / enums / classes (TPI struct
+         synthesis). RSM marks them with `byref t=0xNNNN` (inline
+         per-unit type id); decoding the type-definition records
+         to emit LF_STRUCTURE / LF_FIELDLIST / LF_ENUM into TPI is
+         ~2-3 days. Tracked as Step 11b in CLAUDE.md status table.
 
 [ ] 11.5 (deferred) Locals + parameters from RSM
          Decode procedure records: param names + types + frame

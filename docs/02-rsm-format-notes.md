@@ -286,6 +286,95 @@ finds ~800 candidates in each fixture; only ~40 land in the plausible
 PE-image VA range. The bogus ones drop out cleanly when we cross-
 reference against the `.map` segment table.
 
+### Per-unit type table (the marker → Pascal name bridge)
+
+Each Pascal unit's metadata block contains a **primary type table**
+that maps `Variable::type_marker` (a per-unit even byte, `0x02 /
+0x04 / 0x06 / ...`) to a Pascal type name. The table is a sequence
+of records in source-declaration order:
+
+```
+0x66 <namelen u8> <pascal name> <4-byte hash>
+```
+
+`marker = 2 * (1-based index)`, so the first 0x66 record is marker
+0x02, the second 0x04, etc.
+
+Records are **interleaved with `0x67` entries** of the same shape
+that reference imported functions / methods — those are skipped
+during scanning, they don't get a marker assigned. Example from
+`examples/04_locals` "locals" unit:
+
+```
+66 07 "Integer"       <- marker 0x02
+67 07 "Writeln"       <- skip (function reference)
+66 06 "string"        <- marker 0x04
+66 0d "UnicodeString" <- marker 0x06
+67 06 "Output..."     <- skip
+```
+
+To locate each unit's primary table we look for the **unit anchor**
+signature: `0x02 <namelen> <unit name>` followed (within ~200 bytes)
+by `0x02 0x70 <namelen> <file>.{pas|dpr|inc|tmp}`. The first 0x66
+record after the anchor begins the unit's primary type table; the
+scan terminates at the next anchor or after a generous upper bound.
+This anchor-bound search avoids cross-unit marker collisions which
+the older "consecutive 0x66 run" heuristic suffered from (every
+marker 0x02 in 04_locals used to resolve to "Boolean" because the
+"locals" anchor-less candidate was discarded and the lookup landed
+in an unrelated downstream table).
+
+Some Delphi RTL units use layout variants that don't match the
+anchor signature. Variables in those units stay with empty
+`pascal_type` and fall back to size-based UInt8/16/32/64 hex in the
+PDB writer — same behaviour as before any type resolution, no
+regression.
+
+Lookup `pascal_type` in the built-in `kPrimitiveTable`
+(in `src/rsm/rsm_reader.cpp`) to recover `(PrimitiveKind,
+byte_size)` — `Reader::resolvePrimitive(name)` is the public entry
+point. From there `pdb_writer.cpp::typeForKindParts` picks the
+matching CodeView `SimpleTypeKind` (Int32 / UInt32 / Real32 /
+Real64 / Boolean8 / WideCharacter / NarrowCharacter / ...). String
+types (UnicodeString / AnsiString / WideString / UTF8String / PChar
+family) are emitted with `SimpleTypeMode::NearPointer64` over a
+char base type, which makes cdb auto-display them as `"..."`.
+
+### Sub-record stack-offset encoding
+
+Procedure sub-records (tags `0x20` / `0x21` / `0x22` for param,
+local, var-param respectively) carry the stack offset in one of
+two compact encodings:
+
+| form | byte[0] LSB | size | decode |
+|---|---|---|---|
+| 1-byte | **0** | 1 byte | `stored = (int8) b0` |
+| 2-byte | **1** | 2 bytes (LE word `v`) | `stored = ((int16) v - 1) / 2` |
+
+The 2-byte form is **signed** (i16, not u16). It's used when the
+offset doesn't fit a signed i8 — typically for string / bool /
+char locals in large procedures whose offsets land in the
+-200..-1600 byte range. Decoding it as unsigned puts the
+variable at a stack address well past the function's frame, which
+is what bit early-session PDB output for `ProbeLocals`'s strings
+("NULL pointer" display in cdb).
+
+Both forms normalise to `stored_off / 2` units so the downstream
+real-offset formula stays uniform:
+
+```
+real_local  = sub_rsp + stored_off / 2
+real_param  = sub_rsp + 8*extra_pushes + stored_off / 2
+real_self   = sub_rsp + 8*extra_pushes + 16
+```
+
+`sub_rsp` and `extra_pushes` come from disassembling the function's
+prologue (see `src/pe/prologue.h`). `extra_pushes` counts callee-
+saved `push <reg>` instructions between `push rbp` and `sub rsp`;
+each one shifts the rcx-shadow / param-spill area up by 8 bytes.
+Locals (which sit at `rbp + 0 .. rbp + sub_rsp`) are not affected
+by extra pushes.
+
 ## What we still don't know
 
 - **VA encoding inside variable-record payloads.** The four
@@ -294,12 +383,16 @@ reference against the `.map` segment table.
   4 bits (i.e. `actual_va = stored_u32 >> 4`). Confirmed against
   multiple globals; will be wired into the variable-record parser
   in the next milestone step.
-- **Variable → primitive type-id bridging.** Variable records carry
+- **Variable → primitive type-id bridging.** ~~Variable records carry
   a `0x9C 0x09 ?? ??` reference, distinct from the primitive table's
-  `0x9C 0x13 ?? ??` marker. Two distinct Integer-typed variables
-  also differ in the bytes after `0x9C 0x09`, so this cannot be a
-  plain type-id reference. Step 4 (variable→type binding) will
-  resolve this.
+  `0x9C 0x13 ?? ??` marker.~~ **Resolved 2026-05-27.** Variables
+  carry a small `type_marker` (even byte, `0x02 / 0x04 / 0x06 / ...`)
+  that indexes into the unit's primary type table — see "Per-unit
+  type table" above. The `0x9C 0x09 <hash> <trailer_type_id>`
+  trailer turned out to be a per-variable slot ID (not a type
+  reference); for resolution we only need the marker. RSM primitive
+  table's `raw_type_id` is global but doesn't need to be touched —
+  joining `marker → pascal name → kPrimitiveTable` is sufficient.
 - **Whether function records (tag `0x28`) carry type-of-return / param
   list info.** Out of scope for B-lite; revisit at M2 phase A.
 - **Line-table encoding.** Deliberately not pursuing — `.map` is

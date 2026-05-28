@@ -1085,3 +1085,166 @@ RSM         Remote Symbol file. Modern Delphi sidecar debug-info
             file. Generated automatically for Win64 builds.
 DIE         DWARF debug info entry. (DWARF side terminology;
             unrelated to RSM internals.)
+
+
+================================================================================
+  2026-05-27  Pascal primitive types end-to-end (PDB)
+================================================================================
+
+Context: enabling per-Pascal-type display in cdb (Integer vs Cardinal
+vs Single vs Boolean vs Char vs UnicodeString vs ...). Test fixture
+is examples/05_types -- one global + one local of each primitive
+kind in the same source-declaration order.
+
+[FACT] Per-unit primary type table lives inside the unit's metadata
+       block. Format is a sequence of `0x66 <namelen> <pascal-name>
+       <4-byte hash>` records in source-declaration order.
+
+       Variable.type_marker (even byte 0x02 / 0x04 / 0x06 / ...) is
+       the table index: `marker = 2 * (index + 1)`.
+
+       Verified on all 27 distinct primitive types in 05_types's
+       "types" unit table @0x34b1ff..@0x34b36e (Byte, Word, Cardinal,
+       UInt64, ShortInt, SmallInt, Integer, Int64, Single, Double,
+       Extended, Boolean, ByteBool, WordBool, LongBool, Char,
+       AnsiChar, Pointer, PInteger, UnicodeString, AnsiString,
+       WideString, ShortString, UTF8String, PChar, PAnsiChar,
+       PWideChar). Markers 0x02..0x36 line up exactly with index
+       1..27.
+
+       Pascal `string` -> RSM stores as "UnicodeString" (the real
+       name, not the alias).
+
+[FACT] Type-table records are interleaved with 0x67 records of the
+       same `<tag> <namelen> <name> <4-byte hash>` shape but
+       referring to functions / methods / imports the unit uses.
+       The 0x67 entries don't get a marker -- only 0x66's count
+       toward the index.
+
+       Example (04_locals "locals" unit @0x34b14e onward):
+           66 07 "Integer"        <- marker 0x02
+           67 07 "Writeln"        <- skip (function ref)
+           66 06 "string"         <- marker 0x04
+           66 0d "UnicodeString"  <- marker 0x06
+           67 06 "Output..."      <- skip
+
+       Earlier scanner that required "consecutive 0x66 run >= 3" got
+       1-entry tables and discarded them, then resolved markers
+       against unrelated tables further in the file -- marker 0x02
+       in 04_locals was resolving to "Boolean" before the per-anchor
+       scan was implemented.
+
+[FACT] Unit anchor signature (used to ground per-unit type table
+       scanning): `02 <namelen> <unit-name>` followed within ~200
+       bytes by `02 70 <namelen> <file>.{pas|dpr|inc|tmp}`.
+
+       Some Delphi RTL units use a layout variant that doesn't
+       match this signature -- in 05_types only 4 of the 14 declared
+       units (System, System.Character, System.SysUtils, types) are
+       picked up. User-code unit is always among them, which is
+       what matters for our use case (the PDB only needs accurate
+       types for user-declared variables; the rest fall back to
+       size-based UInt8/16/32/64).
+
+[FACT] Sub-record stack-offset 2-byte form is SIGNED i16, NOT
+       unsigned u16 as we had been decoding it. The 2-byte form is
+       used when the offset doesn't fit a signed i8 (typically for
+       string / bool / char locals in large frames whose true
+       offsets are -200..-1600 range).
+
+       Encoding: byte[0] has LSB=1 to discriminate from the 1-byte
+       form. The two bytes form a little-endian word v; the real
+       formula is:
+
+           real_offset = sub_rsp + ((int16) v - 1) / 4
+
+       Or equivalent normalised form (so the existing downstream
+       `sub_rsp + stored_off / 2` math keeps working):
+
+           stored_off = ((int16) v - 1) / 2
+
+       Validated empirically on examples/05_types ProbeLocals
+       string / pointer locals against the disassembled addresses
+       Delphi's codegen actually uses:
+
+           lS    v=0xFE61 (i16=-415)  -> stored=-208 -> real=448-104 = 344 = 0x158
+           lAS   v=0xFE41 (i16=-447)  -> stored=-224 -> real=448-112 = 336 = 0x150
+           lWS   v=0xFE21 (i16=-479)  -> stored=-240 -> real=448-120 = 328 = 0x148
+           lPC   v=0xF9E1 (i16=-1567) -> stored=-784 -> real=448-392 =  56 = 0x38
+           lPAC  v=0xF9C1 (i16=-1599) -> stored=-800 -> real=448-400 =  48 = 0x30
+           lPWC  v=0xF9A1 (i16=-1631) -> stored=-816 -> real=448-408 =  40 = 0x28
+
+       Earlier unsigned read of 0xFE61 as +65121 produced
+       stored=+32560 -> real=448+16280 = 16728, well outside any
+       real frame. All six addresses agree to the byte after the
+       fix.
+
+[FACT] Delphi-x64 prologue has two shapes (extending the
+       single-block-only assumption from earlier work):
+
+       Simple:
+           55                          push rbp
+           48 83 EC NN                 sub  rsp, imm8
+           48 8B EC                    mov  rbp, rsp
+
+       Multi-push (managed locals / many spills):
+           55                          push rbp
+           57 / 56 / 41 54..           push <reg>             zero..N
+           48 83 EC NN  or  48 81 EC NN NN NN NN  sub rsp, imm
+           48 8B EC                    mov  rbp, rsp
+
+       Each `push <reg>` between `push rbp` and `sub rsp` shifts
+       the saved-rbp / return-addr / rcx-shadow slot up by 8.
+       Locals (rbp+0 .. rbp+sub_rsp) are not affected.
+
+       Formula recap:
+           real_local = sub_rsp + RSM/2
+           real_param = sub_rsp + 8*extra_pushes + RSM/2
+           real_self  = sub_rsp + 8*extra_pushes + 16
+
+[FACT] Nested-function proc-record subtag is 0x41 (additional to the
+       known 0xA0 / 0xE0 / 0x80 / 0x20 set). Format differs:
+
+           0x28 <namelen> "<name>" 0x41 02 10 00 <VA u32> ...
+
+       There are 3 mystery bytes (`02 10 00`) between the subtag
+       and the VA u32 (vs `00 00 <hash u32>` in the 0x80/A0/E0
+       forms). The implicit static-link parameter (parent's rbp,
+       passed in rcx) is NOT recorded as a sub-record; the parser
+       sets `has_static_link = true` when it sees subtag 0x41 so
+       downstream can synthesise a `__frame_outer__` local.
+
+[FACT] Self marker palette (all should bypass the general
+       sub_rsp+RSM/2 decode and use sub_rsp + 16 + 8*extra_pushes
+       directly):
+
+           0x29  base / virtual / regular class method Self
+           0x31  override-method Self  (paired with sentinel +4109)
+           0xD5  anonymous-method closure Self  (paired with +26)
+
+       The `name == "Self"` fallback also catches all three so we
+       don't have to enumerate every marker variant.
+
+[FACT] String type display in CodeView is achieved via
+       SimpleTypeKind + SimpleTypeMode::NearPointer64 (no
+       LF_POINTER record needed):
+
+           UnicodeString / WideString / "string" / PChar / PWideChar
+               -> TypeIndex(WideCharacter, NearPointer64)
+                  = T_64PWCHAR = 0x0671
+                  cdb displays: wchar_t * "..."
+
+           AnsiString / UTF8String / PAnsiChar
+               -> TypeIndex(NarrowCharacter, NearPointer64)
+                  = T_64PRCHAR = 0x0670
+                  cdb displays: char * "..."
+
+       Pascal RTL conveniently puts char data at the pointer's
+       exact address (the RTL header bytes live just below 0), so
+       cdb's "pointer-to-char string display" mode just works
+       without any extra TPI gymnastics.
+
+       ShortString is NOT a managed pointer -- it's an inline
+       length-prefixed byte array -- and stays on the size-based
+       void* / byte[N] fallback.
+
