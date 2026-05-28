@@ -980,30 +980,59 @@ green; user-visible payoff lands at D for records and E for classes.
               the last-wins fallback. DONE (commit 2411035). 67
               tests.
 
-[ ] C    model:: adapters. Carry aggregate metadata (fields, base_hash,
-         enum entries) from rsm:: into model::Symbol so PDB / DWARF
-         emitters can synthesise TPI / DIE records without re-doing
-         the rsm:: lookup themselves. Probably a small new struct
-         (model::AggregateRef) + a decorator that runs in compose::
-         resolveFunction's neighbourhood. No user-visible payoff
-         on its own; preparation for D / E / F. ~3 hours.
+[x] C    model:: adapters / per-unit primitive marker accessor.
+         DONE 2026-05-28 (commit 9a84f9b). Final scope landed
+         minimal: Reader::primitiveNameForMarker(unit_anchor_offset,
+         marker) accessor + primary_table_by_anchor_ member, so
+         Phase D's PDB-side translator can resolve field primitive
+         markers without re-walking the 0x66 table. Speculative
+         decorateTypes-side RecordType emission was reverted to
+         avoid silently regressing the DWARF byte[N] fallback;
+         when Phase J lands it'll re-introduce model::RecordType
+         in lockstep with the DWARF emitter's structure-type
+         support.
 
-[ ] D    PDB struct synth -- RECORDS ONLY (LF_STRUCTURE + LF_FIELDLIST
-         + LF_MEMBER). After this, `dt records.exe!records.GPoint` in
-         cdb shows `+0x000 X 11, +0x004 Y 22` field-by-field. Classes
-         still fall back to byte[N] until E lands. ~4-6 hours.
+[x] D    PDB struct synth -- RECORDS (LF_STRUCTURE + LF_FIELDLIST
+         + LF_MEMBER). DONE 2026-05-28 (commit 4cc443d).
+         examples/07_records: 5 records routed via TPI (TPoint,
+         TPerson, TBox, TPacked, TBig). Composite-typed fields
+         (TBox.TopLeft : TPoint) resolved correctly via nested
+         aggregate refs. 2-byte field offsets (TBig.F32..F39) round-
+         trip cleanly. ResolvedVar gained aggregate_hash +
+         unit_anchor_offset so compose can pass the type identity
+         through to cli_cmd_pdb without re-doing the rsm lookup.
 
-[ ] E    + Classes (LF_CLASS, base-class chain via base_hash). User
-         classes (TShape, TCircle, TBag) become fully inspectable
-         in Watch: vtable pointer + every member field. Inherits
-         the LF_STRUCTURE machinery from D. ~3-4 hours.
+[x] E    + Classes (LF_CLASS + LF_POINTER + LF_BCLASS, base-class
+         chain via base_hash). DONE 2026-05-28 (commit ca06f3c).
+         examples/07_records: TShape, TCircle, TBag inspect
+         field-by-field in cdb / VS; TCircle's LF_BCLASS to TShape
+         lets the debugger walk the inherited fName / fArea.
+         Class variables get LF_POINTER->LF_CLASS so the 8-byte
+         pointer slot is decoded correctly (Pascal class
+         instances live on the heap). 04_locals + 06_interface
+         now also route their TBase/TDerived/TMyClass globals.
 
-[ ] F    + Enums (LF_ENUM + LF_FIELDLIST of LF_ENUMERATE). Globals
-         and locals of enum type display as the enumerator name
-         (`clRed` instead of `0`). Sets stay on byte[N] for now
-         (the encoding doesn't carry enough metadata to emit a
-         CodeView set type without inferring the base enum from
-         names). ~2 hours.
+[x] F    + Enums (LF_ENUM + LF_ENUMERATE). DONE 2026-05-28
+         (commit 6929fc1). examples/07_records: TColor renders
+         as `clRed` / `clGreen` / ... instead of ordinal. Enum
+         width follows Delphi default ({MINENUMSIZE not modelled}):
+         <= 0xFF -> 1 byte, <= 0xFFFF -> 2, else 4. RTL enums get
+         pulled in transitively as they're referenced (e.g.
+         REGSAM).
+
+[x] F+   + Sets as LF_BITFIELD struct. DONE 2026-05-28 (commit
+         5ad3436). Initially deferred at Phase F (the RSM
+         encoding doesn't carry an explicit "set of X" marker on
+         the type record), unblocked by user-report of GColors
+         rendering as 0x00000005 raw. Detection: name-suffix
+         heuristic (TColors -> TColor) scoped to the same unit
+         anchor; if a registered Enum matches, emit an
+         LF_STRUCTURE with one LF_BITFIELD member per enumerator
+         (BitOffset = ordinal, BitSize = 1). cdb / VS now show
+         `clRed: 0y1, clGreen: 0y0, clBlue: 0y1, ...` for set
+         values. Heuristic limitations documented in the commit
+         message; no false positives observed on the fixtures or
+         AdvPCB.
 
 [ ] J    DWARF parity for D + E + F (DW_TAG_structure_type +
          DW_TAG_class_type + DW_TAG_member + DW_TAG_enumeration_type +

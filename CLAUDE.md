@@ -27,7 +27,7 @@ Status snapshot (auto-rotting; verify against the latest commit):
 | Step 10.4 — fix override-method `Self` offset | ✅ done (subsumed by Delphi-x64 frame RE: Self always at rbp+sub_rsp+16 via name + marker check) |
 | Step 10.5 — precise primitive typing (Cardinal vs Integer, Double vs Int64, Boolean, Char, ...) | ✅ done 2026-05-27 (RE'd per-unit type table → marker→Pascal name → CodeView SimpleTypeKind) |
 | Step 11a — string types (`string`, `AnsiString`, `WideString`, `UTF8String`, `PChar`, etc.) | ✅ done 2026-05-27 (CodeView SimpleTypeMode::NearPointer64 + pointer-to-char base; cdb auto-displays `"..."`) |
-| Step 11b — records / enums / classes (full TPI struct synthesis) | 🔧 in progress — phases A + B done; C/D/E/F/J pending (see `todo.txt`) |
+| Step 11b — records / enums / classes (full TPI struct synthesis) | ✅ PDB done 2026-05-28 (phases A..F + sets via LF_BITFIELD); DWARF parity (phase J) deferred |
 | Synthesise line entries at begin/end (begin/end-line source nav) | ⏳ deferred |
 | **M3 — PDB backend (LLVM-backed)** — line BPs + step-into in .pas, S_GDATA32 globals + S_REGREL32 locals/params visible in cppvsdbg | ✅ done, user-verified |
 | M3 follow-up — real Pascal types in PDB TPI | ✅ done 2026-05-27 (per-unit type-table RE + signed 2-byte form fix + multi-push prologue parser; all 21 ProbeLocals primitives + strings resolve in cdb) |
@@ -513,20 +513,28 @@ update this section first and explain why in the commit message.
 
 **Three candidate next steps:**
 
-1. **Step 11b — records / classes / enums (full TPI struct synth)**
-   IN PROGRESS. Phases A + B (RE + RSM parser) done as of
-   2026-05-28 (commits 29ff347 .. 2411035, 67 unit tests). Aggregate
-   metadata (fields + offsets + base_hash + enum entries) now
-   available via `rsm::Reader::aggregates()` /
-   `findAggregateInUnit(unit_anchor_offset, hash)`. Remaining work
-   in `todo.txt` "Step 11b roadmap" section:
-     C  -- model:: adapters (~3h)
-     D  -- PDB LF_STRUCTURE for RECORDS (~4-6h, biggest user-visible win)
-     E  -- + LF_CLASS for classes (~3-4h)
-     F  -- + LF_ENUM for enums (~2h)
-     J  -- DWARF parity for D + E + F (~4-6h)
-   Same machinery also unblocks closure capture display (Step 12,
-   lambdas' ActRec).
+1. **Step 11b — records / classes / enums (PDB side DONE 2026-05-28)**.
+   PDB pipeline emits the full Pascal aggregate set via TPI:
+     - Records  -- LF_STRUCTURE + LF_FIELDLIST + LF_MEMBER.
+                   Composite-typed fields (TBox.TopLeft : TPoint)
+                   resolve to nested record TypeIndex.
+     - Classes  -- LF_CLASS + LF_POINTER + LF_BCLASS. Variables
+                   reference the LF_POINTER (Pascal class instances
+                   live on the heap); LF_BCLASS chains the
+                   inheritance through user units (TCircle -> TShape).
+     - Enums    -- LF_ENUM + LF_ENUMERATE. Width follows Delphi
+                   default rule based on max ordinal.
+     - Sets     -- LF_STRUCTURE wrapping LF_BITFIELDs (one bit per
+                   enumerator, BitOffset = ordinal). Detected via
+                   name-suffix heuristic (TColors -> TColor) scoped
+                   to the same unit anchor.
+   See `todo.txt` "Step 11b roadmap" for per-phase commits
+   (4cc443d D, ca06f3c E, 6929fc1 F, 5ad3436 F+ sets).
+   Phase J -- DWARF parity for D + E + F -- still pending; the
+   DWARF emitter currently leaves Pascal aggregates on the
+   byte[N] DIE fallback. The same machinery unblocks closure
+   capture display (Step 12, lambdas' ActRec) and is the natural
+   next step on the DWARF side.
 
 2. **Step 12 — closure visibility** (~half a day, depends on 11b).
    Nested-function static-link and lambda-body Self are already
@@ -566,14 +574,25 @@ keep them — they're invaluable for future RSM RE):
 
 ---
 
-*Last updated: 2026-05-28, after the three-stage architectural
-refactor (a8768f1 + 9cd88f8 + 1d6338b). All Delphi-x64 frame logic
-now lives in `src/compose/`; PDB and DWARF backends both consume
-`ResolvedFunction` from it. main.cpp is dispatch-only (~40 lines);
-each subcommand has its own `src/cli/cli_cmd_*.cpp`. gdb on the
-DWARF output now matches cdb on the PDB output to the byte (verified
-on examples/04_locals GlobalProc2). 59 unit tests green. Binding
-architecture rules captured above; future work must follow them.
-Remaining UX gaps are Step 11b (records / classes / enums via TPI
-struct synth) and Step 12 (closure auto-deref reusing the same
-machinery).*
+*Last updated: 2026-05-28 (evening), after Step 11b PDB-side
+completion. Phases A (RSM RE) + B.1..B.4 (parser) + C (per-unit
+marker accessor) + D (LF_STRUCTURE) + E (LF_CLASS + LF_POINTER
++ LF_BCLASS) + F (LF_ENUM + LF_ENUMERATE) + F+ (sets via
+LF_BITFIELD) all landed (commits 29ff347 .. 5ad3436). cdb / VS
+on examples/07_records now show records, classes, enums and
+sets field-by-field instead of byte[N]. 67 unit tests green
+plus the AdvPCB-scale probe pass (576 MB RSM, ~3,600 aggregates,
+0 regressions on 04/05/06 fixtures). DWARF parity (phase J)
+still pending -- the DWARF emitter leaves Pascal aggregates on
+the byte[N] DIE fallback. Same machinery unblocks Step 12
+(closure auto-deref) when its time comes.
+
+Architecture: all Delphi-x64 frame logic in `src/compose/`; PDB
+and DWARF backends both consume `ResolvedFunction` from it (now
+also carries aggregate_hash + unit_anchor_offset). main.cpp is
+dispatch-only (~40 lines); each subcommand has its own
+`src/cli/cli_cmd_*.cpp`. gdb on the DWARF output matches cdb on
+the PDB output to the byte for primitives + strings; cdb is now
+ahead for aggregates (gdb stays on byte[N] until phase J).
+Binding architecture rules captured above; future work must
+follow them.*
