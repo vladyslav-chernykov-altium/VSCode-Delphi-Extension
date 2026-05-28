@@ -5,6 +5,7 @@
 #include "map/map_reader.h"
 #include "pdb/pdb_writer.h"
 #include "pe/pe_pdb_injector.h"
+#include "pe/thunk_scanner.h"
 #include "rsm/rsm_reader.h"
 
 #include <algorithm>
@@ -221,6 +222,146 @@ int cmdPdb(int argc, char** argv) {
                  "publics: %zu emitted, %zu no-PE-section, %zu RTL-filtered\n",
                  inputs.publics.size(), skipped, skipped_rtl);
 
+    // -- Interface adjuster-thunk detection -----------------------
+    //
+    // Pattern: `48 83 c1 NN  e9 NN NN NN NN` (9 bytes), Self-adjust
+    // + tail-call into the real method. Without an explicit S_PROC32
+    // + a C13 line entry covering this PC, cppvsdbg silently demotes
+    // step-into-the-thunk to step-over and the user never sees the
+    // method body. We resolve each thunk's jmp target against the
+    // .map publics; matched thunks get synthesised
+    // S_PUB32 + S_GPROC32 entries (named
+    // `<TargetMethod>$Adjust_<HexImm>`) and a single line entry so
+    // cppvsdbg recognises them as user code. Additionally we
+    // generate a sibling `.natstepfilter` listing
+    // `.*\$Adjust_[0-9A-F]+$` -- VS2022 / cppvsdbg honour it and
+    // tail-call-skip through the thunks on Step Into, landing the
+    // user directly in the real method body.
+    struct ThunkEmit {
+        std::uint64_t va;
+        std::uint64_t target_va;
+        std::int32_t  adjustment;
+        std::uint16_t segment;
+        std::uint32_t offset;       // PE-section-relative
+        std::string   name;         // synthesised PDB symbol name
+        std::string   target_unit;  // .map unit that owns the target
+        std::uint32_t target_line;  // first source line of the target
+    };
+    std::vector<ThunkEmit> thunks_to_emit;
+    {
+        // Build the code-section descriptors the scanner needs.
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> code_secs;
+        std::vector<std::pair<std::uint32_t, std::uint16_t>> sec_file;
+        for (std::uint16_t i = 0;
+             i < inputs.sections.size(); ++i) {
+            const auto& s = inputs.sections[i];
+            if ((s.characteristics & 0x20u) == 0) continue;  // !CNT_CODE
+            code_secs.emplace_back(
+                static_cast<std::uint32_t>(s.virtual_address),
+                std::max(s.virtual_size, s.size_of_raw_data));
+            sec_file.emplace_back(
+                static_cast<std::uint32_t>(s.pointer_to_raw_data),
+                static_cast<std::uint16_t>(i + 1));
+        }
+        const auto detected = rsm2pdb::pe::scanAdjusterThunks(
+            pe_bytes, code_secs, sec_file, image_base);
+
+        // Index the original .map publics by VA for jmp-target
+        // resolution. Use the unfiltered list -- thunks to RTL
+        // methods (e.g. System.TInterfacedObject._AddRef) are real
+        // thunks and we want to mask them out too via the same
+        // .natstepfilter pattern.
+        std::unordered_map<std::uint64_t, const rsm2pdb::map::Public*> va_to_pub;
+        va_to_pub.reserve(mf.publics.size());
+        for (const auto& p : mf.publics) {
+            const auto va = (mf.findSegment(p.segment_id)
+                             ? mf.findSegment(p.segment_id)->start_va
+                             : image_base) + p.segment_offset;
+            va_to_pub.emplace(va, &p);
+        }
+
+        // .map module_segment + line-table lookup for "which unit
+        // does this target VA belong to and what's its first source
+        // line" -- the thunk gets attached to that unit's PDB
+        // module and points its C13 line entry at the target's
+        // first source line.
+        auto findUnitForVa = [&](std::uint64_t va) -> std::string {
+            for (const auto& ms : mf.module_segments) {
+                if (ms.segment_id != 1) continue;
+                const auto* seg = mf.findSegment(ms.segment_id);
+                if (!seg) continue;
+                const auto lo = seg->start_va + ms.segment_offset;
+                if (va >= lo && va < lo + ms.length) return ms.module_name;
+            }
+            return {};
+        };
+        auto findLineForVa = [&](std::uint64_t va) -> std::uint32_t {
+            std::uint32_t best = 0;
+            for (const auto& lt : mf.line_tables) {
+                for (const auto& lr : lt.lines) {
+                    const auto* seg = mf.findSegment(lr.segment_id);
+                    if (!seg) continue;
+                    const auto lva = seg->start_va + lr.segment_offset;
+                    if (lva == va) return lr.line;
+                    if (lva < va && (best == 0 || lva > best)) {
+                        best = lr.line;  // closest-prior fallback
+                    }
+                }
+            }
+            return best ? best : 1;
+        };
+
+        std::size_t total_thunks = static_cast<std::size_t>(detected.size());
+        std::size_t resolved = 0;
+        for (const auto& t : detected) {
+            auto it = va_to_pub.find(t.target_va);
+            if (it == va_to_pub.end()) continue;     // unresolved jmp
+            const auto& tgt = *it->second;
+            if (!seg_is_code[tgt.segment_id]) continue;
+
+            // Section coords of the thunk itself.
+            const auto& pe_sec_t = inputs.sections[t.segment - 1];
+            // sanity guard
+            if (t.section_off + rsm2pdb::pe::AdjusterThunk::kSize >
+                pe_sec_t.size_of_raw_data) continue;
+
+            ThunkEmit te;
+            te.va         = t.va;
+            te.target_va  = t.target_va;
+            te.adjustment = t.adjustment;
+            te.segment    = t.segment;
+            te.offset     = t.section_off;
+            // Synthesise the name: <target>$Adjust_<HexImm>. HexImm
+            // is the 32-bit two's-complement of the adjustment so
+            // the value is always positive in the regex
+            // .*\$Adjust_[0-9A-F]+$.
+            const auto adj_u32 = static_cast<std::uint32_t>(t.adjustment);
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "$Adjust_%08X", adj_u32);
+            te.name        = tgt.name + buf;
+            te.target_unit = findUnitForVa(t.target_va);
+            te.target_line = findLineForVa(t.target_va);
+            thunks_to_emit.push_back(std::move(te));
+            ++resolved;
+        }
+        std::fprintf(stdout,
+            "adjuster thunks: %zu found, %zu resolved to known methods\n",
+            total_thunks, resolved);
+    }
+
+    // Emit S_PUB32 entries for resolved thunks now so they show up
+    // in Call Stack with a meaningful name. Their per-module
+    // S_GPROC32 + line entries are added later inside the module
+    // composer (we group them by target unit).
+    for (const auto& te : thunks_to_emit) {
+        rsm2pdb::pdb::PublicSymbol ps;
+        ps.name        = te.name;
+        ps.segment     = te.segment;
+        ps.offset      = te.offset;
+        ps.is_function = true;
+        inputs.publics.push_back(std::move(ps));
+    }
+
     // Optional: parse sibling .rsm for procedure records (params +
     // locals). When present, each function's locals[] gets
     // populated and we emit S_REGREL32 records inside its proc.
@@ -432,6 +573,26 @@ int cmdPdb(int argc, char** argv) {
 
                 pdb_mod.functions.push_back(std::move(mf_out));
             }
+
+            // Inject the adjuster thunks belonging to this unit.
+            // Each gets a tiny S_GPROC32 entry (size = 9 bytes,
+            // matching the `add rcx, imm8; jmp rel32` shape) so
+            // cppvsdbg recognises the PC as user code and steps
+            // into it; without this the engine demotes Step Into
+            // to Step Over on the indirect call that targets the
+            // thunk. The single line entry below points at the
+            // target's first source line -- the user briefly sees
+            // that source location during the descent through the
+            // thunk, then lands in the real method.
+            for (const auto& te : thunks_to_emit) {
+                if (te.target_unit != uname) continue;
+                rsm2pdb::pdb::ModuleFunction tf;
+                tf.name    = te.name;
+                tf.segment = te.segment;
+                tf.offset  = te.offset;
+                tf.size    = rsm2pdb::pe::AdjusterThunk::kSize;
+                pdb_mod.functions.push_back(std::move(tf));
+            }
             total_fns += pdb_mod.functions.size();
 
             // Line entries: translate .map LineRecord coords -> PE
@@ -458,6 +619,24 @@ int cmdPdb(int argc, char** argv) {
                         ml.line    = lr.line;
                         src.lines.push_back(ml);
                     }
+                    // Append thunk line entries to the FIRST source
+                    // of this unit (whatever the .map's primary
+                    // line-table is). The single per-thunk line
+                    // entry covers the thunk's PC range (9 bytes)
+                    // and points at the target method's first
+                    // source line -- enough for cppvsdbg to treat
+                    // the thunk as user code instead of degrading
+                    // Step Into to Step Over.
+                    if (lt == (*lts)[0]) {
+                        for (const auto& te : thunks_to_emit) {
+                            if (te.target_unit != uname) continue;
+                            rsm2pdb::pdb::ModuleLine ml;
+                            ml.segment = te.segment;
+                            ml.offset  = te.offset;
+                            ml.line    = te.target_line;
+                            src.lines.push_back(ml);
+                        }
+                    }
                     total_lines += src.lines.size();
                     if (!src.lines.empty()) {
                         pdb_mod.sources.push_back(std::move(src));
@@ -480,6 +659,39 @@ int cmdPdb(int argc, char** argv) {
         return 1;
     }
     std::fprintf(stdout, "wrote PDB: %s\n", output_pdb.c_str());
+
+    // Emit the sibling .natstepfilter alongside the PDB so VS2022's
+    // native debugger (and cppvsdbg / WinDbg via the same machinery)
+    // tail-call-skips through every `<Method>$Adjust_<HexImm>`
+    // adjuster thunk on Step Into. Without this VS would single-
+    // step the thunk's `add rcx, ...` + `jmp` before landing in the
+    // real method; with it, F11 from an interface call lands the
+    // user directly in the method body.
+    //
+    // Only emit when at least one thunk was detected -- otherwise
+    // a stale empty .natstepfilter near a PDB is just noise.
+    if (!thunks_to_emit.empty()) {
+        const std::filesystem::path nspath =
+            std::filesystem::path(output_pdb).replace_extension(".natstepfilter");
+        std::ofstream f(nspath, std::ios::binary | std::ios::trunc);
+        if (f) {
+            f << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+              << "<StepFilter xmlns=\"http://schemas.microsoft.com/"
+                 "vstudio/debugger/natstepfilter/2010\">\n"
+              << "    <Function>\n"
+              << "        <Name>.*\\$Adjust_[0-9A-Fa-f]+$</Name>\n"
+              << "        <Action>NoStepInto</Action>\n"
+              << "    </Function>\n"
+              << "</StepFilter>\n";
+            std::fprintf(stdout,
+                "wrote natstepfilter: %s (%zu adjuster thunks)\n",
+                nspath.string().c_str(), thunks_to_emit.size());
+        } else {
+            std::fprintf(stderr,
+                "warning: couldn't write natstepfilter to %s\n",
+                nspath.string().c_str());
+        }
+    }
 
     stamp("phase: inject RSDS into PE");
     // 4. Inject the matching RSDS pointer into the PE.

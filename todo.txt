@@ -1041,8 +1041,9 @@ delivered together. Remaining sub-milestones below are deferred.
 [ ] 20   Sets, variants, dynamic arrays, interfaces, classes.
          Major design effort - revisit once core path is solid.
 
-[ ] 21   Interface-adjuster-thunk naming + .natstepfilter generation
-         (VS2022 step-into UX parity with our VSCode hybrid mode).
+[x] 21   DONE 2026-05-28. Interface-adjuster-thunk naming +
+         .natstepfilter generation. Implemented exactly as
+         described below.
 
          Context: when stepping into an interface method, Delphi
          routes the call through a tiny adjuster thunk
