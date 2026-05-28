@@ -27,7 +27,7 @@ Status snapshot (auto-rotting; verify against the latest commit):
 | Step 10.4 — fix override-method `Self` offset | ✅ done (subsumed by Delphi-x64 frame RE: Self always at rbp+sub_rsp+16 via name + marker check) |
 | Step 10.5 — precise primitive typing (Cardinal vs Integer, Double vs Int64, Boolean, Char, ...) | ✅ done 2026-05-27 (RE'd per-unit type table → marker→Pascal name → CodeView SimpleTypeKind) |
 | Step 11a — string types (`string`, `AnsiString`, `WideString`, `UTF8String`, `PChar`, etc.) | ✅ done 2026-05-27 (CodeView SimpleTypeMode::NearPointer64 + pointer-to-char base; cdb auto-displays `"..."`) |
-| Step 11b — records / enums / classes (full TPI struct synthesis) | ⏳ deferred |
+| Step 11b — records / enums / classes (full TPI struct synthesis) | 🔧 in progress — phases A + B done; C/D/E/F/J pending (see `todo.txt`) |
 | Synthesise line entries at begin/end (begin/end-line source nav) | ⏳ deferred |
 | **M3 — PDB backend (LLVM-backed)** — line BPs + step-into in .pas, S_GDATA32 globals + S_REGREL32 locals/params visible in cppvsdbg | ✅ done, user-verified |
 | M3 follow-up — real Pascal types in PDB TPI | ✅ done 2026-05-27 (per-unit type-table RE + signed 2-byte form fix + multi-push prologue parser; all 21 ProbeLocals primitives + strings resolve in cdb) |
@@ -514,12 +514,19 @@ update this section first and explain why in the commit message.
 **Three candidate next steps:**
 
 1. **Step 11b — records / classes / enums (full TPI struct synth)**
-   (~2-3 days). Biggest remaining UX win. RSM marks non-primitive
-   variables with `byref t=0xNNNN` (inline type id into the per-unit
-   type table); we currently fall back to `byte[N]` for these. With
-   TPI `ClassRecord` + `FieldList` synthesis, TPoint / classes /
-   user records would show field-by-field in Watch. Same machinery
-   also unblocks closure capture display (Step 12, lambdas' ActRec).
+   IN PROGRESS. Phases A + B (RE + RSM parser) done as of
+   2026-05-28 (commits 29ff347 .. 2411035, 67 unit tests). Aggregate
+   metadata (fields + offsets + base_hash + enum entries) now
+   available via `rsm::Reader::aggregates()` /
+   `findAggregateInUnit(unit_anchor_offset, hash)`. Remaining work
+   in `todo.txt` "Step 11b roadmap" section:
+     C  -- model:: adapters (~3h)
+     D  -- PDB LF_STRUCTURE for RECORDS (~4-6h, biggest user-visible win)
+     E  -- + LF_CLASS for classes (~3-4h)
+     F  -- + LF_ENUM for enums (~2h)
+     J  -- DWARF parity for D + E + F (~4-6h)
+   Same machinery also unblocks closure capture display (Step 12,
+   lambdas' ActRec).
 
 2. **Step 12 — closure visibility** (~half a day, depends on 11b).
    Nested-function static-link and lambda-body Self are already

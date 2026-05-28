@@ -944,10 +944,71 @@ delivered together. Remaining sub-milestones below are deferred.
          not a managed pointer). See gotcha #25 in CLAUDE.md.
 
          Still deferred: full records / enums / classes (TPI struct
-         synthesis). RSM marks them with `byref t=0xNNNN` (inline
-         per-unit type id); decoding the type-definition records
-         to emit LF_STRUCTURE / LF_FIELDLIST / LF_ENUM into TPI is
-         ~2-3 days. Tracked as Step 11b in CLAUDE.md status table.
+         synthesis). Tracked as Step 11b roadmap below.
+
+
+----- Step 11b roadmap (records / classes / enums in PDB + DWARF) -----
+
+Decomposed into letter-phases. Each phase is one commit with tests
+green; user-visible payoff lands at D for records and E for classes.
+
+[x] A    Reverse-engineer the RSM encoding for records / classes /
+         enums / sets. Tag inventory (0x2a type record, 0x2c field,
+         0x25 enum entry, 0x26 metaclass, 0x47 class header), field-
+         record layout (1B/2B type-ref, 1B/2B offset form, 8B/13B
+         internals), inheritance via base_hash slot, two-cluster
+         file layout (types separate from field-lists, joined by
+         parent_hash). Verified on examples/07_records + AdvPCB.rsm
+         (576 MB). Documented in rsm-format.txt (2026-05-28 entries).
+         Risks R1..R6 all closed. DONE 2026-05-28 (commits 29ff347,
+         ba47bad, dc843a9).
+
+[x] B    RSM parser extension. Split into 4 sub-commits:
+
+         B.1  Aggregate parser + IR (AggregateType / FieldEntry /
+              EnumEntry). DONE (commit b21211e). 64 tests.
+         B.2  Wire globals' inline_type_id -> findAggregateByHash
+              -> Variable::pascal_type. DONE (commit 3119007). 65
+              tests.
+         B.3  Extend parseSub() discriminator + same wire-up for
+              procedure params + locals (both new and legacy RSM
+              format coexist; dispatch on subtag 0x66 vs 0x62 then
+              on marker byte). DONE (commit 6fa71d3). 66 tests.
+         B.4  Per-unit aggregate scoping. AggregateType carries
+              unit_anchor_offset; new (unit, hash) index defeats
+              RTL hash collisions that previously slipped through
+              the last-wins fallback. DONE (commit 2411035). 67
+              tests.
+
+[ ] C    model:: adapters. Carry aggregate metadata (fields, base_hash,
+         enum entries) from rsm:: into model::Symbol so PDB / DWARF
+         emitters can synthesise TPI / DIE records without re-doing
+         the rsm:: lookup themselves. Probably a small new struct
+         (model::AggregateRef) + a decorator that runs in compose::
+         resolveFunction's neighbourhood. No user-visible payoff
+         on its own; preparation for D / E / F. ~3 hours.
+
+[ ] D    PDB struct synth -- RECORDS ONLY (LF_STRUCTURE + LF_FIELDLIST
+         + LF_MEMBER). After this, `dt records.exe!records.GPoint` in
+         cdb shows `+0x000 X 11, +0x004 Y 22` field-by-field. Classes
+         still fall back to byte[N] until E lands. ~4-6 hours.
+
+[ ] E    + Classes (LF_CLASS, base-class chain via base_hash). User
+         classes (TShape, TCircle, TBag) become fully inspectable
+         in Watch: vtable pointer + every member field. Inherits
+         the LF_STRUCTURE machinery from D. ~3-4 hours.
+
+[ ] F    + Enums (LF_ENUM + LF_FIELDLIST of LF_ENUMERATE). Globals
+         and locals of enum type display as the enumerator name
+         (`clRed` instead of `0`). Sets stay on byte[N] for now
+         (the encoding doesn't carry enough metadata to emit a
+         CodeView set type without inferring the base enum from
+         names). ~2 hours.
+
+[ ] J    DWARF parity for D + E + F (DW_TAG_structure_type +
+         DW_TAG_class_type + DW_TAG_member + DW_TAG_enumeration_type +
+         DW_TAG_enumerator). Same metadata via model::AggregateRef.
+         ~4-6 hours.
 
 [ ] 11.5 (deferred) Locals + parameters from RSM
          Decode procedure records: param names + types + frame
