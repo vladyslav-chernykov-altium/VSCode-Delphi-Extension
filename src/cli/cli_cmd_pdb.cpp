@@ -285,30 +285,78 @@ int cmdPdb(int argc, char** argv) {
         // line" -- the thunk gets attached to that unit's PDB
         // module and points its C13 line entry at the target's
         // first source line.
-        auto findUnitForVa = [&](std::uint64_t va) -> std::string {
-            for (const auto& ms : mf.module_segments) {
-                if (ms.segment_id != 1) continue;
-                const auto* seg = mf.findSegment(ms.segment_id);
-                if (!seg) continue;
-                const auto lo = seg->start_va + ms.segment_offset;
-                if (va >= lo && va < lo + ms.length) return ms.module_name;
-            }
-            return {};
+        //
+        // Both helpers used to be linear scans inside the per-thunk
+        // loop. On real-world projects (AdvPCB: 947k publics,
+        // 142k line-tables, ~5M line records, ~tens-of-thousands of
+        // thunks) the inner double-loop in findLineForVa was the
+        // hot path -- ~10^11 iterations, several minutes wall-time.
+        // Pre-build sorted indexes once and binary-search per
+        // thunk: O(log N) per lookup instead of O(N).
+
+        // Unit-by-VA: vector of (va_start, va_end, &unit_name).
+        struct UnitSpan {
+            std::uint64_t va_start;
+            std::uint64_t va_end;
+            const std::string* unit;
         };
-        auto findLineForVa = [&](std::uint64_t va) -> std::uint32_t {
-            std::uint32_t best = 0;
+        std::vector<UnitSpan> unit_spans;
+        unit_spans.reserve(mf.module_segments.size());
+        for (const auto& ms : mf.module_segments) {
+            if (ms.segment_id != 1) continue;
+            const auto* seg = mf.findSegment(ms.segment_id);
+            if (!seg) continue;
+            UnitSpan s;
+            s.va_start = seg->start_va + ms.segment_offset;
+            s.va_end   = s.va_start + ms.length;
+            s.unit     = &ms.module_name;
+            unit_spans.push_back(s);
+        }
+        std::sort(unit_spans.begin(), unit_spans.end(),
+            [](const UnitSpan& a, const UnitSpan& b) {
+                return a.va_start < b.va_start;
+            });
+        auto findUnitForVa = [&](std::uint64_t va) -> std::string {
+            auto it = std::upper_bound(
+                unit_spans.begin(), unit_spans.end(), va,
+                [](std::uint64_t v, const UnitSpan& s) {
+                    return v < s.va_start;
+                });
+            if (it == unit_spans.begin()) return {};
+            --it;
+            return (va < it->va_end) ? *it->unit : std::string{};
+        };
+
+        // Line-by-VA: flat vector of (va, line) sorted by va. Each
+        // entry collapses any duplicates (same VA, multiple lines)
+        // to the smallest line number -- that's the natural "first
+        // source line at this PC" semantic.
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> line_by_va;
+        {
+            std::size_t total = 0;
+            for (const auto& lt : mf.line_tables) total += lt.lines.size();
+            line_by_va.reserve(total);
             for (const auto& lt : mf.line_tables) {
                 for (const auto& lr : lt.lines) {
                     const auto* seg = mf.findSegment(lr.segment_id);
                     if (!seg) continue;
                     const auto lva = seg->start_va + lr.segment_offset;
-                    if (lva == va) return lr.line;
-                    if (lva < va && (best == 0 || lva > best)) {
-                        best = lr.line;  // closest-prior fallback
-                    }
+                    line_by_va.emplace_back(lva, lr.line);
                 }
             }
-            return best ? best : 1;
+            std::sort(line_by_va.begin(), line_by_va.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+        auto findLineForVa = [&](std::uint64_t va) -> std::uint32_t {
+            if (line_by_va.empty()) return 1;
+            auto it = std::upper_bound(
+                line_by_va.begin(), line_by_va.end(), va,
+                [](std::uint64_t v, const auto& p) { return v < p.first; });
+            if (it == line_by_va.begin()) {
+                return it->first == va ? it->second : 1;
+            }
+            --it;
+            return it->second;
         };
 
         std::size_t total_thunks = static_cast<std::size_t>(detected.size());
