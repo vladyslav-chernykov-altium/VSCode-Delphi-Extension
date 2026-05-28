@@ -399,9 +399,24 @@ bool Reader::open(const std::string& path) {
             const std::uint16_t v =
                   static_cast<std::uint16_t>(b0)
                 | (static_cast<std::uint16_t>(b1) << 8);
-            // Normalise so `16 + stored/2` downstream yields the same
-            // rbp-relative real offset that `16 + (v-1)/4` would give.
-            r.stored_off = static_cast<std::int32_t>((v - 1) / 2);
+            // Empirical formula validated against the disassembled
+            // addresses of examples/05_types ProbeLocals's string /
+            // bool / char locals (all of which use the 2-byte form
+            // because their negative-from-top-of-frame offset doesn't
+            // fit a signed i8):
+            //
+            //   real_offset = sub_rsp + ((int16) v - 1) / 4
+            //
+            // i.e. v is signed (typical raw values are 0xF9..0xFE in
+            // the high byte, decoding to -200 .. -2000 range). We
+            // normalise to `stored_off = ((int16) v - 1) / 2` so the
+            // downstream `sub_rsp + stored_off / 2` formula in
+            // main.cpp produces the right address. The earlier
+            // unsigned read decoded 0xFE61 as +65121 which sent the
+            // 2-byte-form locals well outside any real frame slot.
+            const std::int32_t sv =
+                static_cast<std::int16_t>(v);
+            r.stored_off = (sv - 1) / 2;
             r.total_size = (markerAt + 3) - s;
         }
         r.ok = true;
