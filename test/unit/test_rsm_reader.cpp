@@ -538,6 +538,63 @@ TEST_CASE("rsm::Reader sets pascal_type for non-primitive globals") {
     }
 }
 
+TEST_CASE("rsm::Reader resolves non-primitive locals in records.rsm ProbeAll") {
+    // Phase B.3: parseSub() now discriminates between primitive and
+    // non-primitive sub-records inside procedures (the latter share
+    // subtag 0x66 with primitives on the new RSM format but carry a
+    // 2-byte hash where primitives have a 1-byte marker). ProbeAll
+    // declares 10 user-typed locals; all should now resolve.
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kRecords));
+
+    const rsm2pdb::rsm::ProcedureRecord* probeAll = nullptr;
+    for (const auto& p : r.procedures()) {
+        if (p.name.find("ProbeAll") != std::string::npos) {
+            probeAll = &p;
+            break;
+        }
+    }
+    REQUIRE(probeAll != nullptr);
+
+    const auto findLocal = [&](const std::string& nm)
+            -> const rsm2pdb::rsm::Variable* {
+        for (const auto& v : probeAll->locals) {
+            if (v.name == nm) return &v;
+        }
+        return nullptr;
+    };
+
+    struct Expect { const char* name; const char* type; };
+    const Expect cases[] = {
+        {"lPoint",  "TPoint"},
+        {"lPerson", "TPerson"},
+        {"lBox",    "TBox"},
+        {"lPacked", "TPacked"},
+        {"lColor",  "TColor"},
+        {"lColors", "TColors"},
+        {"lShape",  "TShape"},
+        {"lCircle", "TCircle"},
+        {"lBag",    "TBag"},
+        {"lBig",    "TBig"},
+    };
+    for (const auto& c : cases) {
+        const auto* lv = findLocal(c.name);
+        REQUIRE_MESSAGE(lv != nullptr, "missing local " << c.name);
+        CHECK_MESSAGE(!lv->is_primitive,
+                      "local " << c.name << " unexpectedly primitive");
+        CHECK_MESSAGE(lv->pascal_type == c.type,
+                      "local " << c.name << " pascal_type='" << lv->pascal_type
+                                          << "', expected '" << c.type << "'");
+        // Round-trip: inline_type_id matches the aggregate's own_hash.
+        const auto* a = r.findAggregateByHash(lv->inline_type_id);
+        REQUIRE_MESSAGE(a != nullptr,
+                        "local " << c.name << " inline_type_id="
+                                 << lv->inline_type_id
+                                 << " has no aggregate");
+        CHECK(a->name == c.type);
+    }
+}
+
 TEST_CASE("rsm::Reader links variables to aggregates by inline_type_id") {
     // Globals in records.rsm carry inline_type_id == aggregate own_hash.
     // findAggregateByHash() should round-trip cleanly.

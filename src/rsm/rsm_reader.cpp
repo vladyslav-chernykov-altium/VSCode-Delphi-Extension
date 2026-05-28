@@ -347,13 +347,37 @@ bool Reader::open(const std::string& path) {
     // Decoded sub-record. `total_size` is the byte-count of the whole
     // record (tag + namelen + name + body + offset bytes), so callers
     // can advance their cursor by exactly the right amount.
+    //
+    // Sub-records come in two type-ref flavours, discriminated at the
+    // byte after `<subtag> 00 00`:
+    //
+    //   primitive:    <subtag> 00 00 <marker u8>  <offset 1B|2B>
+    //                                ^^^^^^^^^^^
+    //                                small even byte (Integer=0x02,
+    //                                Double=0x04, ...) -> `marker`
+    //                                set, `type_hash` left at 0.
+    //
+    //   non-primitive <subtag> 00 00 <type_hash u16 LE> <offset 1B|2B>
+    //                                ^^^^^^^^^^^^^^^^^
+    //                                first byte fails the primitive
+    //                                test (large or odd) -> read 2
+    //                                bytes as type_hash, `marker`
+    //                                left at 0. type_hash is the
+    //                                own_hash of an aggregate in
+    //                                this unit (see Phase B.1).
+    //
+    // is_primitive captures which branch parseSub took, so callers
+    // don't have to redo the discrimination on subtag (which is
+    // 0x66 in both flavours and not reliable on its own).
     struct SubRec {
         bool          ok            = false;
         std::uint8_t  tag           = 0;     // 0x20 local / 0x21 param / 0x22 var-param
         std::uint8_t  namelen       = 0;
         std::size_t   name_at       = 0;     // index of first name byte
         std::uint8_t  subtag        = 0;
-        std::uint8_t  marker        = 0;
+        std::uint8_t  marker        = 0;     // primitive marker (only when is_primitive)
+        std::uint16_t type_hash     = 0;     // aggregate own_hash (only when !is_primitive)
+        bool          is_primitive  = false;
         std::int32_t  stored_off    = 0;     // normalised for `16 + s/2` formula
         std::size_t   total_size    = 0;
     };
@@ -387,16 +411,62 @@ bool Reader::open(const std::string& path) {
         r.namelen   = nl;
         r.name_at   = s + 2;
         r.subtag    = static_cast<std::uint8_t>(buf[bodyAt]);
-        r.marker    = static_cast<std::uint8_t>(buf[markerAt]);
 
-        const auto b0 = static_cast<std::uint8_t>(buf[markerAt + 1]);
+        // Type-ref discrimination. Two RSM-format generations coexist
+        // in our fixture set:
+        //
+        //   OLD (e.g. two_units.rsm built with Delphi pre-10.x):
+        //     subtag 0x62 + <marker u8> for non-primitives;
+        //     subtag 0x66 + <marker u8> for primitives.
+        //     The marker is a 1-byte per-unit type id.
+        //
+        //   NEW (e.g. records.rsm built with current Delphi):
+        //     subtag 0x66 for BOTH, with the discriminator pushed
+        //     into the byte at markerAt: small-even = primitive
+        //     marker (1 byte); else a 2-byte composite hash. This
+        //     matches the global-variable record's layout.
+        //
+        // Dispatch order: subtag != 0x66 is a hard signal of OLD
+        // non-primitive. subtag == 0x66 may be either generation;
+        // discriminate via markerAt[0] like the globals parser does.
+        const auto mb0 = static_cast<std::uint8_t>(buf[markerAt]);
+        std::size_t offsetAt;
+        if (r.subtag != kVarPayloadSubTag0) {
+            // OLD non-primitive form. 1-byte marker (per-unit type
+            // id), no separate type_hash.
+            r.is_primitive = false;
+            r.marker       = mb0;
+            r.type_hash    = 0;
+            offsetAt       = markerAt + 1;
+        } else {
+            const bool primitive_marker =
+                (mb0 != 0 && mb0 < 0x40 && (mb0 & 0x01) == 0);
+            if (primitive_marker) {
+                r.is_primitive = true;
+                r.marker       = mb0;
+                r.type_hash    = 0;
+                offsetAt       = markerAt + 1;
+            } else {
+                if (markerAt + 2 >= buf.size()) return r;
+                r.is_primitive = false;
+                r.marker       = 0;
+                r.type_hash    = static_cast<std::uint16_t>(mb0)
+                              | (static_cast<std::uint16_t>(
+                                    static_cast<std::uint8_t>(buf[markerAt + 1]))
+                                 << 8);
+                offsetAt       = markerAt + 2;
+            }
+        }
+        if (offsetAt >= buf.size()) return r;
+
+        const auto b0 = static_cast<std::uint8_t>(buf[offsetAt]);
         if ((b0 & 1u) == 0u) {
             const auto iv = static_cast<std::int8_t>(b0);
             r.stored_off = static_cast<std::int32_t>(iv);
-            r.total_size = (markerAt + 2) - s;
+            r.total_size = (offsetAt + 1) - s;
         } else {
-            if (markerAt + 2 >= buf.size()) return r;
-            const auto b1 = static_cast<std::uint8_t>(buf[markerAt + 2]);
+            if (offsetAt + 2 >= buf.size()) return r;
+            const auto b1 = static_cast<std::uint8_t>(buf[offsetAt + 1]);
             const std::uint16_t v =
                   static_cast<std::uint16_t>(b0)
                 | (static_cast<std::uint16_t>(b1) << 8);
@@ -418,7 +488,7 @@ bool Reader::open(const std::string& path) {
             const std::int32_t sv =
                 static_cast<std::int16_t>(v);
             r.stored_off = (sv - 1) / 2;
-            r.total_size = (markerAt + 3) - s;
+            r.total_size = (offsetAt + 2) - s;
         }
         r.ok = true;
         return r;
@@ -585,10 +655,16 @@ bool Reader::open(const std::string& path) {
                                                 sub.namelen);
                 sv.address        = 0;
                 sv.stack_offset   = sub.stored_off;
-                sv.type_marker    = sub.marker;
-                sv.is_primitive   = (sub.subtag == kVarPayloadSubTag0);
+                // is_primitive now comes from parseSub's discriminator
+                // (small-even byte at the marker position), NOT from
+                // the subtag value -- non-primitive sub-records share
+                // subtag 0x66 with primitive ones and would otherwise
+                // be misclassified. type_hash carries the full 2-byte
+                // aggregate own_hash when non-primitive (Phase B.3).
+                sv.is_primitive   = sub.is_primitive;
+                sv.type_marker    = sub.is_primitive ? sub.marker : 0;
+                sv.inline_type_id = sub.is_primitive ? 0 : sub.type_hash;
                 sv.has_trailer    = false;
-                sv.inline_type_id = sv.is_primitive ? 0 : sub.marker;
                 sv.trailer_type_id = 0;
                 sv.file_offset    = s;
 
@@ -1222,31 +1298,41 @@ bool Reader::open(const std::string& path) {
                      fields_total, entries_total);
     }
 
-    // -- Aggregate-based type resolution (Phase B.2) -----------------
+    // -- Aggregate-based type resolution (Phase B.2 + B.3) -----------
     //
-    // Non-primitive variables carry their type's own_hash in
-    // inline_type_id (see Variable::inline_type_id in rsm_reader.h).
-    // Resolve to Pascal-type name via findAggregateByHash; the
-    // existing primitive-typed-via-0x66 path (above) is left alone.
-    //
-    // Procedure params / locals are NOT yet covered here -- their
-    // sub-record parser (parseSub) currently treats the 2-byte hash
-    // as a marker+offset pair and returns garbage. Wiring them up is
-    // Phase B.3 (requires extending parseSub's discriminator).
+    // Non-primitive variables / params / locals carry their type's
+    // own_hash in inline_type_id (see Variable::inline_type_id in
+    // rsm_reader.h). Resolve to Pascal-type name via
+    // findAggregateByHash; the existing primitive-typed-via-0x66 path
+    // (above) is left alone.
     {
-        std::size_t typed_via_aggr = 0;
-        for (auto& v : variables_) {
-            if (v.is_primitive) continue;
-            if (v.inline_type_id == 0) continue;
-            if (!v.pascal_type.empty()) continue;  // already resolved
+        auto resolveAggrFor = [&](Variable& v) -> bool {
+            if (v.is_primitive) return false;
+            if (v.inline_type_id == 0) return false;
+            if (!v.pascal_type.empty()) return false;
             const auto* a = findAggregateByHash(v.inline_type_id);
-            if (a == nullptr) continue;
+            if (a == nullptr) return false;
             v.pascal_type = a->name;
-            ++typed_via_aggr;
+            return true;
+        };
+        std::size_t typed_globals = 0;
+        std::size_t typed_params  = 0;
+        std::size_t typed_locals  = 0;
+        for (auto& v : variables_) {
+            if (resolveAggrFor(v)) ++typed_globals;
+        }
+        for (auto& p : procedures_) {
+            for (auto& v : p.params) {
+                if (resolveAggrFor(v)) ++typed_params;
+            }
+            for (auto& v : p.locals) {
+                if (resolveAggrFor(v)) ++typed_locals;
+            }
         }
         std::fprintf(stderr,
-                     "[rsm] aggregate-typed globals: %zu\n",
-                     typed_via_aggr);
+                     "[rsm] aggregate-typed: %zu globals, %zu params, "
+                     "%zu locals\n",
+                     typed_globals, typed_params, typed_locals);
     }
 
     return true;
