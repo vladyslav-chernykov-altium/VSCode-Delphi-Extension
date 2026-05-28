@@ -10,6 +10,7 @@
 #include "llvm/DebugInfo/CodeView/Line.h"
 #include "llvm/DebugInfo/CodeView/SymbolRecord.h"
 #include "llvm/DebugInfo/CodeView/SymbolSerializer.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/DebugInfo/CodeView/ContinuationRecordBuilder.h"
 #include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/MSF/MSFBuilder.h"
@@ -257,6 +258,44 @@ bool writePdb(const std::string& path,
         };
 
     for (const auto& a : inputs.aggregates) {
+        // Phase F: enum types take a different shape -- LF_ENUM
+        // wrapping an LF_FIELDLIST of LF_ENUMERATEs (one per
+        // enumerator). The underlying integer type is picked from
+        // the precomputed byte_size (1 -> UChar, 2 -> UShort,
+        // 4 -> UInt32) so cdb / VS know how wide to read the
+        // memory slot.
+        if (a.kind == AggregateKind::Enum) {
+            codeview::ContinuationRecordBuilder ecb;
+            ecb.begin(codeview::ContinuationRecordKind::FieldList);
+            for (const auto& e : a.enumerators) {
+                llvm::APSInt apv(64, /*isUnsigned=*/ false);
+                apv = e.value;
+                codeview::EnumeratorRecord er(
+                    codeview::MemberAccess::Public,
+                    apv,
+                    e.name);
+                ecb.writeMemberType(er);
+            }
+            const auto enum_fl_ti = tpi_table.insertRecord(ecb);
+            const codeview::TypeIndex underlying =
+                a.byte_size == 1
+                    ? codeview::TypeIndex::UnsignedCharacter()
+                    : a.byte_size == 2
+                        ? codeview::TypeIndex::UInt16Short()
+                        : codeview::TypeIndex::UInt32();
+            codeview::EnumRecord er_rec(
+                static_cast<std::uint16_t>(a.enumerators.size()),
+                codeview::ClassOptions::None,
+                enum_fl_ti,
+                a.name,
+                std::string{},
+                underlying);
+            const auto enum_ti = tpi_table.writeLeafType(er_rec);
+            aggregate_inner_ti.push_back(enum_ti);
+            aggregate_var_ti.push_back(enum_ti);  // value type
+            continue;
+        }
+
         const bool is_class = (a.kind == AggregateKind::Class);
 
         codeview::ContinuationRecordBuilder crb;

@@ -46,14 +46,21 @@ struct AggregateField {
 };
 
 // Discriminator for AggregateRecord. Records emit as LF_STRUCTURE
-// and are referenced by value; classes emit as LF_CLASS and are
-// referenced via a synthesised LF_POINTER-to-class (Pascal class
-// instances live on the heap, so a variable of class type is an
-// 8-byte pointer). Enums / sets are out of scope for Phase D + E;
-// they take Phase F's LF_ENUM path.
+// and are referenced by value; classes emit as LF_CLASS + a
+// synthesised LF_POINTER (Pascal class instances live on the heap);
+// enums emit as LF_ENUM and are referenced by value (1-, 2- or
+// 4-byte integer slot depending on the ordinal range).
 enum class AggregateKind : std::uint8_t {
     Record,
     Class,
+    Enum,
+};
+
+// One enumerator inside an AggregateRecord with kind == Enum.
+// `value` is the Pascal ordinal (clRed = 0, clGreen = 1, ...).
+struct AggregateEnumerator {
+    std::string  name;
+    std::int64_t value = 0;
 };
 
 // A user-declared record / class. PDB writer emits one LF_STRUCTURE
@@ -64,7 +71,8 @@ struct AggregateRecord {
     AggregateKind kind = AggregateKind::Record;
     std::string   name;
     std::uint32_t byte_size = 0;
-    std::vector<AggregateField> fields;
+    std::vector<AggregateField> fields;       // record / class only
+    std::vector<AggregateEnumerator> enumerators;  // enum only
     // Index into PdbInputs::aggregates of the immediate base class
     // (Phase E inheritance). Only meaningful when kind == Class;
     // nullopt for records and for classes whose only base is the

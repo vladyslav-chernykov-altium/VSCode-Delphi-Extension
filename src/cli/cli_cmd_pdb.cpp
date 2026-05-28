@@ -458,8 +458,12 @@ int cmdPdb(int argc, char** argv) {
             || a->kind == rsm2pdb::rsm::AggregateKind::PackedRecord;
         const bool is_class =
                a->kind == rsm2pdb::rsm::AggregateKind::Class;
-        if (!is_record && !is_class) {
-            // Enums / sets / unknowns -- Phase F territory.
+        const bool is_enum =
+               a->kind == rsm2pdb::rsm::AggregateKind::Enum;
+        if (!is_record && !is_class && !is_enum) {
+            // Sets / Unknowns -- still on the byte[N] fallback. The
+            // encoding doesn't carry enough metadata for sets to be
+            // first-class without name-based base-enum inference.
             return std::nullopt;
         }
         const std::pair<std::uint64_t, std::uint16_t> key{
@@ -491,10 +495,33 @@ int cmdPdb(int argc, char** argv) {
         rsm2pdb::pdb::AggregateRecord rec;
         rec.kind      = is_class
                         ? rsm2pdb::pdb::AggregateKind::Class
-                        : rsm2pdb::pdb::AggregateKind::Record;
+                        : is_enum
+                            ? rsm2pdb::pdb::AggregateKind::Enum
+                            : rsm2pdb::pdb::AggregateKind::Record;
         rec.name      = a->name;
         rec.byte_size = a->total_size;
         rec.base      = base_idx;
+        if (is_enum) {
+            // Enum size follows Delphi's default rule: max ordinal
+            // <= 0xFF -> 1 byte, <= 0xFFFF -> 2 bytes, else 4.
+            // {$MINENUMSIZE} can override; we don't model it yet.
+            std::int64_t max_ord = 0;
+            for (const auto& e : a->enum_entries) {
+                if (e.ordinal > max_ord) max_ord = e.ordinal;
+            }
+            rec.byte_size = max_ord <= 0xFF      ? 1
+                          : max_ord <= 0xFFFF    ? 2
+                                                 : 4;
+            rec.enumerators.reserve(a->enum_entries.size());
+            for (const auto& e : a->enum_entries) {
+                rsm2pdb::pdb::AggregateEnumerator ae;
+                ae.name  = e.name;
+                ae.value = e.ordinal;
+                rec.enumerators.push_back(std::move(ae));
+            }
+            inputs.aggregates.push_back(std::move(rec));
+            return idx;
+        }
         rec.fields.reserve(a->fields.size());
         for (const auto& fe : a->fields) {
             rsm2pdb::pdb::AggregateField f;
