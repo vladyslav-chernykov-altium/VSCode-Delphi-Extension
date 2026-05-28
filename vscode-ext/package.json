@@ -394,8 +394,8 @@
         "rsm2pdb.skipUnknownSourceMode": {
           "type": "string",
           "enum": ["off", "out", "hybrid"],
-          "default": "out",
-          "markdownDescription": "How to handle Step Into / Step Out that lands in a function whose source file isn't on disk (typically Delphi RTL).\n\n- `out` *(default)*: keep issuing Step Out until execution returns to user code. Safe -- never executes past a user breakpoint.\n- `hybrid`: first descend with Step In up to 50 times to catch deeper user-code callbacks (event handlers, virtual overrides, lambdas) invoked from RTL, then fall back to Step Out. Catches more cases but the descend phase may bypass user breakpoints that live in the stepped-through region.\n- `off`: disable; stop wherever the debugger says.\n\nIn all modes, hitting any breakpoint immediately cancels auto-stepping."
+          "default": "hybrid",
+          "markdownDescription": "How to handle Step Into / Step Out that lands in a function whose source file isn't on disk (Delphi RTL, interface adjuster thunks, etc.).\n\n- `hybrid` *(default)*: first descend with Step In up to 50 times to catch deeper user-code callbacks (interface adjuster thunks, virtual overrides, event handlers, lambdas invoked from RTL), then fall back to Step Out up to 30 times. This is the only mode that lands you correctly in the method body when stepping into `IMyInterface(P).Method` -- the vtable slot points at a 2-instruction adjuster thunk that has no source, and Step Out would otherwise return you straight back to the caller.\n- `out`: only Step Out from no-source frames. Strictly safe for breakpoints (Step Out sets a temp BP at the return address and can't execute past one), but misses any deeper user code reached through a thunk or RTL callback.\n- `off`: disable; stop wherever the debugger says.\n\nIn all modes, the auto-step aborts immediately if the debugger reports any breakpoint hit (`hitBreakpointIds` non-empty), so user breakpoints in the stepped-through region are honoured even in `hybrid`."
         },
         "rsm2pdb.skipUnknownSource": {
           "type": "boolean",

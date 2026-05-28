@@ -318,19 +318,22 @@ one click instead of typing.
 
 ## Skip-stops-in-source-less code
 
-Configured by `rsm2pdb.skipUnknownSourceMode` (default `"out"`):
+Configured by `rsm2pdb.skipUnknownSourceMode` (default `"hybrid"`):
 
-- `"out"` -- after each step that lands in a frame whose source file
-  we can't locate on disk, issue `stepOut` until we surface in
-  source-bearing code. Budget 30 attempts. This is the safe default:
-  `stepOut` sets a temp BP at the return address, so it can't bypass
-  a user breakpoint sitting in the same function.
-- `"hybrid"` -- try `stepIn` first (50 attempts), then fall back to
-  `stepOut` (30). Catches the case where RTL code calls a user
-  callback. **Warning**: `stepIn` chains run through user code that
-  may contain breakpoints, and some debug adapters report such hits
-  as `reason: 'step'` -- we mitigate via the `hitBreakpointIds`
-  check below, but the safer `"out"` default exists for a reason.
+- `"hybrid"` *(default)* -- after each step that lands in a frame
+  whose source file we can't locate on disk, first descend with
+  `stepIn` up to 50 times. This is what lets Step Into into
+  `IMyInterface(P).Method` actually land in the method body: the
+  vtable slot points at a 2-instruction adjuster thunk
+  (`add rcx, -ofs; jmp <method>`) that has no source mapping, and
+  two `stepIn`s walk us through it. If 50 stepIns don't find user
+  code, fall back to `stepOut` up to 30 times.
+- `"out"` -- only `stepOut` (30 attempts). Strictly safe for
+  breakpoints (`stepOut` sets a temp BP at the return address and
+  can't execute past one), but misses any user code reached through
+  an adjuster thunk or RTL callback -- Step Into into an interface
+  call lands in the thunk, hits no-source, and we return to the
+  caller without ever showing the method body.
 - `"off"` -- disable; debug as-is.
 
 Safety:
@@ -338,7 +341,9 @@ Safety:
   exception / entry stops are honoured verbatim.
 - Aborts immediately if the `stopped` event carries
   `hitBreakpointIds` (user BP was actually hit, debugger
-  miscategorised the reason).
+  miscategorised the reason as 'step'). This is what makes the
+  `hybrid` descend phase safe -- a user BP in the stepped-through
+  region stops auto-skipping and lands the user at their BP.
 - Per-thread / per-session budget; resets on `terminated` /
   thread change.
 
