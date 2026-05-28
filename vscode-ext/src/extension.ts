@@ -1149,6 +1149,72 @@ export function activate(context: vscode.ExtensionContext): void {
     'as Byte[64]',
     (n) => `*(unsigned char(*)[64])&(${n})`,
   );
+
+  // -------- "Pin View as ..." (add cast expression to Watch) --------
+  //
+  // The "View as ..." commands above only evaluate the cast once.
+  // VSCode does not expose an extension API for adding entries to
+  // the Watch panel programmatically -- the Watch list is private
+  // to the IDE. The cleanest persist-across-sessions workflow is to
+  // put the cast expression on the clipboard and open the standard
+  // "Add Watch Expression" input box; the user finishes with
+  // Ctrl+V / Enter and VSCode persists the entry in workspaceState
+  // for the duration of the workspace (survives reloads /
+  // restart-debug).
+  const pinViewAs = async (
+    arg: DebugVariableArg,
+  ): Promise<void> => {
+    const name = getExpr(arg);
+    if (!name) {
+      vscode.window.showWarningMessage(
+        'rsm2pdb: no variable selected.',
+      );
+      return;
+    }
+    const choices = [
+      { label: 'String (UnicodeString)', expr: `(wchar_t*)(${name})` },
+      { label: 'AnsiString (char*)',     expr: `(char*)(${name})` },
+      { label: 'WideString (wchar_t*)',  expr: `(wchar_t*)(${name})` },
+      { label: 'Integer (Int32)',        expr: `*(int*)&(${name})` },
+      { label: 'Cardinal (UInt32)',      expr: `*(unsigned int*)&(${name})` },
+      { label: 'Int64',                  expr: `*(__int64*)&(${name})` },
+      { label: 'UInt64',                 expr: `*(unsigned __int64*)&(${name})` },
+      { label: 'Byte',                   expr: `*(unsigned char*)&(${name})` },
+      { label: 'Word (UInt16)',          expr: `*(unsigned short*)&(${name})` },
+      { label: 'Single (float)',         expr: `*(float*)&(${name})` },
+      { label: 'Double',                 expr: `*(double*)&(${name})` },
+      { label: 'Byte[16] (hex dump)',
+        expr: `*(unsigned char(*)[16])&(${name})` },
+      { label: 'Byte[64] (hex dump)',
+        expr: `*(unsigned char(*)[64])&(${name})` },
+    ];
+    const picked = await vscode.window.showQuickPick(
+      choices.map((c) => ({ label: `View as ${c.label}`, expression: c.expr })),
+      { placeHolder: `Pin a cast of "${name}" to the Watch panel` },
+    );
+    if (!picked) return;
+    try {
+      await vscode.env.clipboard.writeText(picked.expression);
+      // Surface the Watch input box. The Add Watch dialog opens in
+      // whatever debug-view is currently active; if the user has
+      // closed the Debug viewlet we focus it first.
+      await vscode.commands.executeCommand('workbench.view.debug');
+      await vscode.commands.executeCommand(
+        'workbench.debug.action.addWatchExpression',
+      );
+      vscode.window.showInformationMessage(
+        `Cast on clipboard. Press Ctrl+V then Enter in the ` +
+          `Add Watch input to pin:  ${picked.expression}`,
+      );
+    } catch (e: any) {
+      vscode.window.showErrorMessage(
+        `rsm2pdb: pin to Watch failed: ${e?.message ?? String(e)}`,
+      );
+    }
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand('rsm2pdb.pinViewAs', pinViewAs),
+  );
 }
 
 export function deactivate(): void {

@@ -137,6 +137,11 @@
         "command": "rsm2pdb.viewAsByteArray64",
         "title": "View as Byte[64] (hex dump)",
         "category": "rsm2pdb: View as"
+      },
+      {
+        "command": "rsm2pdb.pinViewAs",
+        "title": "Pin View as ... (add cast to Watch)",
+        "category": "rsm2pdb"
       }
     ],
     "keybindings": [
@@ -285,6 +290,10 @@
         {
           "command": "rsm2pdb.viewAsByteArray64",
           "group": "rsm2pdbViewAs_bytes@2"
+        },
+        {
+          "command": "rsm2pdb.pinViewAs",
+          "group": "rsm2pdbViewAs_pin@1"
         }
       ],
       "debug/watch/context": [
@@ -339,6 +348,10 @@
         {
           "command": "rsm2pdb.viewAsByteArray64",
           "group": "rsm2pdbViewAs_bytes@2"
+        },
+        {
+          "command": "rsm2pdb.pinViewAs",
+          "group": "rsm2pdbViewAs_pin@1"
         }
       ]
     },
