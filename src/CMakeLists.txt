@@ -2,6 +2,7 @@ add_library(rsm2pdb_core STATIC
   rsm/rsm_reader.cpp
   map/map_reader.cpp
   model/model.cpp
+  compose/frame.cpp
   dwarf/dwarf_emitter.cpp
   pe/pe_injector.cpp
   pe/pe_pdb_injector.cpp

@@ -21,6 +21,7 @@ add_executable(rsm2pdb_tests
   unit/test_pe_pdb_injector.cpp
   unit/test_prologue.cpp
   unit/test_size_sniffer.cpp
+  unit/test_compose.cpp
 )
 target_link_libraries(rsm2pdb_tests PRIVATE rsm2pdb_core doctest::doctest)
 target_compile_definitions(rsm2pdb_tests PRIVATE

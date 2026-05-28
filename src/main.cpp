@@ -6,6 +6,7 @@
 #include "pe/pe_pdb_injector.h"
 #include "pe/prologue.h"
 #include "pe/size_sniffer.h"
+#include "compose/frame.h"
 #include "pdb/pdb_writer.h"
 
 #include <random>
@@ -1141,48 +1142,12 @@ int main(int argc, char** argv) {
                          typed_globals, inputs.publics.size());
         }
 
-        // Build a per-marker byte-size table from RSM globals. RSM
-        // stores each variable's `type_marker` (a per-unit primitive
-        // type id) but never the byte width directly; we recover the
-        // width by sorting global VAs and taking the gap to the next
-        // higher symbol. Markers that resolve to the same width
-        // everywhere they're seen win; markers with conflicting
-        // widths across units are dropped (left to the disasm
-        // fallback). Cheap one-shot pass; populated regardless of
-        // whether any specific function needs it.
-        std::unordered_map<std::uint8_t, std::uint32_t> marker_sizes;
-        if (have_rsm) {
-            std::vector<std::uint64_t> all_vas;
-            all_vas.reserve(rsm_reader.variables().size());
-            for (const auto& v : rsm_reader.variables()) {
-                if (v.is_primitive && v.address != 0) {
-                    all_vas.push_back(v.address);
-                }
-            }
-            std::sort(all_vas.begin(), all_vas.end());
-            all_vas.erase(std::unique(all_vas.begin(), all_vas.end()),
-                          all_vas.end());
-
-            std::unordered_set<std::uint8_t> conflicting;
-            for (const auto& v : rsm_reader.variables()) {
-                if (!v.is_primitive || v.address == 0) continue;
-                auto it = std::upper_bound(all_vas.begin(), all_vas.end(),
-                                           v.address);
-                if (it == all_vas.end()) continue;
-                const std::uint64_t gap = *it - v.address;
-                // Gaps larger than a register-sized value mean we
-                // straddled an unrelated symbol (or hit the end of a
-                // section). Skip rather than overestimate.
-                if (gap == 0 || gap > 16) continue;
-                const auto size = static_cast<std::uint32_t>(gap);
-                auto [hit, inserted] = marker_sizes.emplace(
-                    v.type_marker, size);
-                if (!inserted && hit->second != size) {
-                    conflicting.insert(v.type_marker);
-                }
-            }
-            for (auto m : conflicting) marker_sizes.erase(m);
-        }
+        // Per-marker byte-size aggregate from RSM globals; reused by
+        // every resolveFunction call below. See compose::buildMarkerSizes
+        // for the cross-unit consistency rules.
+        const auto marker_sizes = have_rsm
+            ? rsm2pdb::compose::buildMarkerSizes(rsm_reader)
+            : std::unordered_map<std::uint8_t, std::uint32_t>{};
 
         stamp("phase: compose modules");
         // Memoize resolveSourcePath -- on real Delphi projects the
@@ -1338,8 +1303,11 @@ int main(int argc, char** argv) {
                         const auto* pr =
                             rsm_reader.findProcedureAt(r.va);
                         if (pr) {
-                            // Locate the function's bytes inside the
-                            // mapped PE so we can read its prologue.
+                            // Slice of PE bytes the prologue / disasm-
+                            // sniffer in compose::resolveFunction will
+                            // read. Empty when the proc's bytes fall
+                            // outside the PE; the resolver degrades to
+                            // sub_rsp=0 in that case (raw RSM/2).
                             const auto& pe_sec_fn = inputs.sections[
                                 mf_out.segment - 1];
                             const std::size_t fn_fo =
@@ -1351,112 +1319,16 @@ int main(int argc, char** argv) {
                                 code = pe_bytes.data() + fn_fo;
                                 code_len = mf_out.size;
                             }
-                            const auto prologue =
-                                rsm2pdb::pe::parsePrologue(
-                                    code, code_len);
-                            const std::int32_t sub_rsp = prologue.sub_rsp;
-                            // Each callee-saved push between `push rbp`
-                            // and `sub rsp` lives in the 8-byte slot
-                            // immediately above the local area, so
-                            // saved-rbp / return-addr / rcx-shadow all
-                            // shift up by 8 * extra_pushes. Locals
-                            // themselves (which sit at rbp + 0 .. rbp
-                            // + sub_rsp) don't move.
-                            const std::int32_t param_shift =
-                                8 * static_cast<std::int32_t>(
-                                    prologue.extra_pushes);
-                            // Disasm-derived rbp-relative widths.
-                            // Used as fallback when the RSM marker
-                            // table doesn't carry a size for a given
-                            // variable. First memory access wins per
-                            // offset -- typically the prologue's
-                            // ECX/EDX/R8D/R9D spill, which sets the
-                            // natural width.
-                            const auto sniffed =
-                                rsm2pdb::pe::sniffStackVarSizes(
-                                    code, code_len);
-
-                            auto isSelf = [](const rsm2pdb::rsm::Variable& v) {
-                                return v.name == "Self"
-                                    || v.type_marker == 0x29
-                                    || v.type_marker == 0xD5;
-                            };
-                            // Width resolution policy:
-                            //   - Self / managed-self markers -> 8
-                            //     (pointer-to-object / interface
-                            //     reference);
-                            //   - RSM marker -> size from globals'
-                            //     marker table (preferred; consistent
-                            //     across procs in the unit);
-                            //   - else disasm-sniffed width at the
-                            //     resolved rbp offset;
-                            //   - else 0 (void* fallback).
-                            auto resolveSize = [&](const rsm2pdb::rsm::Variable& v,
-                                                   std::int32_t real_off)
-                                                   -> std::uint32_t {
-                                if (isSelf(v)) return 8;
-                                auto it = marker_sizes.find(v.type_marker);
-                                if (it != marker_sizes.end()) return it->second;
-                                auto sit = sniffed.find(real_off);
-                                if (sit != sniffed.end()) return sit->second;
-                                return 0;
-                            };
-                            // Pascal nested functions get an implicit
-                            // static-link param (pointer to outer's
-                            // stack frame) in rcx; Delphi spills it
-                            // to the first shadow slot but the RSM
-                            // record never mentions it. Surface it
-                            // as a synthesised $frame_outer local so
-                            // the user can navigate to outer's vars
-                            // (e.g. `*(int*)((char*)$frame_outer +
-                            // 0x40)`).
-                            if (pr->has_static_link) {
-                                rsm2pdb::pdb::ModuleLocal sl;
-                                // Avoid `$`-prefixed names: cdb's
-                                // expression parser treats `$` as a
-                                // pseudo-register sigil and refuses
-                                // to evaluate `?? $foo`.
-                                sl.name      = "__frame_outer__";
-                                sl.is_param  = true;
-                                sl.offset    = sub_rsp + 16 + param_shift;
-                                sl.byte_size = 8;
-                                mf_out.locals.push_back(std::move(sl));
-                            }
-                            // When RSM resolved a Pascal type name for
-                            // the variable (via the per-unit type
-                            // table), translate it to a kind+size pair
-                            // and override the size-based fallback so
-                            // pdb_writer emits the precise simple type
-                            // (Int32 vs UInt32 vs Real32, Bool8 vs
-                            // UChar, WChar vs UShort, ...).
-                            auto applyPascalType = [](rsm2pdb::pdb::ModuleLocal& ml,
-                                                      const rsm2pdb::rsm::Variable& v) {
-                                if (v.pascal_type.empty()) return;
-                                if (auto rp = rsm2pdb::rsm::Reader::resolvePrimitive(
-                                        v.pascal_type)) {
-                                    ml.prim_kind = rp->kind;
-                                    ml.byte_size = rp->byte_size;
-                                }
-                            };
-                            for (const auto& p : pr->params) {
+                            const auto rf =
+                                rsm2pdb::compose::resolveFunction(
+                                    *pr, code, code_len, marker_sizes);
+                            for (const auto& rv : rf.vars) {
                                 rsm2pdb::pdb::ModuleLocal ml;
-                                ml.name     = p.name;
-                                ml.is_param = true;
-                                ml.offset   = isSelf(p)
-                                              ? sub_rsp + 16 + param_shift
-                                              : sub_rsp + param_shift
-                                                  + (p.stack_offset / 2);
-                                ml.byte_size = resolveSize(p, ml.offset);
-                                applyPascalType(ml, p);
-                                mf_out.locals.push_back(std::move(ml));
-                            }
-                            for (const auto& l : pr->locals) {
-                                rsm2pdb::pdb::ModuleLocal ml;
-                                ml.name     = l.name;
-                                ml.is_param = false;
-                                ml.offset   = sub_rsp + (l.stack_offset / 2);
-                                ml.byte_size = resolveSize(l, ml.offset);
-                                applyPascalType(ml, l);
+                                ml.name      = rv.name;
+                                ml.is_param  = rv.is_param;
+                                ml.offset    = rv.rbp_offset;
+                                ml.byte_size = rv.byte_size;
+                                ml.prim_kind = rv.prim_kind;
                                 mf_out.locals.push_back(std::move(ml));
                             }
                         }
