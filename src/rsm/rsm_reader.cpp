@@ -1200,9 +1200,14 @@ bool Reader::open(const std::string& path) {
             }
 
             // Class header signature: 47 00 10 00 00 <own_hash u16>
-            // Pull out the base_hash that sits ~12 bytes later (at the
-            // fixed offset just before the `25 3f 00` field-list
-            // anchor). See rsm-format.txt 2026-05-28 inheritance entry.
+            // The intermediate "vtable size" block has a variable
+            // length between fixtures (07_records: 9 bytes, 08:
+            // 10 bytes when the class declares property accessor
+            // methods). Robust strategy: scan forward for the
+            // `25 3f 00` field-list anchor and pin the base-class
+            // 2-byte slot at fl_at - 10 (always immediately before
+            // the canonical 8-byte tail `00 NN .. fe 00 NN`).
+            // See rsm-format.txt 2026-05-28 inheritance entry.
             if (tag == 0x47 && i + 24 < buf.size()
                 && static_cast<std::uint8_t>(buf[i + 1]) == 0x00
                 && static_cast<std::uint8_t>(buf[i + 2]) == 0x10
@@ -1210,9 +1215,22 @@ bool Reader::open(const std::string& path) {
                 && static_cast<std::uint8_t>(buf[i + 4]) == 0x00) {
                 ClassHeader ch{};
                 ch.own_hash  = readU16LE(i + 5);
-                // The 11-byte vtable-size block lives at +7..+17,
-                // then the base-class 2-byte slot at +18..+19.
-                ch.base_hash = readU16LE(i + 18);
+                // Scan forward up to 80 bytes for the field-list
+                // anchor; the base-class slot is at -10/-9.
+                std::size_t fl_at = SIZE_MAX;
+                const std::size_t scan_end =
+                    std::min(i + 80, buf.size() - 3);
+                for (std::size_t j = i + 7; j < scan_end; ++j) {
+                    if (static_cast<std::uint8_t>(buf[j])     == 0x25
+                        && static_cast<std::uint8_t>(buf[j + 1]) == 0x3f
+                        && static_cast<std::uint8_t>(buf[j + 2]) == 0x00) {
+                        fl_at = j;
+                        break;
+                    }
+                }
+                if (fl_at != SIZE_MAX && fl_at >= 10) {
+                    ch.base_hash = readU16LE(fl_at - 10);
+                }
                 class_headers.push_back(ch);
                 i += 7;
                 continue;
