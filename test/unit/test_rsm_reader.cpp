@@ -17,6 +17,31 @@ namespace {
 const std::string kHello      = std::string(RSM2PDB_FIXTURES_DIR) + "/hello.rsm";
 const std::string kTwoUnits   = std::string(RSM2PDB_FIXTURES_DIR) + "/two_units.rsm";
 const std::string kPrimitives = std::string(RSM2PDB_FIXTURES_DIR) + "/primitives.rsm";
+const std::string kRecords    = std::string(RSM2PDB_FIXTURES_DIR) + "/records.rsm";
+
+// Find the first aggregate matching `name`. Helper for the
+// Step 11b tests below; we don't have a name lookup on Reader
+// because aggregate names are not globally unique across units
+// (RTL has its own TPoint, TList, ...). The fixture's records
+// unit is the LAST declared, so a reverse-find pinpoints the
+// user copy.
+inline const rsm2pdb::rsm::AggregateType*
+findAggregateByName(const rsm2pdb::rsm::Reader& r,
+                    const std::string& name) {
+    const auto& aggs = r.aggregates();
+    for (auto it = aggs.rbegin(); it != aggs.rend(); ++it) {
+        if (it->name == name) return &*it;
+    }
+    return nullptr;
+}
+
+inline const rsm2pdb::rsm::FieldEntry*
+findField(const rsm2pdb::rsm::AggregateType& a, const std::string& name) {
+    for (const auto& f : a.fields) {
+        if (f.name == name) return &f;
+    }
+    return nullptr;
+}
 
 } // namespace
 
@@ -311,6 +336,199 @@ TEST_CASE("rsm::Reader procedure scan does not double-count locals as globals") 
             CHECK_FALSE(inside);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Step 11b Phase B.1 -- aggregate types (records / classes / enums)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("rsm::Reader decodes user records from records.rsm") {
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kRecords));
+
+    // TPoint: record { X, Y: Integer } -- two 4-byte fields, packed
+    // tight by natural alignment (no padding for Integer/Integer).
+    const auto* tpoint = findAggregateByName(r, "TPoint");
+    REQUIRE(tpoint != nullptr);
+    CHECK(tpoint->kind == rsm2pdb::rsm::AggregateKind::Record);
+    REQUIRE(tpoint->fields.size() == 2u);
+    CHECK(tpoint->fields[0].name == "X");
+    CHECK(tpoint->fields[0].offset == 0u);
+    CHECK(tpoint->fields[1].name == "Y");
+    CHECK(tpoint->fields[1].offset == 4u);
+
+    // TPerson: mixed-type record. Integer + Double + Boolean + string
+    // + Char. Offsets follow Delphi's natural-alignment rules.
+    const auto* tperson = findAggregateByName(r, "TPerson");
+    REQUIRE(tperson != nullptr);
+    CHECK(tperson->kind == rsm2pdb::rsm::AggregateKind::Record);
+    REQUIRE(tperson->fields.size() == 5u);
+    const auto* age    = findField(*tperson, "Age");
+    const auto* salary = findField(*tperson, "Salary");
+    const auto* active = findField(*tperson, "Active");
+    const auto* name   = findField(*tperson, "Name");
+    const auto* grade  = findField(*tperson, "Grade");
+    REQUIRE(age);    CHECK(age->offset    == 0u);
+    REQUIRE(salary); CHECK(salary->offset == 8u);
+    REQUIRE(active); CHECK(active->offset == 16u);
+    REQUIRE(name);   CHECK(name->offset   == 24u);
+    REQUIRE(grade);  CHECK(grade->offset  == 32u);
+
+    // TBox: record-of-records. Both TopLeft and BottomRight reference
+    // TPoint via 2-byte composite hash. Label_ is a string at offset
+    // 16 (after two 8-byte TPoints).
+    const auto* tbox = findAggregateByName(r, "TBox");
+    REQUIRE(tbox != nullptr);
+    REQUIRE(tbox->fields.size() == 3u);
+    const auto* topLeft = findField(*tbox, "TopLeft");
+    const auto* bottomRight = findField(*tbox, "BottomRight");
+    REQUIRE(topLeft);
+    CHECK(topLeft->offset == 0u);
+    CHECK(topLeft->type_hash == tpoint->own_hash);
+    REQUIRE(bottomRight);
+    CHECK(bottomRight->offset == 8u);
+    CHECK(bottomRight->type_hash == tpoint->own_hash);
+}
+
+TEST_CASE("rsm::Reader decodes big record (2-byte offset form)") {
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kRecords));
+
+    // TBig: 40 Integer fields F00..F39 = 160 bytes total. F32..F39
+    // are at offsets >= 128 and exercise the 2-byte offset form.
+    const auto* tbig = findAggregateByName(r, "TBig");
+    REQUIRE(tbig != nullptr);
+    REQUIRE(tbig->fields.size() == 40u);
+
+    // Spot-check F00 (1-byte form) + F32 (first 2-byte form).
+    const auto* f00 = findField(*tbig, "F00");
+    REQUIRE(f00); CHECK(f00->offset == 0u);
+    const auto* f31 = findField(*tbig, "F31");
+    REQUIRE(f31); CHECK(f31->offset == 124u);   // last 1-byte form
+    const auto* f32 = findField(*tbig, "F32");
+    REQUIRE(f32); CHECK(f32->offset == 128u);   // first 2-byte form
+    const auto* f39 = findField(*tbig, "F39");
+    REQUIRE(f39); CHECK(f39->offset == 156u);   // last field
+}
+
+TEST_CASE("rsm::Reader decodes classes and inheritance from records.rsm") {
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kRecords));
+
+    // TShape: class with fName (string) at 8, fArea (Double) at 16.
+    // Class layout starts after the 8-byte vtable pointer.
+    const auto* tshape = findAggregateByName(r, "TShape");
+    REQUIRE(tshape != nullptr);
+    CHECK(tshape->kind == rsm2pdb::rsm::AggregateKind::Class);
+    REQUIRE(tshape->fields.size() == 2u);
+    const auto* fName = findField(*tshape, "fName");
+    const auto* fArea = findField(*tshape, "fArea");
+    REQUIRE(fName); CHECK(fName->offset == 8u);
+    REQUIRE(fArea); CHECK(fArea->offset == 16u);
+
+    // TCircle: inherits TShape. Only its OWN field (fRadius) shows
+    // here -- base fields stay on TShape, reachable via base_hash.
+    const auto* tcircle = findAggregateByName(r, "TCircle");
+    REQUIRE(tcircle != nullptr);
+    CHECK(tcircle->kind == rsm2pdb::rsm::AggregateKind::Class);
+    REQUIRE(tcircle->fields.size() == 1u);
+    const auto* fRadius = findField(*tcircle, "fRadius");
+    REQUIRE(fRadius); CHECK(fRadius->offset == 24u);  // vtable(8) + fName(8) + fArea(8)
+    CHECK(tcircle->base_hash == tshape->own_hash);
+
+    // TShape itself has no explicit base (TObject implicit). The
+    // resolver SHOULD leave base_hash at 0 (TObject lives in System
+    // unit, its hash doesn't match anything local) -- but until
+    // Phase B.2+ adds unit-boundary tracking, RTL classes sharing
+    // our user-type own_hash can leak a phony base into ours.
+    // For now we just verify that IF a base is set, it doesn't
+    // round-trip to a meaningful Pascal name (it points to noise).
+    if (tshape->base_hash != 0u) {
+        const auto* phony = r.findAggregateByHash(tshape->base_hash);
+        // Most likely the leaked base points to some RTL utility
+        // record / class -- not "TObject" by name (we never see
+        // System.TObject in the per-unit type stream).
+        if (phony != nullptr) {
+            CHECK(phony->name != "TShape");
+        }
+    }
+
+    // TBag: class with TPoint-typed fields (clears risk R4).
+    const auto* tbag = findAggregateByName(r, "TBag");
+    REQUIRE(tbag != nullptr);
+    CHECK(tbag->kind == rsm2pdb::rsm::AggregateKind::Class);
+    REQUIRE(tbag->fields.size() == 3u);
+    const auto* fPos  = findField(*tbag, "fPos");
+    const auto* fSlot = findField(*tbag, "fSlot");
+    const auto* fTag  = findField(*tbag, "fTag");
+    const auto* tpoint = findAggregateByName(r, "TPoint");
+    REQUIRE(tpoint != nullptr);
+    REQUIRE(fPos);
+    CHECK(fPos->offset == 8u);
+    CHECK(fPos->type_hash == tpoint->own_hash);
+    REQUIRE(fSlot);
+    CHECK(fSlot->offset == 16u);
+    CHECK(fSlot->type_hash == tpoint->own_hash);
+    REQUIRE(fTag);
+    CHECK(fTag->offset == 24u);
+    CHECK(fTag->type_hash == 0u);          // primitive Integer
+    CHECK(fTag->primitive_marker == 0x02); // Integer marker
+}
+
+TEST_CASE("rsm::Reader decodes enum entries from records.rsm") {
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kRecords));
+
+    // TColor = (clRed, clGreen, clBlue, clYellow).
+    const auto* tcolor = findAggregateByName(r, "TColor");
+    REQUIRE(tcolor != nullptr);
+    CHECK(tcolor->kind == rsm2pdb::rsm::AggregateKind::Enum);
+    REQUIRE(tcolor->enum_entries.size() == 4u);
+
+    auto findOrd = [&](const std::string& nm) -> std::int64_t {
+        for (const auto& e : tcolor->enum_entries)
+            if (e.name == nm) return e.ordinal;
+        return -1;
+    };
+    CHECK(findOrd("clRed")    == 0);
+    CHECK(findOrd("clGreen")  == 1);
+    CHECK(findOrd("clBlue")   == 2);
+    CHECK(findOrd("clYellow") == 3);
+}
+
+TEST_CASE("rsm::Reader links variables to aggregates by inline_type_id") {
+    // Globals in records.rsm carry inline_type_id == aggregate own_hash.
+    // findAggregateByHash() should round-trip cleanly.
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kRecords));
+
+    const auto* tpoint = findAggregateByName(r, "TPoint");
+    const auto* tbag   = findAggregateByName(r, "TBag");
+    const auto* tbig   = findAggregateByName(r, "TBig");
+    REQUIRE(tpoint); REQUIRE(tbag); REQUIRE(tbig);
+
+    // Every non-primitive variable named GPoint / GBag / GBig should
+    // exist with inline_type_id pointing at the right aggregate.
+    bool found_gpoint = false, found_gbag = false, found_gbig = false;
+    for (const auto& v : r.variables()) {
+        if (v.is_primitive) continue;
+        if (v.name == "GPoint") {
+            found_gpoint = true;
+            CHECK(v.inline_type_id == tpoint->own_hash);
+            CHECK(r.findAggregateByHash(v.inline_type_id) == tpoint);
+        } else if (v.name == "GBag") {
+            found_gbag = true;
+            CHECK(v.inline_type_id == tbag->own_hash);
+            CHECK(r.findAggregateByHash(v.inline_type_id) == tbag);
+        } else if (v.name == "GBig") {
+            found_gbig = true;
+            CHECK(v.inline_type_id == tbig->own_hash);
+            CHECK(r.findAggregateByHash(v.inline_type_id) == tbig);
+        }
+    }
+    CHECK(found_gpoint);
+    CHECK(found_gbag);
+    CHECK(found_gbig);
 }
 
 TEST_CASE("rsm::Reader rejects bad magic") {

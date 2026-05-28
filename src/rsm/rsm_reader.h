@@ -122,6 +122,69 @@ struct ProcedureRecord {
     bool                    has_static_link = false;
 };
 
+// One member of a record / class type, parsed from a 0x2c sub-record.
+//
+// Encoding (see rsm-format.txt 2026-05-28 Phase A entries):
+//   2c <namelen> <name>
+//      00 <storage u8> 00           -- storage: 0x00 private, 0x02 public,
+//                                     0x04 protected, 0xa0 packed-record
+//      <type-ref>                   -- 1 byte primitive marker
+//                                     OR 2-byte own_hash of another
+//                                     type record in the same unit.
+//      <offset 1B or 2B>            -- offset within parent; 2-byte form
+//                                     marked by LSB=1, decoded as
+//                                     `real = (u16-1) / 4`.
+//      <internals 13B or 8B>        -- file back-refs, ignored.
+//      <parent_hash u16 LE>
+//      0xff                         -- field terminator.
+//
+// `type_hash` is set when the field's type is another aggregate;
+// `primitive_marker` is set otherwise. Exactly one of them is
+// non-zero (we never see both empty -- types that fail to resolve
+// fall back to a synthetic byte[N] downstream).
+struct FieldEntry {
+    std::string   name;
+    std::uint32_t offset = 0;        // real byte offset within parent
+    std::uint8_t  primitive_marker = 0;  // small even from kPrimitiveTable
+    std::uint16_t type_hash = 0;     // own_hash of another aggregate
+    std::uint8_t  storage = 0x02;    // raw byte; visibility / packed flag
+};
+
+// One enumerator in a Pascal enum type, parsed from a 0x25 sub-record.
+struct EnumEntry {
+    std::string  name;
+    std::int64_t ordinal = 0;        // decoded value (e.g. clRed=0, clGreen=1)
+};
+
+// Kind discriminator for AggregateType. See classify() in
+// rsm_reader.cpp for the inference rules (we don't trust the 0x2a
+// record's `kind` byte alone -- field-storage and entry presence
+// disambiguate).
+enum class AggregateKind : std::uint8_t {
+    Unknown = 0,
+    Record,                          // simple `record ... end`
+    PackedRecord,                    // `packed record ... end`
+    Class,                           // `class ... end`
+    Enum,                            // `(a, b, c)`
+    Set,                             // `set of TColor` (best-effort)
+};
+
+// A user-declared Pascal aggregate type, parsed from a 0x2a record
+// + its trailing 0x2c / 0x25 sub-records (which live in a separate
+// metadata cluster but are linked by parent_hash). The own_hash is
+// the unit-local identifier that 0x66-form sub-records use to point
+// at this type.
+struct AggregateType {
+    std::string             name;            // Pascal name ("TPoint", ...)
+    std::uint16_t           own_hash = 0;    // unique within this unit
+    AggregateKind           kind = AggregateKind::Unknown;
+    std::vector<FieldEntry> fields;          // records / classes
+    std::vector<EnumEntry>  enum_entries;    // enums only
+    std::uint16_t           base_hash = 0;   // classes only: parent's own_hash
+    std::uint32_t           total_size = 0;  // bytes; 0 if unknown
+    std::uint64_t           file_offset = 0; // 0x2a record start (debug aid)
+};
+
 struct Header {
     static constexpr std::uint32_t kMagic = 0x37485343;  // "CSH7" LE
     static constexpr std::uint32_t kMetadataStart = 0x00000420;
@@ -147,6 +210,7 @@ public:
     const std::vector<Primitive>&       primitives() const { return primitives_; }
     const std::vector<Variable>&        variables()  const { return variables_; }
     const std::vector<ProcedureRecord>& procedures() const { return procedures_; }
+    const std::vector<AggregateType>&   aggregates() const { return aggregates_; }
     const std::string&                  error()      const { return error_; }
 
     // Lookup a primitive by its Pascal name (case-sensitive). Returns
@@ -171,6 +235,12 @@ public:
     // Lookup a procedure record by its function entry VA.
     const ProcedureRecord* findProcedureAt(std::uint64_t address) const;
 
+    // Lookup an aggregate type by its unit-local own_hash. This is
+    // the lookup variables / locals / params + the marker resolver
+    // use to convert an `inline_type_id` into structured field /
+    // enum-entry data for downstream PDB / DWARF emission.
+    const AggregateType* findAggregateByHash(std::uint16_t hash) const;
+
     void dump(std::FILE* out) const;
 
 private:
@@ -184,6 +254,9 @@ private:
     // Speeds up findVariableAt / findProcedureAt from O(N) to O(1).
     std::unordered_map<std::uint64_t, std::size_t> var_by_va_;
     std::unordered_map<std::uint64_t, std::size_t> proc_by_va_;
+    // Aggregates (records / classes / enums / sets), indexed by own_hash.
+    std::vector<AggregateType>                     aggregates_;
+    std::unordered_map<std::uint16_t, std::size_t> aggr_by_hash_;
 };
 
 // Decorate a populated model::Module with type information derived

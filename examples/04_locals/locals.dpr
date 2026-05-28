@@ -117,9 +117,11 @@ var
     lInner := pB + lOuter;     // touches outer's local
     Result := lInner + pA;     // touches outer's param
   end;
-
+Var
+    PostfixVar : Integer;
 begin
   lOuter := pA * 10;
+  PostfixVar := pA * 20;
   Result := NestedInner(pA + 1);
 end;
 
