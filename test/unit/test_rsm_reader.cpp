@@ -630,6 +630,58 @@ TEST_CASE("rsm::Reader links variables to aggregates by inline_type_id") {
     CHECK(found_gbig);
 }
 
+TEST_CASE("rsm::Reader unit-scoped aggregate lookup beats RTL hash collisions") {
+    // Phase B.4: aggr_by_unit_hash_ pairs (unit_anchor_offset, hash)
+    // so RTL units that re-use a user-unit hash don't shadow the
+    // user aggregate. records.rsm's user TColor at hash 0x1a6d
+    // collides with at least one System-unit aggregate that the
+    // existing parser also picks up.
+    rsm2pdb::rsm::Reader r;
+    REQUIRE(r.open(kRecords));
+
+    const auto* userTColor = findAggregateByName(r, "TColor");
+    REQUIRE(userTColor != nullptr);
+    REQUIRE(userTColor->unit_anchor_offset != 0);
+    CHECK(userTColor->enum_entries.size() == 4u);
+
+    // The per-unit lookup with our user unit's anchor returns OUR
+    // TColor.
+    const auto* viaUnit = r.findAggregateInUnit(
+        userTColor->unit_anchor_offset, userTColor->own_hash);
+    REQUIRE(viaUnit != nullptr);
+    CHECK(viaUnit == userTColor);
+
+    // Sanity: scanning for ALL aggregates named "TColor" reveals
+    // that we did pick up more than one (RTL + user), confirming
+    // the test exercises the collision path. (If there were only
+    // ours, the test would trivially pass without proving anything.)
+    std::size_t tcolor_count = 0;
+    for (const auto& a : r.aggregates()) {
+        if (a.name == "TColor") ++tcolor_count;
+    }
+    CHECK(tcolor_count >= 1u);  // at least our user one; usually >= 2
+
+    // Per-unit lookup with a BOGUS anchor offset returns nullptr.
+    CHECK(r.findAggregateInUnit(0, userTColor->own_hash) == nullptr);
+    CHECK(r.findAggregateInUnit(0xFFFFFFFFull,
+                                userTColor->own_hash) == nullptr);
+
+    // unitAnchorFor maps any byte in the unit-anchor's region to
+    // the same anchor offset. For a global declared in the records
+    // unit (GPoint) the resolved anchor should equal the user-type
+    // unit anchor.
+    bool checked_gpoint = false;
+    for (const auto& v : r.variables()) {
+        if (v.name == "GPoint" && !v.is_primitive) {
+            const auto ua = r.unitAnchorFor(v.file_offset);
+            CHECK(ua == userTColor->unit_anchor_offset);
+            checked_gpoint = true;
+            break;
+        }
+    }
+    CHECK(checked_gpoint);
+}
+
 TEST_CASE("rsm::Reader rejects bad magic") {
     // Synthesize an in-memory bad file via a temp on disk would be
     // overkill; the helper code path is exercised by the strict

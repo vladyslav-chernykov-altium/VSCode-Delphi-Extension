@@ -183,6 +183,13 @@ struct AggregateType {
     std::uint16_t           base_hash = 0;   // classes only: parent's own_hash
     std::uint32_t           total_size = 0;  // bytes; 0 if unknown
     std::uint64_t           file_offset = 0; // 0x2a record start (debug aid)
+    // The closest-prior unit anchor's file offset. Pins this
+    // aggregate to a specific unit's local hash space -- crucial on
+    // multi-unit projects where RTL units can declare distinct types
+    // sharing the same own_hash value as a user-unit aggregate.
+    // 0 means "no enclosing unit anchor found" (rare; falls back to
+    // global last-wins lookup).
+    std::uint64_t           unit_anchor_offset = 0;
 };
 
 struct Header {
@@ -235,11 +242,26 @@ public:
     // Lookup a procedure record by its function entry VA.
     const ProcedureRecord* findProcedureAt(std::uint64_t address) const;
 
-    // Lookup an aggregate type by its unit-local own_hash. This is
-    // the lookup variables / locals / params + the marker resolver
-    // use to convert an `inline_type_id` into structured field /
-    // enum-entry data for downstream PDB / DWARF emission.
+    // Lookup an aggregate type by its unit-local own_hash. own_hash
+    // is per-unit, NOT globally unique -- last-wins is used: the
+    // aggregate added last to the list (file-order) for a given
+    // hash is returned. Prefer findAggregateInUnit() when the caller
+    // knows which unit the lookup originates from.
     const AggregateType* findAggregateByHash(std::uint16_t hash) const;
+
+    // Lookup an aggregate by (unit, hash). `unit_anchor_offset` is
+    // the file offset of the unit's anchor record -- callers can get
+    // it by feeding a Variable's file_offset to unitAnchorFor().
+    // Returns nullptr if no aggregate matches that exact (unit, hash)
+    // pair (e.g. when the hash actually belongs to a different unit).
+    const AggregateType* findAggregateInUnit(std::uint64_t unit_anchor_offset,
+                                             std::uint16_t hash) const;
+
+    // Returns the file offset of the unit anchor that contains the
+    // given file_offset, or 0 if none. Use this with
+    // findAggregateInUnit() to scope a hash lookup to a variable's
+    // own unit.
+    std::uint64_t unitAnchorFor(std::uint64_t file_offset) const;
 
     void dump(std::FILE* out) const;
 
@@ -254,9 +276,38 @@ private:
     // Speeds up findVariableAt / findProcedureAt from O(N) to O(1).
     std::unordered_map<std::uint64_t, std::size_t> var_by_va_;
     std::unordered_map<std::uint64_t, std::size_t> proc_by_va_;
-    // Aggregates (records / classes / enums / sets), indexed by own_hash.
+    // Aggregates (records / classes / enums / sets). Indexed two
+    // ways: aggr_by_hash_ is global last-wins (for callers without
+    // a unit context), aggr_by_unit_hash_ is per-unit precise (for
+    // callers that have a Variable's file_offset to lift to a unit
+    // anchor first). See findAggregateInUnit() / unitAnchorFor().
     std::vector<AggregateType>                     aggregates_;
     std::unordered_map<std::uint16_t, std::size_t> aggr_by_hash_;
+    struct UnitHashKey {
+        std::uint64_t unit_anchor_offset;
+        std::uint16_t hash;
+        bool operator==(const UnitHashKey& o) const {
+            return unit_anchor_offset == o.unit_anchor_offset
+                && hash == o.hash;
+        }
+    };
+    struct UnitHashKeyHasher {
+        std::size_t operator()(const UnitHashKey& k) const noexcept {
+            // 64-bit FNV-style mix.
+            std::uint64_t h = k.unit_anchor_offset;
+            h ^= (static_cast<std::uint64_t>(k.hash) * 0x9E3779B97F4A7C15ull);
+            h ^= (h >> 33);
+            h *= 0xC2B2AE3D27D4EB4Full;
+            return static_cast<std::size_t>(h);
+        }
+    };
+    std::unordered_map<UnitHashKey, std::size_t,
+                       UnitHashKeyHasher>          aggr_by_unit_hash_;
+    // Unit-anchor offsets in ascending file order, for upper_bound
+    // queries via unitAnchorFor(). Populated alongside the existing
+    // primary-type-table scan but kept as a member here so the
+    // aggregate parser + downstream callers can both use it.
+    std::vector<std::uint64_t>                     unit_anchor_offsets_;
 };
 
 // Decorate a populated model::Module with type information derived

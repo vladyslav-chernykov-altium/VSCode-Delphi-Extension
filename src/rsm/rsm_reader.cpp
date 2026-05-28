@@ -838,6 +838,10 @@ bool Reader::open(const std::string& path) {
     };
 
     struct UnitAnchor { std::size_t file_offset; std::string name; };
+    // Local during the primary-type-table scan; mirrored into the
+    // member unit_anchor_offsets_ at the end so later passes (e.g.
+    // the aggregate parser, the per-unit resolver, downstream
+    // callers via unitAnchorFor) can use it.
     std::vector<UnitAnchor> unit_anchors;
     const std::size_t kVarPayloadHdr = 0x420;
     for (std::size_t a = kVarPayloadHdr; a + 60 < buf.size(); ) {
@@ -993,6 +997,17 @@ bool Reader::open(const std::string& path) {
         proc_by_va_.emplace(procedures_[k].address, k);
     }
 
+    // Mirror unit_anchors offsets into a member sorted vector so the
+    // aggregate parser (below) + downstream callers (unitAnchorFor
+    // and the per-unit aggregate lookup) can do an upper_bound query
+    // against it.
+    unit_anchor_offsets_.clear();
+    unit_anchor_offsets_.reserve(unit_anchors.size());
+    for (const auto& ua : unit_anchors) {
+        unit_anchor_offsets_.push_back(ua.file_offset);
+    }
+    std::sort(unit_anchor_offsets_.begin(), unit_anchor_offsets_.end());
+
     // -- Aggregate types (Step 11b Phase B.1) -------------------------
     //
     // Walk the metadata stream collecting 0x2a / 0x2c / 0x25 records
@@ -1054,6 +1069,19 @@ bool Reader::open(const std::string& path) {
                 a.name        = std::string(buf.data() + i + 2, nl);
                 a.own_hash    = readU16LE(at + 3);
                 a.file_offset = i;
+                // Pin the aggregate to its enclosing unit anchor.
+                // Closest-prior anchor via upper_bound on sorted
+                // offsets (Phase B.4). Without a unit anchor the
+                // aggregate is unscoped; downstream lookups fall
+                // back to the global last-wins index.
+                auto uit = std::upper_bound(
+                    unit_anchor_offsets_.begin(),
+                    unit_anchor_offsets_.end(),
+                    static_cast<std::uint64_t>(i));
+                a.unit_anchor_offset =
+                    (uit == unit_anchor_offsets_.begin())
+                        ? 0
+                        : *(uit - 1);
                 // Provisional kind = Unknown; refined in pass 2.
                 aggregates_.push_back(std::move(a));
                 i = at + 5;
@@ -1186,16 +1214,29 @@ bool Reader::open(const std::string& path) {
         // own_hash is unit-local, not globally unique -- RTL units can
         // declare types with the same hash as our user units (TColor
         // in records.dpr collides with at least one System-unit type
-        // at hash 0x1a6d). Without unit-boundary tracking in pass 1
-        // we use the last-wins policy: user types live in user units
-        // that are linked LAST, so iterating in file order and
-        // overwriting earlier hits leaves the user-type aggregate at
-        // the indexed slot. This is good enough for the fixtures and
-        // for our examples. Phase B.2+ should track unit boundaries
-        // to scope the lookup properly on multi-unit projects.
+        // at hash 0x1a6d). Two indexes:
+        //
+        //   aggr_by_hash_       -- last-wins by hash alone. Used when
+        //                          caller has no unit context.
+        //                          (User units link last, so the
+        //                          user aggregate wins on practical
+        //                          fixtures.)
+        //
+        //   aggr_by_unit_hash_  -- precise by (unit_anchor_offset,
+        //                          hash). Used when the caller knows
+        //                          which unit owns the lookup. The
+        //                          pascal_type resolver below uses
+        //                          this when a variable's file_offset
+        //                          falls inside a unit anchor.
         aggr_by_hash_.reserve(aggregates_.size());
+        aggr_by_unit_hash_.reserve(aggregates_.size());
         for (std::size_t k = 0; k < aggregates_.size(); ++k) {
-            aggr_by_hash_[aggregates_[k].own_hash] = k;
+            const auto& a = aggregates_[k];
+            aggr_by_hash_[a.own_hash] = k;
+            if (a.unit_anchor_offset != 0) {
+                aggr_by_unit_hash_[
+                    UnitHashKey{a.unit_anchor_offset, a.own_hash}] = k;
+            }
         }
 
         // Attach pending fields / enums by parent_hash, then classify.
@@ -1306,11 +1347,29 @@ bool Reader::open(const std::string& path) {
     // findAggregateByHash; the existing primitive-typed-via-0x66 path
     // (above) is left alone.
     {
+        // Per-unit-first resolution (Phase B.4): if the variable's
+        // file_offset falls inside a known unit anchor, look up the
+        // aggregate by (unit, hash) so an RTL hash collision can't
+        // route to the wrong type. Fall back to global last-wins
+        // when no enclosing unit anchor is known (rare; happens for
+        // variables that the existing scanner picked up outside any
+        // unit boundary -- mostly bogus VAs from prologue bytes that
+        // the var_by_va_ filter already drops downstream).
         auto resolveAggrFor = [&](Variable& v) -> bool {
             if (v.is_primitive) return false;
             if (v.inline_type_id == 0) return false;
             if (!v.pascal_type.empty()) return false;
-            const auto* a = findAggregateByHash(v.inline_type_id);
+            const std::uint64_t ua = unitAnchorFor(v.file_offset);
+            const AggregateType* a = nullptr;
+            if (ua != 0) {
+                a = findAggregateInUnit(ua, v.inline_type_id);
+            }
+            if (a == nullptr) {
+                // Either no enclosing unit anchor, or this hash
+                // simply isn't defined in this unit. Last-wins is
+                // the only useful answer left.
+                a = findAggregateByHash(v.inline_type_id);
+            }
             if (a == nullptr) return false;
             v.pascal_type = a->name;
             return true;
@@ -1366,6 +1425,22 @@ const ProcedureRecord* Reader::findProcedureAt(std::uint64_t address) const {
 const AggregateType* Reader::findAggregateByHash(std::uint16_t hash) const {
     auto it = aggr_by_hash_.find(hash);
     return it == aggr_by_hash_.end() ? nullptr : &aggregates_[it->second];
+}
+
+const AggregateType*
+Reader::findAggregateInUnit(std::uint64_t unit_anchor_offset,
+                            std::uint16_t hash) const {
+    if (unit_anchor_offset == 0) return nullptr;
+    auto it = aggr_by_unit_hash_.find(UnitHashKey{unit_anchor_offset, hash});
+    return it == aggr_by_unit_hash_.end() ? nullptr : &aggregates_[it->second];
+}
+
+std::uint64_t Reader::unitAnchorFor(std::uint64_t file_offset) const {
+    auto it = std::upper_bound(unit_anchor_offsets_.begin(),
+                               unit_anchor_offsets_.end(),
+                               file_offset);
+    if (it == unit_anchor_offsets_.begin()) return 0;
+    return *(it - 1);
 }
 
 void Reader::dump(std::FILE* out) const {
