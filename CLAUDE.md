@@ -61,7 +61,12 @@ body. `git log --oneline` for the recent history.
 | `examples/01_hello/` | Single-file Delphi sample. |
 | `examples/02_two_units/` | Multi-unit (Geometry + App.Colors + dpr). Primary local-debug fixture. |
 | `examples/03_primitives/` | 13 user globals across 12 distinct primitive types. Used to RE the type-marker encoding. |
-| `test/fixtures/` | Committed .exe/.rsm/.map sample inputs (all three example projects). |
+| `examples/04_locals/` | Procedure-locals + nested function + virtual / override methods. The Delphi-x64 frame-layout RE relied on this. |
+| `examples/05_types/` | 21 primitive + string typed locals in `ProbeLocals`. RE'd Step 10.5 + 11a (precise primitive typing + string pointer-to-char). |
+| `examples/06_interface/` | Interface-dispatch patterns + adjuster thunks (Item 21). Used to verify `.natstepfilter` + hybrid auto-skip. |
+| `examples/07_records/` | Records / classes (with single-level inheritance) / enums / sets. Drove Step 11b phases D / E / F / F+. TBig has 40 Integer fields to exercise the 2-byte offset form (R6). |
+| `examples/08_inherit_props/` | 3-level inheritance (TAnimal -> TMammal -> TDog) + Pascal `property` (field-backed / read-only / getter-setter). Surfaced the variable-length class-header bug (gotcha #26); confirmed properties are invisible to CodeView. |
+| `test/fixtures/` | Committed .exe/.rsm/.map sample inputs (hello, two_units, primitives, records). |
 | `spike/` | History of the de-risking spikes. Not compiled. See `spike/README.md`. |
 | `scripts/install-deps.ps1` | One-time installer for MSYS2 + LLVM. |
 | `scripts/delphi-debug.ps1` | Convenience PowerShell wrapper; superseded by vscode-ext for interactive use. |
@@ -479,6 +484,45 @@ update this section first and explain why in the commit message.
     `[Self+0x10..]` and need TPI struct synth for auto-deref
     (Step 12).
 
+27. **Class-header layout is VARIABLE-LENGTH between fixtures.**
+    The RSM "vtable size info" block between `47 00 10 00 00
+    <own_hash u16>` and the base-class slot grows by one or more
+    bytes when a class declares additional methods -- in
+    particular Pascal `property` declarations that synthesize
+    getter / setter procedures (08_inherit_props's TDog has 4
+    methods including GetBarkCount / SetBarkCount versus 07_records
+    TCircle's 2 methods, and the intermediate block is 10 vs 9
+    bytes).
+
+    The original Phase B.1 detector hard-coded base_hash at
+    `i + 18` from the `47` marker, which silently dropped the
+    inheritance link on any class above 9 bytes of intermediate
+    metadata. Real-world AdvPCB-scale classes hit this constantly.
+
+    Robust detector (since commit 394e12a, src/rsm/rsm_reader.cpp):
+    scan forward up to 80 bytes for the `25 3f 00` field-list
+    anchor, then read base_hash at `fl_at - 10`. The 8-byte tail
+    immediately before the anchor (`00 NN .. fe 00 NN`) is the
+    only invariant -- everything between the header and the
+    base slot flexes with method count.
+
+28. **Pascal `property` declarations don't make it into the PDB.**
+    CodeView has no `LF_PROPERTY` counterpart. What survives the
+    Delphi -> RSM -> CodeView pipeline:
+      - backing FIELDS (LF_MEMBER `fName`, `fBarkCount`, ...);
+      - accessor METHODS (`TDog.GetBarkCount`, `TDog.SetBarkCount`
+        emit normal S_GPROC32 + S_PUB32 entries).
+    What's lost: the property NAMES themselves (`Name`, `BarkCount`,
+    `Breed`). cdb / VS Watch evaluator can't resolve
+    `?? lDog.BarkCount`; users must reach for the backing field
+    (`?? lDog.fBarkCount`) or call the getter directly.
+
+    This is an inherent RSM/Delphi limitation -- not something
+    rsm2pdb can synthesize without parsing the per-unit RTTI from
+    .drc / .sym artifacts or shipping a NatVis script that maps
+    known property names to backing-field accesses. Verified on
+    examples/08_inherit_props.
+
 ---
 
 ## How we maintain `todo.txt` and `rsm-format.txt`
@@ -574,18 +618,29 @@ keep them — they're invaluable for future RSM RE):
 
 ---
 
-*Last updated: 2026-05-28 (evening), after Step 11b PDB-side
-completion. Phases A (RSM RE) + B.1..B.4 (parser) + C (per-unit
-marker accessor) + D (LF_STRUCTURE) + E (LF_CLASS + LF_POINTER
-+ LF_BCLASS) + F (LF_ENUM + LF_ENUMERATE) + F+ (sets via
-LF_BITFIELD) all landed (commits 29ff347 .. 5ad3436). cdb / VS
-on examples/07_records now show records, classes, enums and
-sets field-by-field instead of byte[N]. 67 unit tests green
-plus the AdvPCB-scale probe pass (576 MB RSM, ~3,600 aggregates,
-0 regressions on 04/05/06 fixtures). DWARF parity (phase J)
-still pending -- the DWARF emitter leaves Pascal aggregates on
-the byte[N] DIE fallback. Same machinery unblocks Step 12
-(closure auto-deref) when its time comes.
+*Last updated: 2026-05-28 (late evening), after the 08_inherit_props
+fixture + variable-length class-header fix (commit 394e12a). The
+new fixture exercises 3-level inheritance (TAnimal -> TMammal ->
+TDog) plus Pascal `property` declarations; surfaced a real bug in
+the class-header layout detector that silently dropped LF_BCLASS
+edges whenever the class declared property accessor methods. The
+fix uses a scan-forward strategy anchored on the `25 3f 00`
+field-list marker (gotcha #27). Also confirmed: Pascal `property`
+syntax has no representation in RSM or CodeView -- only backing
+fields + accessor methods survive (gotcha #28).
+
+Step 11b PDB-side complete: phases A (RSM RE) + B.1..B.4 (parser)
++ C (per-unit marker accessor) + D (LF_STRUCTURE) + E (LF_CLASS +
+LF_POINTER + LF_BCLASS) + F (LF_ENUM + LF_ENUMERATE) + F+ (sets
+via LF_BITFIELD) + G (08 fixture + class-header fix). Commits
+29ff347 .. 394e12a. cdb / VS on examples/07_records + 08_inherit_props
+show records, classes, enums, sets, and multi-level inheritance
+field-by-field instead of byte[N]. 67 unit tests green plus the
+AdvPCB-scale probe pass (576 MB RSM, ~3,600 aggregates, 0
+regressions on 04/05/06 fixtures). DWARF parity (phase J) still
+pending -- the DWARF emitter leaves Pascal aggregates on the
+byte[N] DIE fallback. Same machinery unblocks Step 12 (closure
+auto-deref) when its time comes.
 
 Architecture: all Delphi-x64 frame logic in `src/compose/`; PDB
 and DWARF backends both consume `ResolvedFunction` from it (now

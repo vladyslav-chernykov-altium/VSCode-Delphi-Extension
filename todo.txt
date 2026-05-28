@@ -1034,6 +1034,27 @@ green; user-visible payoff lands at D for records and E for classes.
          message; no false positives observed on the fixtures or
          AdvPCB.
 
+[x] G    Class-header layout bug-fix + 08_inherit_props fixture.
+         DONE 2026-05-28 (commit 394e12a). 08 exercises 3-level
+         inheritance (TAnimal -> TMammal -> TDog) and Pascal
+         `property` declarations (field-backed / read-only /
+         getter-setter). Surfaced a real bug in the class-header
+         detector: the intermediate "vtable size info" block is
+         not fixed-length (07's TCircle had 9 bytes, 08's TDog
+         had 10 due to property accessors); the original fixed
+         offset `i + 18` silently dropped TMammal -> TAnimal and
+         TDog -> TMammal LF_BCLASS edges. Fix: scan forward for
+         the `25 3f 00` field-list anchor and read base_hash at
+         fl_at - 10 (the 8-byte tail before the anchor is the
+         only invariant). Documented as gotcha #27 + #28 in
+         CLAUDE.md and in rsm-format.txt's 2026-05-28-later entry.
+
+         Also confirmed: Pascal `property` syntax has no
+         representation in RSM or CodeView. cdb / VS see only
+         the backing fields (LF_MEMBER) and accessor methods
+         (S_GPROC32); the property name itself is invisible.
+         Limitation, not a bug -- documented for future readers.
+
 [ ] J    DWARF parity for D + E + F (DW_TAG_structure_type +
          DW_TAG_class_type + DW_TAG_member + DW_TAG_enumeration_type +
          DW_TAG_enumerator). Same metadata via model::AggregateRef.

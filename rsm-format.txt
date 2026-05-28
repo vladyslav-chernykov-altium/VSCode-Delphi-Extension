@@ -1730,3 +1730,79 @@ AdvPCB.rsm (576 MB real-world build).
 Step 11b is now unblocked. Phase B (parser extension) can proceed
 without speculative branches.
 
+---------------------------------------------------------------------------
+2026-05-28 (later) -- class-header layout is variable-length
+---------------------------------------------------------------------------
+
+Phase A's first pass claimed the class-header intermediate block
+(between `47 00 10 00 00 <own_hash u16>` and the base-class slot)
+was a fixed 11-byte "vtable size info". That held for
+examples/07_records (TShape / TCircle / TBag all have 2 declared
+methods each: Create + Describe / Create + Describe + Create+Free).
+Broke immediately on examples/08_inherit_props, where TDog declares
+the additional property accessors GetBarkCount + SetBarkCount and
+the block grew by 1 byte.
+
+[FACT] Empirical sizes seen so far:
+
+         07_records TShape   (Create + Describe)      9-byte block
+         07_records TCircle  (Create + Describe)      9-byte block
+         07_records TBag     (3 fields, no methods)   9-byte block
+         08 TAnimal          (Create + Describe)      10-byte block
+         08 TMammal          (Create + Describe)      10-byte block
+         08 TDog             (Create + Describe +
+                              GetBarkCount + SetBarkCount)
+                                                      10-byte block
+
+       Sample TMammal class header (from inherit_props.rsm):
+
+         47 00 10 00 00          -- header marker
+         79 1a                   -- own_hash (TMammal)
+         99 07                   -- u16 (vtable count? always small)
+         46 dd 01                -- 3 bytes (unique to fixture)
+         10 cd 1b                -- another 3-byte block
+         00 00                   -- separator
+         33 83                   -- end marker of vtable block
+         71 1a                   -- base_hash (TAnimal)
+         00 40                   -- start of 8-byte tail
+         c9 1b 02 fe 00 04       -- ... rest of tail
+         25 3f 00                -- field-list anchor
+
+       Equivalent TCircle (07_records) is one byte shorter inside
+       the `46 ... 33 83` window. Not yet clear which dimension
+       drives the growth -- possibly bytecount-of-vtable, possibly
+       number of distinct method signatures the linker emitted.
+       For now we don't decode this block; we just walk past it.
+
+[FACT] Robust base_hash location. The ONLY invariant across
+       fixtures is the 8-byte "tail" between the base-class slot
+       and the field-list anchor:
+
+         <base_hash u16> <00 NN .. fe 00 NN> <25 3f 00>
+
+       So: scan forward from `47 00 10 00 00 <own_hash>` (up to
+       ~80 bytes) for `25 3f 00`; base_hash is at fl_at - 10 .. fl_at - 9.
+
+       Implementation lives in src/rsm/rsm_reader.cpp scanAggregateTypes
+       (since commit 394e12a). Verified on:
+         07_records: TCircle.base_hash = TShape ✓ (no change)
+         08_inherit_props:
+             TAnimal.base_hash = 0x0002 (no local match -> no base)
+             TMammal.base_hash = TAnimal ✓
+             TDog.base_hash    = TMammal ✓
+
+       Side-effect: the old fixed-offset version sometimes
+       picked up adjacent RTL hash bytes as a spurious base_hash,
+       which pulled extra RTL aggregates into the PDB TPI
+       (REGSAM, etc.). Those are gone now.
+
+[FACT] Pascal `property` declarations are not represented in RSM
+       at all. The compiler emits getter / setter procedures as
+       normal methods (regular 0x2e records with the property
+       accessor names like GetBarkCount / SetBarkCount), and the
+       backing fields as 0x2c records under the class. The
+       property NAME is purely a source-language artifact and
+       has no debug-info counterpart. cdb / VS surface the
+       methods + fields but not the property -- documented as
+       gotcha #28 in CLAUDE.md.
+
