@@ -453,9 +453,14 @@ int cmdPdb(int argc, char** argv) {
     registerAggr = [&](const rsm2pdb::rsm::AggregateType* a)
             -> std::optional<std::size_t> {
         if (a == nullptr) return std::nullopt;
-        if (a->kind != rsm2pdb::rsm::AggregateKind::Record
-            && a->kind != rsm2pdb::rsm::AggregateKind::PackedRecord) {
-            return std::nullopt;  // Phase E / F territory
+        const bool is_record =
+               a->kind == rsm2pdb::rsm::AggregateKind::Record
+            || a->kind == rsm2pdb::rsm::AggregateKind::PackedRecord;
+        const bool is_class =
+               a->kind == rsm2pdb::rsm::AggregateKind::Class;
+        if (!is_record && !is_class) {
+            // Enums / sets / unknowns -- Phase F territory.
+            return std::nullopt;
         }
         const std::pair<std::uint64_t, std::uint16_t> key{
             a->unit_anchor_offset, a->own_hash};
@@ -463,13 +468,33 @@ int cmdPdb(int argc, char** argv) {
             it != aggr_idx_cache.end()) {
             return it->second;
         }
-        // Reserve slot first so cyclic references (rare in Pascal
-        // records but theoretically possible via TArray<T>) terminate.
+        // For classes, recurse on the base class FIRST so its index
+        // is registered before our own. CodeView LF_BCLASS needs the
+        // base's TypeIndex at emission time, and the writer keys off
+        // the dependency order we lay down here. (Phase B.4 already
+        // proved base_hash points to user-local TypeIndex space when
+        // present.)
+        std::optional<std::size_t> base_idx;
+        if (is_class && a->base_hash != 0) {
+            const rsm2pdb::rsm::AggregateType* base_a =
+                rsm_reader.findAggregateInUnit(a->unit_anchor_offset,
+                                               a->base_hash);
+            if (base_a == nullptr) {
+                base_a = rsm_reader.findAggregateByHash(a->base_hash);
+            }
+            base_idx = registerAggr(base_a);
+        }
+        // Reserve slot. Children we register (composite-typed fields)
+        // will register themselves recursively below.
         const auto idx = inputs.aggregates.size();
         aggr_idx_cache[key] = idx;
         rsm2pdb::pdb::AggregateRecord rec;
+        rec.kind      = is_class
+                        ? rsm2pdb::pdb::AggregateKind::Class
+                        : rsm2pdb::pdb::AggregateKind::Record;
         rec.name      = a->name;
         rec.byte_size = a->total_size;
+        rec.base      = base_idx;
         rec.fields.reserve(a->fields.size());
         for (const auto& fe : a->fields) {
             rsm2pdb::pdb::AggregateField f;

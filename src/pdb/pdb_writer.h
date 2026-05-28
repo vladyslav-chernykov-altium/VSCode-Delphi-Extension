@@ -45,14 +45,32 @@ struct AggregateField {
     std::optional<std::size_t>             nested_aggregate;
 };
 
+// Discriminator for AggregateRecord. Records emit as LF_STRUCTURE
+// and are referenced by value; classes emit as LF_CLASS and are
+// referenced via a synthesised LF_POINTER-to-class (Pascal class
+// instances live on the heap, so a variable of class type is an
+// 8-byte pointer). Enums / sets are out of scope for Phase D + E;
+// they take Phase F's LF_ENUM path.
+enum class AggregateKind : std::uint8_t {
+    Record,
+    Class,
+};
+
 // A user-declared record / class. PDB writer emits one LF_STRUCTURE
-// (CLASS_FLAGS plain record for now -- class/enum lifting comes in
-// Phase E / F) per entry. Variable / public symbols reference it by
-// index via `aggregate_index`.
+// (records) or LF_CLASS + LF_POINTER (classes) per entry. Variable
+// / public symbols reference it by index via `aggregate_index`; the
+// writer dispatches to value-vs-pointer based on `kind`.
 struct AggregateRecord {
+    AggregateKind kind = AggregateKind::Record;
     std::string   name;
     std::uint32_t byte_size = 0;
     std::vector<AggregateField> fields;
+    // Index into PdbInputs::aggregates of the immediate base class
+    // (Phase E inheritance). Only meaningful when kind == Class;
+    // nullopt for records and for classes whose only base is the
+    // implicit System.TObject (which lives in a unit we don't decode
+    // and so has no entry in PdbInputs::aggregates).
+    std::optional<std::size_t> base;
 };
 
 // A CodeView public symbol. `segment` is the 1-based PE section index

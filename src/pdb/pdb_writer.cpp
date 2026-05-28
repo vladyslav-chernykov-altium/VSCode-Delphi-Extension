@@ -207,48 +207,73 @@ bool writePdb(const std::string& path,
         }
         return typeForSize(v.byte_size);
     };
-    // -- LF_FIELDLIST + LF_STRUCTURE for every user aggregate ---------
+    // -- LF_FIELDLIST + LF_STRUCTURE / LF_CLASS + LF_POINTER ----------
     //
-    // Phase D scope: we emit a CodeView Struct (kind = TpiV80
-    // Structure) for each record in PdbInputs::aggregates. Locals /
-    // publics carrying `aggregate_index` then route through the
-    // resulting TypeIndex instead of falling back to byte[N], so
-    // cdb's `dt` shows the variable field-by-field.
+    // Phase D + E: emit a TPI record for every user aggregate.
     //
-    // Two-pass emission to satisfy CodeView's "referenced types
-    // must come before referrers" rule (the AppendingTypeTableBuilder
-    // doesn't sort): first pass emits a placeholder LF_STRUCTURE for
-    // every aggregate so its TypeIndex is reservable for nested
-    // refs; second pass walks fields, builds the LF_FIELDLIST, and
-    // emits the final LF_STRUCTURE that references it.
+    //   Record (TPoint, TPerson, TBox, TPacked, TBig, ...)
+    //     LF_FIELDLIST -- one LF_MEMBER per field.
+    //     LF_STRUCTURE -- references the field list.
+    //     A variable of this type references the LF_STRUCTURE
+    //     directly (records are value types in Pascal).
     //
-    // For Phase D we just do a single pass -- nested refs are
-    // backward (TBox declared AFTER TPoint in source order), and
-    // cli_cmd_pdb's registrar walks composite refs depth-first so
-    // children are registered before their containers. If a future
-    // fixture introduces a true forward ref (mutual record refs
-    // through pointers) we'd switch to the two-pass scheme.
-    std::vector<codeview::TypeIndex> aggregate_ti;
-    aggregate_ti.reserve(inputs.aggregates.size());
-    // Resolve a field's TypeIndex. Done before we know if all later
-    // aggregates have been emitted -- the registrar enforces forward
-    // safety today; nullopt nested_aggregate falls back to UCHAR.
+    //   Class (TShape, TCircle, TBag, ...)
+    //     LF_FIELDLIST -- optional LF_BCLASS first, then LF_MEMBERs.
+    //     LF_CLASS     -- references the field list.
+    //     LF_POINTER   -- 8-byte Near64 pointer to LF_CLASS.
+    //     A variable of this type references the LF_POINTER (Pascal
+    //     class instances live on the heap; `var X: TShape` is a
+    //     pointer slot, not an inline structure).
+    //
+    // We keep two parallel TypeIndex vectors:
+    //   aggregate_inner_ti -- the LF_STRUCTURE / LF_CLASS itself,
+    //                         used for LF_BCLASS base references
+    //                         and LF_MEMBER nested-record fields.
+    //   aggregate_var_ti   -- what variables / globals reference:
+    //                         records  == aggregate_inner_ti
+    //                         classes  == LF_POINTER -> inner_ti
+    //
+    // Single-pass emission is correct for Phase D + E because the
+    // cli_cmd_pdb registrar walks composite refs AND class bases
+    // depth-first, so dependents (base classes, nested records) are
+    // always registered before their containers / derived classes.
+    std::vector<codeview::TypeIndex> aggregate_inner_ti;
+    std::vector<codeview::TypeIndex> aggregate_var_ti;
+    aggregate_inner_ti.reserve(inputs.aggregates.size());
+    aggregate_var_ti.reserve(inputs.aggregates.size());
+
+    // Resolve a field's TypeIndex.
     auto fieldTypeIndex =
         [&](const AggregateField& f) -> codeview::TypeIndex {
             if (f.nested_aggregate) {
                 const auto idx = *f.nested_aggregate;
-                if (idx < aggregate_ti.size()) return aggregate_ti[idx];
-                // Forward ref not supported in Phase D; fall back
-                // to UCHAR-sized hex rather than emitting an invalid
-                // TypeIndex (would crash the debugger).
+                if (idx < aggregate_var_ti.size()) return aggregate_var_ti[idx];
+                // Forward ref not supported; fall back to UCHAR to
+                // avoid an invalid TypeIndex landing in the debugger.
                 return codeview::TypeIndex::UnsignedCharacter();
             }
             return typeForKindParts(
                 f.byte_size != 0 ? f.byte_size : 4u, f.prim_kind);
         };
+
     for (const auto& a : inputs.aggregates) {
+        const bool is_class = (a.kind == AggregateKind::Class);
+
         codeview::ContinuationRecordBuilder crb;
         crb.begin(codeview::ContinuationRecordKind::FieldList);
+        std::uint16_t member_count = 0;
+        // LF_BCLASS for class with explicit base (Phase E
+        // inheritance). The base lives at field-list position 0; its
+        // TypeIndex must be the LF_CLASS, not the pointer wrapper.
+        if (is_class && a.base
+            && *a.base < aggregate_inner_ti.size()) {
+            codeview::BaseClassRecord bcr(
+                codeview::MemberAccess::Public,
+                aggregate_inner_ti[*a.base],
+                /*offset=*/ 0);
+            crb.writeMemberType(bcr);
+            ++member_count;
+        }
         for (const auto& f : a.fields) {
             codeview::DataMemberRecord dmr(
                 codeview::MemberAccess::Public,
@@ -256,19 +281,37 @@ bool writePdb(const std::string& path,
                 f.byte_offset,
                 f.name);
             crb.writeMemberType(dmr);
+            ++member_count;
         }
         const auto field_list_ti = tpi_table.insertRecord(crb);
         codeview::ClassRecord cr(
-            codeview::TypeRecordKind::Struct,
-            static_cast<std::uint16_t>(a.fields.size()),
+            is_class ? codeview::TypeRecordKind::Class
+                     : codeview::TypeRecordKind::Struct,
+            member_count,
             codeview::ClassOptions::None,
             field_list_ti,
-            codeview::TypeIndex::None(),   // no derivation list
-            codeview::TypeIndex::None(),   // no vshape (records)
+            codeview::TypeIndex::None(),
+            codeview::TypeIndex::None(),
             a.byte_size,
             a.name,
-            std::string{});                // empty unique-name
-        aggregate_ti.push_back(tpi_table.writeLeafType(cr));
+            std::string{});
+        const auto inner_ti = tpi_table.writeLeafType(cr);
+        aggregate_inner_ti.push_back(inner_ti);
+
+        if (is_class) {
+            // Wrap in an 8-byte Near64 LF_POINTER. Variables of class
+            // type are pointers; the pointer is what S_REGREL32 /
+            // S_GDATA32 ultimately reference.
+            codeview::PointerRecord pr(
+                inner_ti,
+                codeview::PointerKind::Near64,
+                codeview::PointerMode::Pointer,
+                codeview::PointerOptions::None,
+                /*size=*/ 8);
+            aggregate_var_ti.push_back(tpi_table.writeLeafType(pr));
+        } else {
+            aggregate_var_ti.push_back(inner_ti);
+        }
     }
 
     // Route a (byte_size, prim_kind, optional aggregate_index) tuple
@@ -278,8 +321,8 @@ bool writePdb(const std::string& path,
             const std::optional<model::PrimitiveKind>& prim_kind,
             const std::optional<std::size_t>& aggregate_index)
             -> codeview::TypeIndex {
-            if (aggregate_index && *aggregate_index < aggregate_ti.size()) {
-                return aggregate_ti[*aggregate_index];
+            if (aggregate_index && *aggregate_index < aggregate_var_ti.size()) {
+                return aggregate_var_ti[*aggregate_index];
             }
             return typeForKindParts(byte_size, prim_kind);
         };
