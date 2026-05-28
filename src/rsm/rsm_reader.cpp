@@ -1008,6 +1008,18 @@ bool Reader::open(const std::string& path) {
     }
     std::sort(unit_anchor_offsets_.begin(), unit_anchor_offsets_.end());
 
+    // Mirror the per-unit primary type-table name list into a
+    // member map keyed by anchor offset. decorateTypes() consults it
+    // when resolving a field's primitive_marker to a Pascal type
+    // name.
+    primary_table_by_anchor_.clear();
+    for (std::size_t k = 0; k < unit_anchors.size(); ++k) {
+        if (k >= primary_tables.size()) break;
+        const auto& tt = primary_tables[k];
+        if (tt.names.empty()) continue;
+        primary_table_by_anchor_[unit_anchors[k].file_offset] = tt.names;
+    }
+
     // -- Aggregate types (Step 11b Phase B.1) -------------------------
     //
     // Walk the metadata stream collecting 0x2a / 0x2c / 0x25 records
@@ -1443,6 +1455,17 @@ std::uint64_t Reader::unitAnchorFor(std::uint64_t file_offset) const {
     return *(it - 1);
 }
 
+const std::string* Reader::primitiveNameForMarker(
+        std::uint64_t unit_anchor_offset, std::uint8_t marker) const {
+    if (unit_anchor_offset == 0) return nullptr;
+    if (marker == 0 || (marker & 0x01) != 0) return nullptr;
+    auto it = primary_table_by_anchor_.find(unit_anchor_offset);
+    if (it == primary_table_by_anchor_.end()) return nullptr;
+    const auto idx = static_cast<std::size_t>(marker) / 2;
+    if (idx == 0 || idx > it->second.size()) return nullptr;
+    return &it->second[idx - 1];
+}
+
 void Reader::dump(std::FILE* out) const {
     std::fprintf(out, "RSM file: %s\n", path_.c_str());
     std::fprintf(out, "Header:\n");
@@ -1684,6 +1707,9 @@ void decorateTypes(const Reader& reader, model::Module& mod) {
         }
 
         // Non-primitive variables: byte[N] fallback sized by next-gap.
+        // The aggregate-aware path lives in the PDB pipeline directly
+        // (Phase D); the DWARF emitter still needs its array-of-byte
+        // fallback here until Phase J takes it over.
         for (auto* s : non_primitives) {
             const auto next = nextHigher(s->address);
             std::uint64_t n = (next > s->address) ? (next - s->address) : 1;
@@ -1724,7 +1750,9 @@ void decorateTypes(const Reader& reader, model::Module& mod) {
                 // Records / classes / enums: byte[N] fallback. We don't
                 // know N for params/locals at this stage -- default to
                 // a sensible 8 bytes which fits TPoint and most small
-                // records. Refine later when we decode aggregate types.
+                // records. PDB pipeline (Phase D) has its own struct
+                // synth that goes via PdbInputs::aggregates; DWARF
+                // will gain it in Phase J.
                 return byteArrayOfSize(8);
             }
         };

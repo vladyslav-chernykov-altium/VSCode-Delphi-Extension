@@ -263,6 +263,15 @@ public:
     // own unit.
     std::uint64_t unitAnchorFor(std::uint64_t file_offset) const;
 
+    // Look up the Pascal type name a per-unit primitive marker
+    // resolves to. Used by aggregate-field decoration: a field's
+    // primitive_marker is a position in its enclosing unit's
+    // 0x66 type-table run. Returns nullptr if either the unit
+    // anchor or the marker is unknown.
+    const std::string* primitiveNameForMarker(
+        std::uint64_t unit_anchor_offset,
+        std::uint8_t marker) const;
+
     void dump(std::FILE* out) const;
 
 private:
@@ -308,6 +317,12 @@ private:
     // primary-type-table scan but kept as a member here so the
     // aggregate parser + downstream callers can both use it.
     std::vector<std::uint64_t>                     unit_anchor_offsets_;
+    // Per-unit primary type-table name list, keyed by the unit's
+    // anchor offset. Position N within the list is the Pascal type
+    // name for marker = 2 * (N+1). Used by aggregate-field decoration
+    // to resolve a field's primitive_marker to a CodeView TypeKind.
+    std::unordered_map<std::uint64_t,
+                       std::vector<std::string>>   primary_table_by_anchor_;
 };
 
 // Decorate a populated model::Module with type information derived
