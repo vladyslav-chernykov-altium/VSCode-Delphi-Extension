@@ -941,7 +941,7 @@ delivered together. Remaining sub-milestones below are deferred.
          `wchar_t * "..."` in cdb;
          AnsiString/UTF8String/PAnsiChar as `char * "..."`.
          ShortString stays on byte[N] (it's inline length-prefixed,
-         not a managed pointer). See gotcha #25 in CLAUDE.md.
+         not a managed pointer). See gotcha #25 (docs/06-gotchas.md).
 
          Still deferred: full records / enums / classes (TPI struct
          synthesis). Tracked as Step 11b roadmap below.

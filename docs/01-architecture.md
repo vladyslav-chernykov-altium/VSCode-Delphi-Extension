@@ -300,7 +300,7 @@ Keybindings: `Ctrl+B` (Make), `Ctrl+Shift+B` (Rebuild), `Ctrl+F9`
   generated unit-init code falls outside the line-derived address
   range; without absorbing function-symbol addresses too, gdb
   returns "no source" for those addresses. This was a real-world
-  bug observed on Altium AdvPCB (see CLAUDE.md gotcha #12).
+  bug observed on Altium AdvPCB (see docs/06-gotchas.md #12).
 - **Pascal-mode case-insensitive lookup via `-gdb-set case-sensitive
   off`** is set up at session start by the vscode-ext. Without this,
   typing `gd` in the Watch panel fails to find `gD`. gdb's Pascal

@@ -1804,7 +1804,7 @@ the block grew by 1 byte.
        property NAME is purely a source-language artifact and
        has no debug-info counterpart. cdb / VS surface the
        methods + fields but not the property -- documented as
-       gotcha #28 in CLAUDE.md.
+       gotcha #28 (docs/06-gotchas.md).
 
 ---------------------------------------------------------------------------
 2026-05-28 (night) -- cross-unit type-reference encoding
