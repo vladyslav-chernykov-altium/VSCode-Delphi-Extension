@@ -2321,3 +2321,136 @@ parked.
     Reactivation criteria (unchanged): real-project request +
     dedicated RE budget. The findings in this entry + the previous
     Tier 2 park entry give the next investigator a head start.
+
+---------------------------------------------------------------------------
+2026-05-29 (cross-unit local typing -- BRIDGE CRACKED via differential RE)
+---------------------------------------------------------------------------
+
+RESOLVES the two PARKED entries above ("Tier 2 / cross-unit local
+typing" + "Tier 2.1 attempt"). The slot-id -> type mapping is now
+fully understood. Cracked by a DIFFERENTIAL experiment: added a 5th
+unit Extra.pas (class TExtra) to examples/09_cross_unit, declared two
+locals lExtra/lExtra2 of it in ProbeAll, rebuilt, diffed the RSM.
+
+NOTE on offsets: examples/09 was rebuilt during this session (Tier 2
++ the Extra unit), so the absolute offsets in the two PARKED entries
+above are STALE. All offsets below are from the post-Extra build
+(EOF = 3529982). The OLD trailer-table @3516606 is now all-zero; the
+live master slot table moved to @3522817.
+
+[FACT] inline_type_id of a composite local is the local's SLOT-ID,
+    read as the 2-byte value at the sub-record's marker position:
+        20 <len> <name> 66 00 00 <slot_id u16 LE> <flag u8>
+    ProbeAll's locals (post-Extra build):
+        lPoint   slot=0x064d   flag=0xf0
+        lSize    slot=0x0651   flag=0xe0
+        lColor   slot=0x0655   flag=0xde
+        lItem    slot=0x0659   flag=0xc0
+        lLayout  slot=0x065d   flag=0xb0
+        lExtra   slot=0x0661   flag=0xa0
+        lExtra2  slot=0x0661   flag=0x90      <-- SAME slot as lExtra
+
+[FACT] The slot-id is PER-TYPE-PER-PROCEDURE, not per-occurrence.
+    lExtra and lExtra2 are both TExtra and share slot 0x0661; they
+    differ ONLY in the trailing flag byte (0xa0 vs 0x90). So the
+    flag byte is the per-occurrence / stack discriminator (it
+    decreases per local), and the slot-id identifies the TYPE.
+    This is THE key fact the earlier parks missed -- they assumed
+    one id per variable.
+
+[FACT] The slot-id linearly indexes the unit's own 0x66 IMPORT
+    BLOCK (the contiguous run of `66 <len> <name> <hash4 u32 LE>`
+    entries, interleaved with 0x67 method refs, that lists every
+    type the unit can see -- RTL + its `uses` types):
+
+        slot_id = base_unit + 4 * position_in_import_block
+
+    where position_in_import_block = the entry's index counted over
+    ALL 0x66 entries from the file start (the global 0x66 index,
+    "gidx"), and base_unit is a per-unit constant.
+
+    Verified across the WHOLE cross_unit import block (gidx
+    727..1293, 567 entries), C = base - 4*gidx_start = -1887:
+        gidx 727  {System}TArray<...TLangRec>  slot 0x03fd  (base)
+        gidx 875  TPoint                        slot 0x064d
+        gidx 876  TSize                         slot 0x0651
+        gidx 877  TColor                        slot 0x0655
+        gidx 878  TItem                         slot 0x0659
+        gidx 879  TLayout                       slot 0x065d
+        gidx 880  TExtra                        slot 0x0661   <-- new
+    The 6 user types sit CONSECUTIVELY at the tail of the block
+    (gidx 875..880), so their slots step +4 in declaration order.
+    Adding TExtra appended exactly one entry (gidx 880 -> 0x0661)
+    without shifting the others.
+
+[FACT] The bridge therefore is:
+        local.slot_id
+          -> position = (slot_id - base_unit) / 4
+          -> unit_import_block[position] -> (name, hash4)
+          -> findAggregateByHash(hash4) / hash4-low16 == own_hash
+          -> AggregateType (TItem / TLayout / TExtra / ...)
+    hash4 -> aggregate already works (gotcha #35: hash4 is the
+    universal per-type id, low 16 bits == own_hash in declaring
+    unit). The missing piece was ONLY slot_id -> hash4.
+
+[DISPROVEN] base_unit is NOT global (no single C for the file).
+    TPoint appears in the 0x66 table at gidx {136,460,468,875,902}
+    (once per importing unit). cross_unit uses gidx 875 (C=-1887).
+    A global C would give Items' TPoint (gidx 460) slot
+    4*460-1887 = -47 (impossible). So each unit numbers its own
+    import block; base_unit differs per unit.
+
+[FACT] Master slot table (the OLD "trailer table"), now @3522817:
+    contiguous 4-byte entries `<slot_id u16 LE> <kind u8> 0x0f`,
+    slot-ids ASCENDING +4 (1561/1578 steps are exactly +4; 17
+    jumps). kinds: 0x10 x1567, 0x20 x10, 0x30 x2. This is the
+    global, slot-sorted master list of ALL slot-ids in the program.
+    It carries NO hash4/name, so it cannot map slot->type on its
+    own. It is NOT 1:1 with the 0x66 table by position
+    (master[259]=0x0661 but 0x66[259]=Pointer; the two tables are
+    different orderings -- master is slot-sorted, 0x66 is gidx /
+    unit-declaration order).
+
+[DISPROVEN] base_unit is NOT recoverable from the master table's
+    structure: 0x03fd (cross_unit's base) sits at master pos 128 in
+    the middle of a clean +4 run (...3f5,3f9,3fd,401,405...); the
+    kind!=0x10 markers and the +4 jumps do NOT line up with unit
+    boundaries. base_unit is also NOT stored adjacent to the import
+    block start (no `fd 03` near @3472017). The linker almost
+    certainly computes base_unit as a cumulative type-count carried
+    in the .dcu, which RSM does not expose directly.
+
+[METHOD] Proposed robust implementation -- self-calibrate base_unit
+    per unit, no magic constant, no .dcu needed:
+      1. Parse each unit's 0x66 import block in order -> list of
+         (name, hash4, gidx). Flag entries whose hash4 resolves to
+         a known AggregateType.
+      2. Collect the slot-ids referenced by that unit's cross-unit
+         (unresolved) locals/params.
+      3. Solve for the single base_unit such that EVERY referenced
+         slot maps (pos=(slot-base)/4) onto an aggregate entry.
+         Aggregates are sparse in the import block, so the
+         alignment is over-determined and unique.
+      4. Optional cross-check: compose's sniffed byte_size for the
+         local (class -> 8-byte pointer, record -> record size)
+         must agree with the resolved aggregate's kind/size.
+    With cross_unit's 6 locals the alignment is heavily
+    over-determined -> robust. Implementation site:
+    Reader::resolveAggregateTypes (rsm_aggregates.cpp resolveAggrFor),
+    which currently does findAggregateInUnit(ua,inline_type_id)
+    then findAggregateByHash(inline_type_id) -- both wrong for the
+    cross-unit slot-id case (the latter hits RTL collisions like
+    TDisposeRec).
+
+[QUESTION] Where, if anywhere, does RSM store base_unit explicitly?
+    Not found in this round (master table, import-block neighbours,
+    uses-list all checked). If a future round locates it, the
+    self-calibration step 3 can be replaced by a direct read. The
+    uses-list before ProbeAll carried unit-ids (Shapes=0x06d9,
+    Items=0x06f5, Layout=0x0711) -- a different id space from the
+    type slot-ids; relationship to base_unit unknown.
+
+[FIXTURE] examples/09_cross_unit now has a 5th unit Extra.pas
+    (class TExtra, distinctive field fMagicTag) + locals
+    lExtra/lExtra2 in ProbeAll, kept as the differential control
+    for this mechanism. cross_unit.dproj gained the DCCReference.

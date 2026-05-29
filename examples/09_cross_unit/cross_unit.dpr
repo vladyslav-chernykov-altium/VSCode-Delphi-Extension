@@ -40,7 +40,8 @@ uses
   System.SysUtils,
   Shapes   in 'Shapes.pas',
   Items    in 'Items.pas',
-  Layout   in 'Layout.pas';
+  Layout   in 'Layout.pas',
+  Extra    in 'Extra.pas';
 
 procedure SetBreakHere;
 begin
@@ -54,6 +55,8 @@ var
   lColor:  TColor;
   lItem:   TItem;
   lLayout: TLayout;
+  lExtra:  TExtra;
+  lExtra2: TExtra;
 begin
   lPoint.X := 11;
   lPoint.Y := 22;
@@ -70,6 +73,10 @@ begin
   lLayout := TLayout.Create(lPoint, lItem);
   lLayout.ItemCount := 7;
 
+  lExtra  := TExtra.Create(101, 'alpha');
+  lExtra2 := TExtra.Create(202, 'beta');
+  lExtra.MagicTag := 999;
+
   // Exercise every property read so the compiler keeps the
   // accessors and the property record itself in RSM. NatVis
   // emission for properties depends on these surviving the
@@ -82,12 +89,16 @@ begin
           ' lead-name="', lLayout.LeadName,
           '" lead-tag=', lLayout.LeadItem.Tag,
           ' count=', lLayout.ItemCount,
-          ' origin.x=', lLayout.Origin.X);
+          ' origin.x=', lLayout.Origin.X,
+          ' extra=', lExtra.MagicTag, '/', lExtra.Lbl,
+          ' extra2=', lExtra2.MagicTag, '/', lExtra2.Lbl);
   SetBreakHere;
   Writeln('done');
 
   lItem.Free;
   lLayout.Free;
+  lExtra.Free;
+  lExtra2.Free;
 end;
 
 begin

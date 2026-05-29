@@ -55,6 +55,7 @@
         <DCCReference Include="Shapes.pas"/>
         <DCCReference Include="Items.pas"/>
         <DCCReference Include="Layout.pas"/>
+        <DCCReference Include="Extra.pas"/>
         <BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
         <BuildConfiguration Include="Debug">
             <Key>Cfg_2</Key>

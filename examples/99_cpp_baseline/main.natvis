@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+  <Type Name="TAnimal">
+    <DisplayString>BASELINE_TAnimal_NATVIS_ACTIVE</DisplayString>
+    <Expand>
+      <Item Name="fAge">fAge</Item>
+    </Expand>
+  </Type>
+  <Type Name="TMammal">
+    <DisplayString>BASELINE_TMammal_NATVIS_ACTIVE</DisplayString>
+    <Expand>
+      <ExpandedItem>(TAnimal*)this</ExpandedItem>
+      <Item Name="fFurLen">fFurLen</Item>
+    </Expand>
+  </Type>
+  <Type Name="TDog">
+    <DisplayString>BASELINE_TDog_NATVIS_ACTIVE</DisplayString>
+    <Expand>
+      <ExpandedItem>(TMammal*)this</ExpandedItem>
+      <Item Name="fBarkCount">fBarkCount</Item>
+      <Item Name="GetBarkCount()">GetBarkCount()</Item>
+    </Expand>
+  </Type>
+</AutoVisualizer>
