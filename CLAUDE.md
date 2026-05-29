@@ -119,6 +119,94 @@ body. `git log --oneline` for the recent history.
 
 ---
 
+## Frugality directives (STRONG — review before any refactor / build / text-manip phase)
+
+Locked in by the 2026-05-29 retro after two back-to-back monster-
+function refactors (`rsm/` + `pdb/`). Each item maps to a specific
+recurring waste pattern that was observed compounding across the
+session. Treat this section as a checklist, not optional reading --
+glance it before entering any refactor / multi-step build / bulk
+text-manipulation phase.
+
+1. **SCAN BEFORE EXTEND.** Before adding a new phase / feature to
+   an existing function or file, run `wc -l` on the target.
+   Function > 150 lines or file > 400 lines -> create a new
+   function / file from the start. Never write
+   `// -- new phase --` inside a 200+-line function "to extract
+   later." Pay the cost now or pay 10x later as a rescue refactor.
+
+2. **THREE STRIKES ON A HEURISTIC.** If a discriminator gets a
+   third condition (`X && Y && Z`) or a third "but on real data
+   we also see..." carve-out, STOP adding clauses. Dump fresh
+   hex from 3-5 real samples, find the actual format invariant,
+   rewrite the discriminator. The Nth condition is technical debt
+   that compounds across releases (see gotchas #17, #29, #31 for
+   what this looks like when ignored).
+
+3. **VERIFY AT MILESTONE BOUNDARIES, NOT EVERY EDIT.** Inside a
+   multi-step refactor, run full build + tests + smoke ONCE per
+   logical milestone (e.g. "all 5 extractions done"), not after
+   each micro-edit. Trust compiler diagnostics for micro-steps;
+   full verification is the exit gate, not the per-step gate.
+   11 build cycles × 30s burned a noticeable chunk of the pdb/
+   refactor.
+
+4. **ONE-LINER HELPERS FOR REPEATED COMMANDS.** The moment a
+   command's boilerplate (vcvars wrapping, cd-into-build chains)
+   appears 3+ times, write a tiny helper script (`build/_b.sh`
+   for build, `build/_t.sh` for test) and use it. Re-typing
+   150-char incantations is pure waste.
+
+5. **ASK ABOUT TOOLING UP-FRONT.** At session start, when you
+   can predict you'll run scripts / heredocs / cmd.exe wrappers,
+   ask the user about broader permission allow-list patterns
+   BEFORE getting blocked mid-flow. One question saves N mid-
+   work interruptions and tool-call retries.
+
+6. **IN-MEMORY OVER TEMP FILES.** When transforming text across
+   multiple Python operations, keep intermediate state in
+   variables, not in `build/*.txt`. Disk temp files only when
+   data must outlive the script (between separate tool calls
+   that can't share state). One Python invocation, one in-memory
+   pipeline.
+
+7. **FORMAT-AS-YOU-EXTRACT.** Run `clang-format` on the affected
+   file IMMEDIATELY after each text-move step. Don't accumulate
+   indent debt and clean up at the end with one giant format
+   pass -- the diff explodes (one 1500-line clang-format diff
+   landed in the pdb commit because of this).
+
+8. **NO SUMMARY TABLES UNLESS REQUESTED.** After a refactor
+   step, report in one sentence: "Step N done, run() now X
+   lines, tests green." Skip the 7-row "what file holds what"
+   tables -- the user sees file sizes with `wc -l`. Context
+   window is a shared resource.
+
+9. **GREP FIRST, READ SECOND.** To find a function / symbol /
+   boundary, use `Grep -n -A/-B/-C`. Only Read when you need
+   >20 contiguous lines or context above an unknown location.
+   Don't Read 100 lines to find a 5-line region grep would
+   pinpoint in one call.
+
+10. **DON'T RE-READ AFTER YOU EDIT.** Edit / Write guarantees
+    the write succeeded (or errors out). The system reminder
+    shows post-edit content if it's noteworthy. Re-reading is
+    double the tokens for zero new info.
+
+11. **DON'T READ SCHEMA DUMPS / ERROR EXPANSIONS.** When a
+    tool returns a 500-line schema in an error message
+    (settings.json validation, etc.), DON'T ingest the full
+    dump. Read 1-2 lines of the actual error and infer the fix.
+    Skim only -- the schema isn't the user's question.
+
+12. **PYTHON FILE I/O: ALWAYS `newline=''`.** Default to
+    `io.open(path, 'r'/'w', encoding='utf-8', newline='')`.
+    Without it, Python silently translates LF <-> CRLF on
+    Windows and breaks EOL conformance in committed code (we
+    hit this once already; not a third time).
+
+---
+
 ## Architecture rules (binding for all future work)
 
 These were locked in by the three-stage refactor on 2026-05-28

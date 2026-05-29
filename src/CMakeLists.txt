@@ -10,6 +10,7 @@ add_library(rsm2pdb_core STATIC
   model/model.cpp
   compose/frame.cpp
   dwarf/dwarf_emitter.cpp
+  dwarf/dwarf_sections.cpp
   pe/pe_injector.cpp
   pe/pe_pdb_injector.cpp
   pdb/pdb_writer.cpp
