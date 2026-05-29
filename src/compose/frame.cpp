@@ -124,8 +124,18 @@ ResolvedFunction resolveFunction(
     // Each callee-saved push between `push rbp` and `sub rsp` lives
     // in the 8-byte slot immediately above the local area, so saved-
     // rbp / return-addr / rcx-shadow all shift up by 8 *
-    // extra_pushes. Locals themselves (which sit at rbp + 0 ..
-    // rbp + sub_rsp) don't move.
+    // extra_pushes. Locals also shift DOWN by 8 * extra_pushes within
+    // the frame: Delphi reserves the top of the sub_rsp area for the
+    // saved callee-saved register(s), and lays out the actual locals
+    // beneath. So the effective local area size is
+    // (sub_rsp - param_shift), and a raw offset -N translates to
+    // rbp + (sub_rsp - param_shift + raw/2). Without this correction
+    // every local in a function with extra pushes (e.g. anything with
+    // try/except, where Delphi pushes rbx) reads from one slot above
+    // its real address. Verified on 08_inherit_props ProbeAll:
+    // push rbp; push rbx; sub rsp, 0x58; mov rbp,rsp ->
+    // extra_pushes=1, sub_rsp=88; lAnimal(raw=-16) real at rbp+72
+    // (not rbp+80 the old formula gave).
     const std::int32_t param_shift =
         8 * static_cast<std::int32_t>(out.extra_pushes);
     const auto sniffed = pe::sniffStackVarSizes(code, code_len);
@@ -168,7 +178,7 @@ ResolvedFunction resolveFunction(
         ResolvedVar rv;
         rv.name     = l.name;
         rv.is_param = false;
-        rv.rbp_offset = out.sub_rsp + (l.stack_offset / 2);
+        rv.rbp_offset = out.sub_rsp - param_shift + (l.stack_offset / 2);
         rv.byte_size = resolveSize(l, rv.rbp_offset,
                                    marker_sizes, sniffed);
         applyPascalType(rv, l);

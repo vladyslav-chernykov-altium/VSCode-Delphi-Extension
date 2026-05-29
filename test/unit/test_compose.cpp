@@ -79,9 +79,13 @@ TEST_CASE("compose::resolveFunction: simple prologue locals (GlobalProc2)") {
     CHECK(rf.vars[3].rbp_offset == 0x28);   // sub_rsp - 8
 }
 
-TEST_CASE("compose::resolveFunction: multi-push shifts params, leaves locals") {
-    // 2 extra pushes (rdi, rsi) -> 16-byte shadow shift for params.
-    // Locals stay at rbp + (sub_rsp + RSM/2).
+TEST_CASE("compose::resolveFunction: multi-push shifts both params and locals") {
+    // 2 extra pushes (rdi, rsi) -> 16-byte shadow shift for params,
+    // 16-byte downward shift for locals. Delphi reserves the top of
+    // the sub_rsp area for the saved callee-saved register(s) when
+    // try/except is in scope, so the effective local area starts
+    // lower and the raw -> real translation needs the -param_shift
+    // correction. Verified empirically on 08_inherit_props.ProbeAll.
     ProcedureRecord proc{};
     proc.name = "MultiPushProc";
     proc.params.push_back(mkVar("p", 32));
@@ -99,8 +103,8 @@ TEST_CASE("compose::resolveFunction: multi-push shifts params, leaves locals") {
     // sub_rsp(0x1C0) + RSM/2(16) + 8*2 (param_shift) = 0x1E0
     CHECK(rf.vars[0].rbp_offset == 0x1E0);
     CHECK(rf.vars[1].name == "l");
-    // sub_rsp(0x1C0) + (-8/2) = 0x1BC -- no shift for locals
-    CHECK(rf.vars[1].rbp_offset == 0x1BC);
+    // sub_rsp(0x1C0) - param_shift(16) + (-8/2) = 0x1AC
+    CHECK(rf.vars[1].rbp_offset == 0x1AC);
 }
 
 TEST_CASE("compose::resolveFunction: Self uses rcx-shadow slot") {
