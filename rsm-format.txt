@@ -1962,3 +1962,111 @@ into the PDB.
 
 
 
+
+
+
+================================================================================
+  2026-05-29 (later) -- 09 `8a 00 00` enum-parent: more failed hypotheses
+================================================================================
+
+Targeted probe round looking for the parent-back-reference inside the
+`25 <nl> <name> 8a 00 00 <entry_id u32> 04 00 00 <ord>` payload + the
+surrounding 0x2a TColor record body. Status: still UNRESOLVED but
+several hypotheses ruled out -- saving the negative results so the
+next investigator doesn't re-walk the same paths.
+
+Setup
+-----
+cross_unit.rsm:
+- TColor (Shapes unit) 0x2a record at 0x34b14d:
+    2a 06 "TColor"  a8 00 00  c6 ca 4a 5e  04  07 76 26 04
+                    ^kind+00  ^hash4 LE   ^?  ^?
+  own_hash = 0xcac6, hash4 = 0x5e4acac6 (LE).
+- 4 enum entries IMMEDIATELY before TColor's 0x2a:
+    @0x34b0eb  25 05 "clRed"    8a 00 00  3f 74 48 f1  04 00 00 00
+    @0x34b0fd  25 07 "clGreen"  8a 00 00  42 74 48 f1  04 00 00 02
+    @0x34b111  25 06 "clBlue"   8a 00 00  45 74 48 f1  04 00 00 04
+    @0x34b124  25 08 "clYellow" 8a 00 00  48 74 48 f1  04 00 00 06
+  entry_id (LE u32):
+    clRed    = 0xf148_743f
+    clGreen  = 0xf148_7442
+    clBlue   = 0xf148_7445
+    clYellow = 0xf148_7448
+  Sequential +3 step on the low byte; shared high 3 bytes
+  `74 48 f1` across the batch.
+
+Disproven
+---------
+[DISPROVEN] Hypothesis: byte at TColor body +7 (= 04) encodes
+    the parent linkage / enumerator count. Reality: TPoint at
+    same byte position has 06, TSize has 08 -- and TPoint/TSize
+    are STRUCTURALLY IDENTICAL records (both 2x Integer).
+    Differing values rule out align/pack/struct-shape encoding.
+    The `04 == 4 enumerators` for TColor is coincidence.
+
+[DISPROVEN] Hypothesis: spatial proximity links entries to
+    the next-following 0x2a record. Reality: the 4 entries are
+    BEFORE TPoint, not before TColor. Order in file (Shapes
+    region):
+        clRed clGreen clBlue clYellow  <-- 0x25 entries
+        TPoint (0x2a)
+        TColor (0x2a)
+        TSize  (0x2a)
+    Entries are NEAR TColor but not adjacent; the intervening
+    TPoint record makes "nearest-following 0x2a is parent" wrong.
+
+[DISPROVEN] Hypothesis: shared `74 48 f1` 3-byte prefix in
+    entries is a back-pointer to TColor's 0x2a record. Pattern
+    occurs 5 times in the file total; 4 are inside the entries
+    themselves, the 5th appears inside an unrelated name-mangled
+    string `clGreenB 74 48 f1 67 0c Finalization...`. It does
+    NOT appear anywhere in TColor's 0x2a body. Likely it's a
+    per-UNIT-bucket id; counting all 8a-entries in cross_unit.rsm
+    gives 8059 entries grouped into 454 distinct 3-byte
+    back-id buckets (largest bucket: 3046 entries) -- so a
+    bucket is shared across many enums, not unique per enum.
+
+Open hypotheses (NOT yet tested)
+--------------------------------
+[GUESS] A. entry_id u32 is a hash of `<unit_name>.<enum_type>.<entry>`
+    or similar -- some compiler-deterministic hash that's
+    reconstructible without an explicit back-pointer. Test
+    plan: in a controlled fixture rebuild Shapes with one more
+    enumerator (clMagenta) and see if existing entry_ids stay
+    stable + new one's id follows the +3 sequence (or +N step).
+
+[GUESS] B. There's a separate "enum directory" / "type-extras"
+    record with an unrecognised tag that we haven't catalogued.
+    It would name the enum + list the entry_ids it owns.
+    Test plan: byte-histogram of the file vs known tags
+    (0x2a/0x2c/0x25/0x47/0x66/0x67/0x63/0x64/...) to find
+    candidate unknown tags appearing in roughly enum-count
+    proportions.
+
+[GUESS] C. The 5-byte tail `07 76 26 04` after TColor's
+    `<byte>` field is a forward-link into a per-unit "enum
+    declaration table" with one entry per declared enum,
+    each carrying the entry_id list. Test plan: search for
+    that exact sequence + neighbouring patterns elsewhere
+    in the file.
+
+[GUESS] D. Linkage lives entirely outside the 0x2a/0x25
+    record stream -- in a per-unit symbol/type table that's
+    parsed separately. Test plan: dump the 0x66 import table
+    for Shapes and look for entries that reference TColor
+    by hash4 (0x5e4acac6) with extra payload.
+
+Decision (2026-05-29)
+---------------------
+PARKED. Not blocking PDB-benefit work. Documented as known
+limit -- TItem.fColor (cross-unit enum field) renders as
+`unsigned` in cdb / VS until linkage is decoded. Records
+(TPoint, TSize) work cross-unit. Same-unit enum fields
+inside Shapes itself NOT tested in 09; if those work,
+indicates linkage IS in some local-only structure (option D).
+
+Reactivation criteria: when AdvPCB or any real project shows
+the same `8a 00 00` style entries en masse AND a user reports
+the missing-enum cross-unit gap. As of this date no AdvPCB
+8a-stat available; gating on real-project data before another
+RE round.
