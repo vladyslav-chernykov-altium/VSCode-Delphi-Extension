@@ -162,6 +162,23 @@ struct EnumEntry {
     std::int64_t ordinal = 0;        // decoded value (e.g. clRed=0, clGreen=1)
 };
 
+// One Pascal `property` declaration attached to a class (or record),
+// parsed from a 0x31 sub-record. CodeView has no representation for
+// properties, but our NatVis sidecar exposes them: for each property
+// we emit an `<Item Name="<PropName>">f<PropName></Item>` (field-
+// backed) or `Get<PropName>()` (method-backed) entry based on the
+// `f`/`Get` naming heuristic over the class's parsed fields + methods.
+//
+// Tier 2.0: name-only. The 0x31 record additionally carries accessor
+// markers pointing at the per-class field/method registry (see
+// rsm-format.txt 2026-05-29 / Tier 2 entry); decoding those is Tier
+// 2.1 work for cases where the naming heuristic fails (e.g. a
+// property whose getter is `MyCustomGetter` rather than `Get<Name>`).
+struct PropertyEntry {
+    std::string  name;               // the property name as declared
+    std::uint8_t type_marker = 0;    // primitive marker / type-table idx
+};
+
 // Kind discriminator for AggregateType. See classify() in
 // rsm_reader.cpp for the inference rules (we don't trust the 0x2a
 // record's `kind` byte alone -- field-storage and entry presence
@@ -186,6 +203,7 @@ struct AggregateType {
     AggregateKind           kind = AggregateKind::Unknown;
     std::vector<FieldEntry> fields;          // records / classes
     std::vector<EnumEntry>  enum_entries;    // enums only
+    std::vector<PropertyEntry> properties;   // classes/records (Tier 2)
     std::uint16_t           base_hash = 0;   // classes only: parent's own_hash
     // Secondary hash carried by 0x2a records whose kind byte has
     // bit 0x80 set (AdvPCB-style large-project classes -- the type

@@ -261,6 +261,13 @@ Context::registerAggr(const rsm2pdb::rsm::AggregateType *a) {
     }
     rec.fields.push_back(std::move(f));
   }
+  // Tier 2: copy parsed Pascal property names through to the PDB
+  // aggregate record. The NatVis emitter consumes them; the PDB
+  // itself ignores them entirely (CodeView has no representation).
+  rec.property_names.reserve(a->properties.size());
+  for (const auto& pe : a->properties) {
+    rec.property_names.push_back(pe.name);
+  }
   inputs.aggregates.push_back(std::move(rec));
   const auto idx = inputs.aggregates.size() - 1;
   aggr_idx_cache[key] = idx;

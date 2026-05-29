@@ -32,6 +32,29 @@ bool shouldEmitMethodAsGetter(const rsm2pdb::pdb::AggregateMethod& m) {
   return true;
 }
 
+// Tier 2 heuristic: for a Pascal property named `PropName` declared
+// inside class `cls`, return the expression NatVis should use to
+// surface it in Watch -- the backing field expression if one matches
+// the `f<PropName>` convention, otherwise the parameterless getter
+// `Get<PropName>()` if the class has a matching method, otherwise
+// empty (caller skips emission).
+std::string resolvePropertyExpr(const rsm2pdb::pdb::AggregateRecord& cls,
+                                const std::string& prop_name) {
+  // Field-backed: `property X read fX [write fX]`.
+  const std::string field_name = "f" + prop_name;
+  for (const auto& f : cls.fields) {
+    if (f.name == field_name) return field_name;
+  }
+  // Method-backed getter: `property X read GetX`.
+  const std::string getter_name = "Get" + prop_name;
+  for (const auto& m : cls.methods) {
+    if (m.name == getter_name) return getter_name + "()";
+  }
+  // No conventional accessor; skip (Tier 2.1 will resolve via
+  // accessor markers when this proves limiting).
+  return std::string{};
+}
+
 } // namespace
 
 std::string buildNatVisXml(const rsm2pdb::pdb::PdbInputs& inputs) {
@@ -63,6 +86,17 @@ std::string buildNatVisXml(const rsm2pdb::pdb::PdbInputs& inputs) {
       if (!shouldEmitMethodAsGetter(m)) continue;
       f << "      <Item Name=\"" << xmlEscape(m.name) << "()\">"
         << xmlEscape(m.name) << "()</Item>\n";
+    }
+    // Tier 2: Pascal `property` declarations. Routed through the
+    // naming heuristic in resolvePropertyExpr (field-backed `fX` or
+    // method-backed `GetX()`). Property name in the Watch UI keeps
+    // its Pascal spelling (no `f` / `Get` prefix); the expression
+    // accessed is whichever convention exists on this class.
+    for (const auto& prop_name : a.property_names) {
+      const std::string expr = resolvePropertyExpr(a, prop_name);
+      if (expr.empty()) continue;
+      f << "      <Item Name=\"" << xmlEscape(prop_name) << "\">"
+        << xmlEscape(expr) << "</Item>\n";
     }
 
     f << "    </Expand>\n";

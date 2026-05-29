@@ -62,11 +62,27 @@ begin
   lColor := clGreen;
 
   lItem := TItem.Create('first', lPoint, lSize, lColor);
-  lItem.Tag := 42;
+  lItem.Tag  := 42;
+  lItem.Tag2 := -5;   // SetTag clamps to 0
+  lItem.Pos  := lPoint;
+  lItem.Color := clBlue;
 
   lLayout := TLayout.Create(lPoint, lItem);
+  lLayout.ItemCount := 7;
 
-  Writeln('item="', lItem.Name, '" lead="', lLayout.LeadName, '"');
+  // Exercise every property read so the compiler keeps the
+  // accessors and the property record itself in RSM. NatVis
+  // emission for properties depends on these surviving the
+  // build.
+  Writeln('item="', lItem.Name,
+          '" pos=(', lItem.Pos.X, ',', lItem.Pos.Y,
+          ') tag=', lItem.Tag,
+          ' tag2=', lItem.Tag2,
+          ' desc=', lItem.Description,
+          ' lead-name="', lLayout.LeadName,
+          '" lead-tag=', lLayout.LeadItem.Tag,
+          ' count=', lLayout.ItemCount,
+          ' origin.x=', lLayout.Origin.X);
   SetBreakHere;
   Writeln('done');
 

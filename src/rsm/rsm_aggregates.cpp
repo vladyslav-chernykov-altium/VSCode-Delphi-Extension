@@ -65,6 +65,19 @@ void Reader::scanAggregateTypes(const std::string& buf) {
     };
     std::vector<ClassHeader> class_headers;
 
+    // Pending property records (tag 0x31). Each entry carries the
+    // property name + parent_hash extracted from the record's
+    // trailer (the 2 bytes immediately before `ff`). Same key shape
+    // as pending_fields_by_unit -- properties of a given class
+    // share the same parent_hash as that class's fields. Attached
+    // after the main scan via aggr_by_unit_hash_.
+    // See rsm-format.txt 2026-05-29 / Tier 2 entry.
+    std::map<std::pair<std::uint64_t, std::uint16_t>,
+             std::vector<PropertyEntry>> pending_properties_by_unit;
+    // Fallback for properties we can't tie to a unit anchor.
+    std::unordered_map<std::uint16_t,
+                       std::vector<PropertyEntry>> pending_properties;
+
     auto readU16LE = [&](std::size_t off) -> std::uint16_t {
         return static_cast<std::uint8_t>(buf[off])
              | (static_cast<std::uint8_t>(buf[off + 1]) << 8);
@@ -254,6 +267,70 @@ void Reader::scanAggregateTypes(const std::string& buf) {
         // 2-byte slot at fl_at - 10 (always immediately before
         // the canonical 8-byte tail `00 NN .. fe 00 NN`).
         // See rsm-format.txt 2026-05-28 inheritance entry.
+        // 0x31 -- Pascal property record (Tier 2):
+        //   31 <namelen u8> <name> 00 02 00 <type_marker u8>
+        //      fe 0f 00 00 00 80
+        //      <getter_ref> <setter_ref>          (1 or 2 bytes each
+        //                                          depending on the
+        //                                          RSM format; setter=0
+        //                                          for read-only)
+        //      <tail>                             (4 bytes for primitive
+        //                                          RO, 8 bytes else;
+        //                                          pattern `00 00 00 0f
+        //                                          00 00 00 80`)
+        //      9c 01 <self_marker> 07 00 00 08 <parent u16 LE> ff
+        //   Tier 2.0 captures only the NAME + type_marker + the
+        //   trailer's parent_hash. parent_hash matches the same
+        //   per-class identifier the field records use, so we attach
+        //   properties to their class via aggr_by_unit_hash_.
+        //   Accessor markers themselves are left for Tier 2.1.
+        if (tag == 0x31) {
+            const auto nl = static_cast<std::uint8_t>(buf[i + 1]);
+            if (nl < 1 || nl > 64
+                || i + 2 + nl + 10 > buf.size()) { ++i; continue; }
+            if (!isPrintableName(buf.data() + i + 2, nl)) { ++i; continue; }
+            const std::size_t at = i + 2 + nl;
+            // Anchor on the `00 02 00 <type> fe 0f` signature -- the
+            // strict shape avoids confusing 0x31 with the same byte
+            // appearing elsewhere in unrelated payloads.
+            if (static_cast<std::uint8_t>(buf[at])     != 0x00
+                || static_cast<std::uint8_t>(buf[at + 1]) != 0x02
+                || static_cast<std::uint8_t>(buf[at + 2]) != 0x00
+                || static_cast<std::uint8_t>(buf[at + 4]) != 0xfe
+                || static_cast<std::uint8_t>(buf[at + 5]) != 0x0f) {
+                ++i; continue;
+            }
+            // Scan forward up to ~64 bytes for the ff terminator.
+            // The 2 bytes immediately before ff carry the parent
+            // class's identifier (same hash used by 0x2c fields).
+            std::size_t walk_end = std::min(at + 64, buf.size());
+            std::size_t ff_at = SIZE_MAX;
+            for (std::size_t j = at + 6; j < walk_end; ++j) {
+                if (static_cast<std::uint8_t>(buf[j]) == 0xff) {
+                    ff_at = j;
+                    break;
+                }
+            }
+            if (ff_at == SIZE_MAX || ff_at < at + 8) { ++i; continue; }
+            const std::uint16_t parent = readU16LE(ff_at - 2);
+            PropertyEntry pe;
+            pe.name = std::string(buf.data() + i + 2, nl);
+            pe.type_marker = static_cast<std::uint8_t>(buf[at + 3]);
+            const std::uint64_t pua = unitAnchorFor(
+                static_cast<std::uint64_t>(i));
+            if (pua != 0) {
+                pending_properties_by_unit[{pua, parent}]
+                    .push_back(std::move(pe));
+            } else {
+                pending_properties[parent].push_back(std::move(pe));
+            }
+            // Bisect probe: advance only 1 byte to confirm whether
+            // the wide-jump `i = ff_at + 1` is what's stomping
+            // downstream record parsing.
+            ++i;
+            continue;
+        }
+
         if (tag == 0x47 && i + 24 < buf.size()
             && static_cast<std::uint8_t>(buf[i + 1]) == 0x00
             && static_cast<std::uint8_t>(buf[i + 2]) == 0x10
@@ -556,6 +633,39 @@ void Reader::scanAggregateTypes(const std::string& buf) {
                  "%zu enum entries\n",
                  aggregates_.size(), rec, packed, cls, enm, unk,
                  fields_total, entries_total);
+
+    // Tier 2: attach pending 0x31 property records to their class.
+    // Properties carry the same parent_hash in their trailer as the
+    // matching 0x2c field records, so we attach via the same per-
+    // unit (anchor, hash) index that fields use.
+    std::size_t prop_total = 0, prop_attached = 0;
+    for (auto& [k, v] : pending_properties_by_unit) {
+        prop_total += v.size();
+        auto it = aggr_by_unit_hash_.find(
+            UnitHashKey{k.first, k.second});
+        if (it == aggr_by_unit_hash_.end()) continue;
+        auto& a = aggregates_[it->second];
+        for (auto& pe : v) {
+            a.properties.push_back(std::move(pe));
+            ++prop_attached;
+        }
+    }
+    for (auto& [h, v] : pending_properties) {
+        prop_total += v.size();
+        auto it = aggr_by_hash_.find(h);
+        if (it == aggr_by_hash_.end()) continue;
+        auto& a = aggregates_[it->second];
+        for (auto& pe : v) {
+            a.properties.push_back(std::move(pe));
+            ++prop_attached;
+        }
+    }
+    if (prop_total != 0) {
+        std::fprintf(stderr,
+                     "[rsm] properties: %zu found, %zu attached to a "
+                     "class\n",
+                     prop_total, prop_attached);
+    }
 }
 
 // -- Phase B.2 + B.3: aggregate-based type resolution -------------------

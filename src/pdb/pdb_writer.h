@@ -120,6 +120,15 @@ struct AggregateRecord {
     // meaningful when kind == Class. Triggers forward-decl +
     // complete LF_CLASS pattern in TPI emission.
     std::vector<AggregateMethod> methods;
+    // Pascal `property` names (Tier 2). Parsed from 0x31 records and
+    // attributed to their owning class via cluster proximity (see
+    // rsm-format.txt 2026-05-29 / Tier 2 entry). NatVis emitter
+    // turns each into an `<Item Name="<PropName>">expr</Item>` using
+    // the `f<PropName>` / `Get<PropName>` naming heuristic to pick
+    // the backing expression from `fields` + `methods` above.
+    // CodeView itself has no representation -- the PDB ignores this
+    // vector entirely; only natvis_writer.cpp consumes it.
+    std::vector<std::string> property_names;
     // Index into PdbInputs::aggregates of the immediate base class
     // (Phase E inheritance). Only meaningful when kind == Class;
     // nullopt for records and for classes whose only base is the

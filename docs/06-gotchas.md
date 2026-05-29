@@ -579,20 +579,35 @@ go at the bottom with the next number.
     parented to FLD_PARENT 0x1208 never find their TItem
     aggregate (which has own_hash 0x424c, NAME hash).
 
-37. **Pascal `property` declarations don't make it into the PDB.**
-    CodeView has no `LF_PROPERTY` counterpart. What survives the
-    Delphi -> RSM -> CodeView pipeline:
-      - backing FIELDS (LF_MEMBER `fName`, `fBarkCount`, ...);
-      - accessor METHODS (`TDog.GetBarkCount`, `TDog.SetBarkCount`
-        emit normal S_GPROC32 + S_PUB32 entries).
-    What's lost: the property NAMES themselves (`Name`, `BarkCount`,
-    `Breed`). cdb / VS Watch evaluator can't resolve
-    `?? lDog.BarkCount`; users must reach for the backing field
-    (`?? lDog.fBarkCount`) or call the getter directly.
+37. **Pascal `property` declarations don't surface directly in
+    CodeView -- but they ARE in RSM as 0x31 records, and our
+    NatVis sidecar exposes them.**
 
-    This is an inherent RSM/Delphi limitation -- not something
-    rsm2pdb can synthesize without parsing the per-unit RTTI from
-    .drc / .sym artifacts or shipping a NatVis script that maps
-    known property names to backing-field accesses. Verified on
-    examples/08_inherit_props.
+    CodeView has no `LF_PROPERTY` counterpart. The Delphi compiler
+    emits these PDB-visible artifacts for a `property X read fX
+    write SetX`:
+      - backing FIELD (LF_MEMBER `fX`);
+      - accessor METHODS (`GetX` / `SetX` if any -> S_GPROC32 +
+        S_PUB32).
+    What CodeView WON'T render in Watch is the property name
+    itself -- `?? lDog.BarkCount` returns `no member`.
+
+    rsm2pdb closes the gap with the NatVis sidecar (embedded in
+    the PDB as an injected source -- see src/natvis/). The RSM
+    file DOES carry property records (tag 0x31, see rsm-format.txt
+    entry 2026-05-29 / Tier 2). Tier 2.0 parses property NAMES
+    from those records and emits NatVis `<Item>` entries with
+    naming-heuristic expressions:
+      - field `fPropName` exists  -> `<Item Name="PropName">fPropName</Item>`
+      - method `GetPropName` exists -> `<Item Name="PropName">GetPropName()</Item>`
+    Covers ~95% of real-world Delphi convention; non-conventional
+    accessors (custom getter names not matching `Get<PropName>`)
+    fall back to the raw field access. Tier 2.1 will do full
+    accessor-marker resolution if the heuristic proves insufficient
+    on real codebases.
+
+    Verified on examples/09_cross_unit (TItem.Name / .Tag / .Pos /
+    .Description, TLayout.Origin / .LeadName / .ItemCount). cdb
+    still doesn't see properties (cdb ignores NatVis -- that's a
+    cdb-side limit, not ours); VS native + cppvsdbg do.
 

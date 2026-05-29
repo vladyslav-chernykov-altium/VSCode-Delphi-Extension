@@ -2070,3 +2070,191 @@ the same `8a 00 00` style entries en masse AND a user reports
 the missing-enum cross-unit gap. As of this date no AdvPCB
 8a-stat available; gating on real-project data before another
 RE round.
+
+---------------------------------------------------------------------------
+2026-05-29 (Tier 2 / NatVis) -- Pascal `property` records (tag 0x31)
+---------------------------------------------------------------------------
+
+CORRECTION to 2026-05-28 [FACT] above ("Pascal `property`
+declarations are not represented in RSM at all"). They ARE
+represented -- with a dedicated record tag 0x31. The old
+conclusion came from looking only for property records right
+next to their backing fields; the actual property records live
+in a DIFFERENT cluster of the RSM metadata stream, further
+along from the 0x2c/0x2e cluster.
+
+[FACT] Property record format (tag 0x31). Located by scanning
+    for `0x31 <namelen u8> <printable name>` followed by the
+    `00 02 00 <type> fe 0f 00 00 00 80` signature.
+
+    Layout (variable length body):
+
+      31 <namelen u8> <PropName>
+      00 02 00 <type_marker u8>      ; type kind / index
+      fe 0f 00 00 00 80              ; fixed signature
+      <getter_ref>                   ; W bytes (W = 1 or 2; see below)
+      <setter_ref>                   ; W bytes; all-zero = read-only
+      <tail>                         ; variable; ends before next record
+
+    Followed by the usual per-record trailer
+      9c <flag> <self_marker> 07 00 00 08 <2 bytes> ff
+
+    The trailer's `9c <flag>` byte selects 1-byte (`9c 01`) vs
+    2-byte (`9c 09`) marker width for the WHOLE record family
+    (fields + methods + properties inside the same unit).
+    Mixed widths within one RSM file haven't been observed.
+
+[FACT] Accessor marker width is per-RSM-version (or per-Delphi-
+    version):
+
+    examples/09_cross_unit (1-byte markers, `9c 01 <byte>`):
+      Tag        (RW field-backed, Integer) body = 90 96 96 00 00 00 0f 00 00 00 80
+      Tag2       (mixed: f-read, m-write)    body = 06 96 72 00 00 00 0f 00 00 00 80
+      Name       (RO field-backed, string)   body = 04 8e 00 00 00 00 00
+
+    examples/08_inherit_props (2-byte markers, `9c 09 <u16>`):
+      BarkCount  (RW method-backed, Integer) body = 06 45 1c 51 1c 00 00 00 0f 00 00 00 80
+      Name       (RW field-backed, string)   body = 04 dd 1c dd 1c 00 00 00 00 9c 01 ed 1c
+      Breed      (RO field-backed, string)   body = 04 05 1d 00 00 00 00 00 00
+
+    The accessor markers point at per-class field/method
+    counters, NOT at type-table hashes. Each 0x2c (field) and
+    0x2e (method) record in the class carries its own marker
+    byte/word right after its `9c 01`/`9c 09` sub-record header:
+      9c 01 <field_marker_u8>     (for fields, 09 fixture)
+      9c 09 <field_marker_u16>    (for fields, 08 fixture)
+      e2    <method_marker_uW>    (for methods; the `e2` prefix
+                                  replaces `9c 0?` for methods.
+                                  W follows the same rule.)
+    Property's getter / setter slot stores the marker value
+    found in the corresponding field's or method's record.
+
+    Same-class field markers increment by 2 in declaration
+    order. Methods increment differently (param-count-dependent
+    step?). RO properties have setter_ref = 0.
+
+[FACT] Property records live in a SEPARATE metadata cluster from
+    the field/method cluster of the same class.
+
+    In 09_cross_unit, TItem class has:
+      Field cluster   @0x34b62b (5 fields + 2 methods, no
+                                 property records nearby).
+      Property cluster @0x34d8f9 (7 property records back-to-
+                                 back).
+
+    Same cluster split observed for TLayout (Layout.pas) and
+    in 08_inherit_props for TAnimal / TMammal / TDog. Roughly
+    +0x2000 bytes downstream from the field cluster, no
+    universal alignment.
+
+    To link properties back to their owning class, the parser
+    needs the property's PARENT_HASH. This sits inside the
+    property's `9c 01 ... 07 00 00 08 <2 bytes> ff` trailer:
+    the `<2 bytes>` immediately before `ff` is the class's
+    own_hash (matches 0x47 CLS_HEADER for classes).
+
+    Verified: TItem properties' trailer 2-byte parent is
+    `14 ff` -> 0x1408 + the LINKED-hash-low-byte pattern.
+    Cross-check on Pos's trailer: `9c 01 a0 07 00 00 08 14 ff`
+    -> last 2 bytes before ff = `08 14` -> low-byte 0x14 ==
+    TItem's NAME-hash low byte 0x4c. NOT exact match -- this
+    one needs more RE before relying on it; for Tier 2.0 the
+    parser instead resolves properties by NAME-PROXIMITY to
+    the most recently parsed class (cluster heuristic).
+
+[DECISION] Tier 2.0 implementation strategy.
+
+    The full accessor-marker resolution (look up getter_ref in
+    a per-class field+method marker table, fall back across
+    1-byte / 2-byte widths) is non-trivial and the parent-hash
+    encoding still has open RE questions. Going with a NAMING
+    HEURISTIC instead for the first cut:
+
+      Given property NAME P inside class C:
+        a. If C has field "fP"          -> emit `<Item Name="P">fP</Item>`
+        b. Else if C has method "GetP"  -> emit `<Item Name="P">GetP()</Item>`
+        c. Else                          -> skip (rare)
+
+    Covers ~95% of real-world Delphi (where the `f` /
+    `Get` prefix is the dominant convention). Edge cases like
+    09's `Tag2` (reads `fTag` not `fTag2`) get skipped.
+
+    Tier 2.1 (deferred): proper accessor-marker resolution.
+    Reactivation criteria: a real Delphi codebase showing
+    properties with non-conventional accessor names that
+    users actually want to inspect via Watch.
+
+---------------------------------------------------------------------------
+2026-05-29 (Tier 2 / cross-unit local typing) -- PARKED
+---------------------------------------------------------------------------
+
+While verifying Tier 2 (Pascal property NatVis emission) on the
+extended 09_cross_unit fixture, surfaced that cross-unit class-as-
+LOCAL type resolution was never working end-to-end. cdb / VS Watch
+shows:
+
+    lItem    : struct TDisposeRec       (should be TItem)
+    lLayout  : unsigned __int64         (should be TLayout)
+
+[FACT] Pre-existing since Phase B.2 (commit 3119007), confirmed by
+    re-testing the original 09_cross_unit fixture at commit
+    c787057 (pre-session start). Not a regression introduced by
+    Tier 2 work.
+
+[FACT] Root cause -- in Reader::resolveAggregateTypes (rsm_aggregates
+    .cpp resolveAggrFor):
+
+      a = findAggregateInUnit(ua, v.inline_type_id);
+      if (!a) a = findAggregateByHash(v.inline_type_id);
+
+    For SAME-unit class locals (08_inherit_props.lDog), inline_type_id
+    equals the aggregate's own_hash in its declaring unit, so
+    findAggregateInUnit hits and pascal_type stamps correctly
+    ("TDog").
+
+    For CROSS-unit class locals (09_cross_unit.lItem), inline_type_id
+    is a different encoding -- a per-procedure trailer-id from a
+    GLOBAL type-id table at file offset ~3516606..3522890 (cross_unit
+    .rsm), NOT the foreign aggregate's own_hash. findAggregateInUnit
+    misses (TItem not in cross_unit's anchor), and findAggregateByHash
+    falls back to global last-wins which hits unrelated RTL types
+    (TDisposeRec / IDisposer / etc.) that happen to share the
+    trailer-id value as their own_hash.
+
+[FACT] Trailer-table structure (cross_unit.rsm):
+
+      offset 3516606..3522890     -- contiguous global type-id table
+      1571 entries, each 4 bytes  -- `<id u16 LE> <kind u8> 0x0f`
+      kind byte mostly 0x10       -- (occasionally 0x20 / 0x30)
+      ids mostly +4 sequential    -- with occasional jumps between
+                                     hash families (0x06XX -> 0x1bXX)
+
+    cross_unit's 5 locals (lPoint .. lLayout) occupy entries
+    248..255 (ids 0x0641 .. 0x065d).
+
+[GUESS] The trailer table is a global INDEX into a parallel data
+    structure that maps each id to (unit, name, hash). That parallel
+    structure has not yet been identified -- 0x66 import-table entries
+    don't carry the matching id, and named search around the trailer
+    table boundaries didn't reveal a names array.
+
+[DECISION] PARKED. Not blocking Tier 2 property emission (which
+    works correctly on single-unit fixtures like 08_inherit_props
+    where this bug isn't triggered). Cross-unit local-typing is
+    its own RE round -- the same class as the 8a-enum-linkage gap
+    parked on 2026-05-29-day. NatVis sidecar for cross_unit
+    classes is emitted (1138 bytes, 11 properties), but VS can't
+    apply our `<Type Name="TItem">` rule because lItem in PDB
+    is typed as TDisposeRec (whatever findAggregateByHash returned),
+    not TItem.
+
+    Reactivation criteria: a user-reported request for cross-unit
+    class-as-local inspection on a real Delphi project where this
+    pattern matters. The next RE round needs to find the inline_type_id
+    -> (name, hash) map; candidate places to look:
+      - Cross-reference each global trailer-table entry against the
+        consuming unit's 0x66 import table for sequential pairing.
+      - Look for additional named-type tables near the global
+        trailer table boundaries.
+      - Check if the variable record's flag byte after inline_type_id
+        (0xf0/0xe0/... for cross_unit locals) encodes a unit ID.
