@@ -416,19 +416,26 @@ bool Reader::open(const std::string& path) {
         // in our fixture set:
         //
         //   OLD (e.g. two_units.rsm built with Delphi pre-10.x):
-        //     subtag 0x62 + <marker u8> for non-primitives;
-        //     subtag 0x66 + <marker u8> for primitives.
+        //     subtag 0x62 + <marker u8> for non-primitives.
         //     The marker is a 1-byte per-unit type id.
         //
-        //   NEW (e.g. records.rsm built with current Delphi):
-        //     subtag 0x66 for BOTH, with the discriminator pushed
-        //     into the byte at markerAt: small-even = primitive
-        //     marker (1 byte); else a 2-byte composite hash. This
-        //     matches the global-variable record's layout.
+        //   NEW (e.g. records.rsm / AdvPCB.rsm):
+        //     subtag 0x66 for BOTH primitive and composite-typed
+        //     locals. The form (1-byte marker vs 2-byte hash) AND
+        //     the offset form (1-byte vs 2-byte) are encoded by
+        //     BODY LENGTH:
         //
-        // Dispatch order: subtag != 0x66 is a hard signal of OLD
-        // non-primitive. subtag == 0x66 may be either generation;
-        // discriminate via markerAt[0] like the globals parser does.
+        //       primitive 1B marker + 1B offset   -> 5-byte body
+        //       primitive 1B marker + 2B offset   -> 6-byte body
+        //       composite 2B hash   + 1B offset   -> 6-byte body
+        //       composite 2B hash   + 2B offset   -> 7-byte body
+        //
+        // To pick the right one we look ahead for the next plausible
+        // record tag (0x20/0x21/0x22/0x23/0x25/0x28/0x2a/0x63). The
+        // earlier "byte < 0x40 && even" heuristic for primitive
+        // markers was too restrictive -- AdvPCB's per-unit type
+        // tables hand out markers up to ~0x9a (TDynamicString = 0x9a
+        // in the PCBCommands_PCB unit), which is well above 0x40.
         const auto mb0 = static_cast<std::uint8_t>(buf[markerAt]);
         std::size_t offsetAt;
         if (r.subtag != kVarPayloadSubTag0) {
@@ -439,15 +446,62 @@ bool Reader::open(const std::string& path) {
             r.type_hash    = 0;
             offsetAt       = markerAt + 1;
         } else {
-            const bool primitive_marker =
-                (mb0 != 0 && mb0 < 0x40 && (mb0 & 0x01) == 0);
-            if (primitive_marker) {
-                r.is_primitive = true;
-                r.marker       = mb0;
-                r.type_hash    = 0;
-                offsetAt       = markerAt + 1;
+            // Scan forward up to 16 bytes for the next plausible
+            // record tag to nail down body length.
+            auto isKnownNextTag = [](std::uint8_t b) {
+                return b == 0x20 || b == 0x21 || b == 0x22
+                    || b == 0x23 || b == 0x25 || b == 0x28
+                    || b == 0x2a || b == 0x63;
+            };
+            const std::size_t maxBodyEnd =
+                std::min(bodyAt + 16, buf.size() - 1);
+            std::size_t bodyEnd = SIZE_MAX;
+            for (std::size_t k = bodyAt + 5; k <= maxBodyEnd; ++k) {
+                if (isKnownNextTag(static_cast<std::uint8_t>(buf[k]))) {
+                    bodyEnd = k;
+                    break;
+                }
+            }
+            if (bodyEnd == SIZE_MAX) return r;
+            const std::size_t bodyLen = bodyEnd - bodyAt;
+            // Pick form from body length.
+            bool composite_form;
+            bool two_byte_offset;
+            if (bodyLen == 5) {
+                composite_form  = false;
+                two_byte_offset = false;
+            } else if (bodyLen == 7) {
+                composite_form  = true;
+                two_byte_offset = true;
+            } else if (bodyLen == 6) {
+                // Ambiguous (primitive 2B-offset vs composite 1B-offset).
+                // Disambiguate by LSB of marker byte and of position +4:
+                //   - mb0 odd                -> definitely composite
+                //     (primitive markers are always even).
+                //   - mb0 even AND buf[+4] LSB=1 -> primitive 2B
+                //     (offset_lo's LSB=1 is the 2-byte-offset signal).
+                //   - else                   -> composite 1B (default;
+                //     even-low-byte hashes do exist on RTL types).
+                if ((mb0 & 1u) != 0u) {
+                    composite_form  = true;
+                    two_byte_offset = false;
+                } else {
+                    const auto b4 =
+                        static_cast<std::uint8_t>(buf[bodyAt + 4]);
+                    if ((b4 & 1u) != 0u) {
+                        composite_form  = false;
+                        two_byte_offset = true;
+                    } else {
+                        composite_form  = true;
+                        two_byte_offset = false;
+                    }
+                }
             } else {
-                if (markerAt + 2 >= buf.size()) return r;
+                // Unexpected body length; bail rather than mis-decode.
+                return r;
+            }
+            if (composite_form) {
+                if (markerAt + 2 > buf.size()) return r;
                 r.is_primitive = false;
                 r.marker       = 0;
                 r.type_hash    = static_cast<std::uint16_t>(mb0)
@@ -455,7 +509,16 @@ bool Reader::open(const std::string& path) {
                                     static_cast<std::uint8_t>(buf[markerAt + 1]))
                                  << 8);
                 offsetAt       = markerAt + 2;
+            } else {
+                r.is_primitive = true;
+                r.marker       = mb0;
+                r.type_hash    = 0;
+                offsetAt       = markerAt + 1;
             }
+            (void) two_byte_offset;  // offset form is also implied by
+                                     // the offset byte's LSB below
+                                     // (kept loaded above for the body-
+                                     // length disambiguation).
         }
         if (offsetAt >= buf.size()) return r;
 
@@ -638,14 +701,46 @@ bool Reader::open(const std::string& path) {
 
                 const auto tag = static_cast<std::uint8_t>(buf[s]);
                 if (tag == kFunctionEndMarker) { ++s; break; }
-                // Real Delphi RSMs use additional sub-record tags
-                // (e.g. 0x23 / 0x25) for return-value metadata and
-                // enum-entries. We don't decode them yet, so we stop
-                // the param/local walk gracefully on any unknown
-                // tag rather than discarding the whole proc.
+                // Real Delphi RSMs interleave additional sub-record
+                // tags into the proc body BETWEEN params and locals:
+                //   0x23  return-value descriptor (one per function)
+                //   0x25  enum entries (one per enum value, for any
+                //         enum used as a param / local / return type)
+                // These can run for hundreds of bytes (a function
+                // with a multi-enum return type like FileSave's
+                // TSaveFormat hits ~150 bytes of 0x25 records). We
+                // don't decode them; we just need to walk past to
+                // find the next 0x20 local. The earlier 6-byte
+                // re-anchor scan is too small for this; do a wider
+                // 1024-byte forward scan when we hit an unknown
+                // tag, looking for the next valid sub-record header
+                // (0x20 / 0x21 / 0x22 whose parseSub validates) or
+                // the proc-end marker (0x63).
                 if (tag != kRecordTagParam && tag != kRecordTagVariable
                     && tag != kRecordTagVarParam) {
-                    break;
+                    const std::size_t bigScan = std::min(
+                        s + 1024,
+                        buf.size() > 8 ? buf.size() - 8 : 0);
+                    std::size_t ns = s + 1;
+                    bool found = false;
+                    while (ns < bigScan) {
+                        const auto t2 = static_cast<std::uint8_t>(buf[ns]);
+                        if (t2 == kFunctionEndMarker) {
+                            found = true;
+                            break;
+                        }
+                        if ((t2 == kRecordTagParam
+                             || t2 == kRecordTagVariable
+                             || t2 == kRecordTagVarParam)
+                            && parseSub(ns).ok) {
+                            found = true;
+                            break;
+                        }
+                        ++ns;
+                    }
+                    if (!found) break;
+                    s = ns;
+                    continue;
                 }
                 const SubRec sub = parseSub(s);
                 if (!sub.ok) break;

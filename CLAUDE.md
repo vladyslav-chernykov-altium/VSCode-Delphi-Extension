@@ -527,7 +527,43 @@ update this section first and explain why in the commit message.
     detection + nullopt is the cheapest path that preserves both
     invariants.
 
-29. **Pascal `property` declarations don't make it into the PDB.**
+29. **Two RSM sub-record bugs hide locals on real Delphi units.**
+    User reported on AdvPCB's `PCBCommands_PCB.TPCBCommands.FileSave`
+    that the 8 declared locals (FileName, Format, SaveFormat,
+    IsRecovery, DocFormat, ShelvedPolyCount, SilentMode, State)
+    were missing from the PDB -- only the 3 params showed up. Two
+    issues fixed together (commit XXXXXX):
+
+    (a) `scanProcedures` broke its sub-record loop on the FIRST
+        unknown tag (e.g. `0x23` return-value descriptor or `0x25`
+        enum entries emitted between params and locals for any
+        function that returns / accepts an enum). FileSave's
+        return type `TSaveFormat` produces 12 `0x25` enum-entry
+        records totalling ~150 bytes that sat between AKind and
+        FileName -- the existing 6-byte re-anchor window couldn't
+        scan past them. Fix: widen the re-anchor to 1024 bytes
+        when the current tag isn't one of 0x20 / 0x21 / 0x22 (or
+        the proc-end marker 0x63), and validate candidate
+        sub-records via parseSub before accepting.
+
+    (b) `parseSub`'s primitive-vs-composite discriminator was
+        `mb0 < 0x40 && (mb0 & 1) == 0` -- too restrictive. AdvPCB's
+        per-unit primary type tables run to 100+ entries each, so
+        primitive markers go up to ~0x9a (PCBCommands_PCB's
+        TDynamicString = marker 0x9a, well above 0x40). FileName
+        and DocFormat (both TDynamicString) were mis-classified as
+        composite-typed, consuming the wrong byte as the offset
+        and corrupting subsequent sub-record alignment. Fix:
+        switch to BODY-LENGTH disambiguation. Scan forward from
+        the sub-record body for the next plausible record tag
+        (0x20 / 0x21 / 0x22 / 0x23 / 0x25 / 0x28 / 0x2a / 0x63);
+        body length 5 -> primitive 1B, 7 -> composite 2B, 6 ->
+        disambiguate by marker-byte LSB (odd = composite). Works
+        for every fixture (07_records, 08_inherit_props) AND for
+        AdvPCB's FileSave (all 8 locals + correct TSaveFormat*
+        type for the in-proc-emitted enum).
+
+30. **Pascal `property` declarations don't make it into the PDB.**
     CodeView has no `LF_PROPERTY` counterpart. What survives the
     Delphi -> RSM -> CodeView pipeline:
       - backing FIELDS (LF_MEMBER `fName`, `fBarkCount`, ...);
