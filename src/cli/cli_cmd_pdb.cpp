@@ -448,6 +448,13 @@ int cmdPdb(int argc, char** argv) {
     // by reusing this same registrar with kind-aware emission).
     std::map<std::pair<std::uint64_t, std::uint16_t>,
              std::size_t> aggr_idx_cache;
+    // In-progress set protects against cyclic base-class /
+    // composite-field references that we've seen on real-world
+    // AdvPCB-scale projects (deep VCL hierarchies + generic
+    // container owner-loops). Without this guard the recursive
+    // registrar blows the stack -- STATUS_STACK_OVERFLOW observed
+    // at registerAggr depth ~thousands on AdvPCB.
+    std::set<std::pair<std::uint64_t, std::uint16_t>> aggr_in_progress;
     std::function<std::optional<std::size_t>(
         const rsm2pdb::rsm::AggregateType*)> registerAggr;
     registerAggr = [&](const rsm2pdb::rsm::AggregateType* a)
@@ -494,12 +501,22 @@ int cmdPdb(int argc, char** argv) {
             it != aggr_idx_cache.end()) {
             return it->second;
         }
-        // For classes, recurse on the base class FIRST so its index
-        // is registered before our own. CodeView LF_BCLASS needs the
-        // base's TypeIndex at emission time, and the writer keys off
-        // the dependency order we lay down here. (Phase B.4 already
-        // proved base_hash points to user-local TypeIndex space when
-        // present.)
+        // Cycle break: if we're already registering this aggregate
+        // (deeper in the call stack), bail out -- treat the
+        // recursive reference as "unresolved". The writer's
+        // dependency-order invariant (children emitted before
+        // referrers) requires that registerAggr push to
+        // inputs.aggregates AFTER recursing on children, so we
+        // can't reserve a slot upfront without breaking that
+        // invariant -- this is the cheapest workable alternative.
+        if (!aggr_in_progress.insert(key).second) {
+            return std::nullopt;
+        }
+        // For classes, recurse on the base class FIRST so its
+        // index is registered before our own. The recursion may
+        // return nullopt if it hits a cycle -- we treat that as
+        // "no explicit base" (CodeView LF_BCLASS chains don't
+        // cycle anyway).
         std::optional<std::size_t> base_idx;
         if (is_class && a->base_hash != 0) {
             const rsm2pdb::rsm::AggregateType* base_a =
@@ -510,8 +527,6 @@ int cmdPdb(int argc, char** argv) {
             }
             base_idx = registerAggr(base_a);
         }
-        // Reserve slot. Children we register (composite-typed fields)
-        // will register themselves recursively below.
         const auto idx = inputs.aggregates.size();
         aggr_idx_cache[key] = idx;
         rsm2pdb::pdb::AggregateRecord rec;
@@ -546,6 +561,7 @@ int cmdPdb(int argc, char** argv) {
                 : max_ord <= 31  ? 4
                                  : 8;
             inputs.aggregates.push_back(std::move(rec));
+            aggr_in_progress.erase(key);
             return idx;
         }
         if (is_enum) {
@@ -567,6 +583,7 @@ int cmdPdb(int argc, char** argv) {
                 rec.enumerators.push_back(std::move(ae));
             }
             inputs.aggregates.push_back(std::move(rec));
+            aggr_in_progress.erase(key);
             return idx;
         }
         rec.fields.reserve(a->fields.size());
@@ -600,6 +617,7 @@ int cmdPdb(int argc, char** argv) {
             rec.fields.push_back(std::move(f));
         }
         inputs.aggregates.push_back(std::move(rec));
+        aggr_in_progress.erase(key);
         return idx;
     };
     auto lookupAggrIdx = [&](const rsm2pdb::rsm::Variable& v)

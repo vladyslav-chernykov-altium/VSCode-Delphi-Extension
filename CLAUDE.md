@@ -506,7 +506,28 @@ update this section first and explain why in the commit message.
     only invariant -- everything between the header and the
     base slot flexes with method count.
 
-28. **Pascal `property` declarations don't make it into the PDB.**
+28. **`registerAggr` recursion must break cycles to avoid stack
+    overflow at AdvPCB scale.** Phase E's recursive aggregate
+    registrar (cli_cmd_pdb.cpp) walks the base-class chain +
+    composite-typed fields depth-first. On AdvPCB (21k classes,
+    deep VCL hierarchies, generic container owner-loops) the
+    chain can cycle: A -> base B -> base A or A.f -> B.f -> A.
+    Without a cycle guard the recursion blows the 1 MB Windows
+    stack (STATUS_STACK_OVERFLOW = 0xC00000FD = exit 3221225725
+    observed at registerAggr depth ~thousands).
+
+    Fix: an `aggr_in_progress` set keyed by (unit_anchor_offset,
+    own_hash). Inserted at the start of registerAggr, erased
+    after `inputs.aggregates.push_back`. Re-entry while the same
+    key is in-progress returns nullopt (treated as "no base" /
+    "unknown field type" downstream). We DELIBERATELY don't
+    reserve an aggregate slot upfront -- the writer's dependency-
+    order invariant (children pushed before referrers, so they
+    get a smaller TypeIndex) would break if we did. Cycle-
+    detection + nullopt is the cheapest path that preserves both
+    invariants.
+
+29. **Pascal `property` declarations don't make it into the PDB.**
     CodeView has no `LF_PROPERTY` counterpart. What survives the
     Delphi -> RSM -> CodeView pipeline:
       - backing FIELDS (LF_MEMBER `fName`, `fBarkCount`, ...);
@@ -618,16 +639,28 @@ keep them — they're invaluable for future RSM RE):
 
 ---
 
-*Last updated: 2026-05-28 (late evening), after the 08_inherit_props
-fixture + variable-length class-header fix (commit 394e12a). The
-new fixture exercises 3-level inheritance (TAnimal -> TMammal ->
-TDog) plus Pascal `property` declarations; surfaced a real bug in
-the class-header layout detector that silently dropped LF_BCLASS
-edges whenever the class declared property accessor methods. The
-fix uses a scan-forward strategy anchored on the `25 3f 00`
-field-list marker (gotcha #27). Also confirmed: Pascal `property`
-syntax has no representation in RSM or CodeView -- only backing
-fields + accessor methods survive (gotcha #28).
+*Last updated: 2026-05-28 (late evening), after AdvPCB-scale
+verification + STATUS_STACK_OVERFLOW fix in the aggregate
+registrar (gotcha #28). End-to-end on AdvPCB (947k publics, 142k
+line-tables, 66k aggregates, 207k aggregate-typed globals): clean
+exit, 46 seconds wall-time, 136 user records routed via TPI +
+2,825 aggregates registered. Phase E's recursive registrar was
+the culprit -- cyclic base / composite-field references in deep
+VCL hierarchies blew the 1 MB Windows stack at depth ~thousands.
+Fixed with an `aggr_in_progress` set returning nullopt on
+recursive re-entry; preserves the writer's children-before-
+referrers dependency invariant.
+
+Earlier the same day: 08_inherit_props fixture + variable-length
+class-header fix (commit 394e12a). The new fixture exercises
+3-level inheritance (TAnimal -> TMammal -> TDog) plus Pascal
+`property` declarations; surfaced a real bug in the class-header
+layout detector that silently dropped LF_BCLASS edges whenever
+the class declared property accessor methods. The fix uses a
+scan-forward strategy anchored on the `25 3f 00` field-list
+marker (gotcha #27). Also confirmed: Pascal `property` syntax has
+no representation in RSM or CodeView -- only backing fields +
+accessor methods survive (gotcha #29).
 
 Step 11b PDB-side complete: phases A (RSM RE) + B.1..B.4 (parser)
 + C (per-unit marker accessor) + D (LF_STRUCTURE) + E (LF_CLASS +
