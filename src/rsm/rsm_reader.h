@@ -359,6 +359,18 @@ private:
     // position N -> marker = 2 * (N + 1).
     std::unordered_map<std::uint64_t,
                        std::vector<UnitTypeEntry>> primary_table_by_anchor_;
+
+    // Phase pipelines extracted from open() during the 2026-05-28
+    // sanitary-day refactor. Each method owns one logical pass over
+    // the loaded RSM byte buffer / already-populated tables. See
+    // open() for the dispatch order. `buf` is the whole file kept
+    // alive by open()'s frame -- not stored as a member because
+    // none of these passes need it after open() returns.
+    void scanPrimitiveTable(const std::string& buf);
+    void scanProceduresAndVariables(const std::string& buf);
+    void scanPerUnitTypeTables(const std::string& buf);
+    void scanAggregateTypes(const std::string& buf);
+    void resolveAggregateTypes();
 };
 
 // Decorate a populated model::Module with type information derived

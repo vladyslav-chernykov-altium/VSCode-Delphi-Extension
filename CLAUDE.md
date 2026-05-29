@@ -173,6 +173,53 @@ update this section first and explain why in the commit message.
    adapters around it), never in "the other backend's formula" --
    because there is no other formula.
 
+6. **Small, single-purpose units.** Code goes into the smallest
+   sensible unit -- a function per logical pass, a `.cpp` per
+   logical module, a `.h` for shared internals. Established by the
+   2026-05-28 sanitary refactor of `src/rsm/` (commit pending),
+   which split a 2158-line `rsm_reader.cpp` with a 1638-line
+   `Reader::open()` into 7 .cpp files + 2 .h files, with the
+   biggest .cpp at ~625 lines and `Reader::open()` at ~50 lines.
+   Concrete guidelines:
+
+   - **Functions: hundreds of lines is a smell, thousands is a
+     bug.** When a function tops ~200 lines or grows a second
+     distinct phase, extract a named helper. Mega-functions hide
+     dataflow and force callers to re-read context every time.
+   - **`.cpp` files: one logical responsibility each.** New
+     unrelated functionality goes into a new `.cpp`, not appended
+     to an existing one. The `src/rsm/rsm_*.cpp` family is the
+     reference shape: `rsm_reader.cpp` dispatches, `rsm_primitives
+     .cpp` / `rsm_procs_vars.cpp` / `rsm_unit_tables.cpp` /
+     `rsm_aggregates.cpp` / `rsm_dump.cpp` / `rsm_decorate.cpp`
+     each own one pass. Same pattern in `src/cli/cli_cmd_*.cpp`
+     (rule #3 above).
+   - **Shared internals: an `_internal.h` header with
+     `inline` / `inline constexpr` items in a `detail` namespace.**
+     `src/rsm/rsm_internal.h` is the prototype: record-tag
+     constants, the primitive descriptor table, byte-level
+     helpers (`readU32LE`, `findBytes`, `isPrintableName`).
+     Anonymous namespaces in `.cpp` files are fine for things
+     used by ONE TU; promote to `*_internal.h` the moment a
+     second TU needs them, never copy-paste.
+   - **Extraction stays behaviour-identical.** Each extraction is
+     a pure refactor: build clean + `rsm2pdb_tests` green + a
+     smoke run that prints the same `[rsm] ...` counters. The
+     `2026-05-28` refactor sequence (steps 1..5 + the split into
+     submodules) is the worked example -- six incremental edits,
+     six verification cycles, no regressions.
+   - **`open()`-style dispatchers stay tiny.** The top-level
+     entry point should read like a table of contents: load
+     input, call each phase, return. If you can't tell what a
+     function does in one glance, the function has too much
+     going on.
+   - **Extractions are reversible-by-inlining.** A good helper
+     can be re-inlined cleanly because its signature captures
+     exactly what it depends on. If extraction needs to thread
+     ten parameters or pass a giant captures-everything closure,
+     the boundary is in the wrong place -- redesign instead of
+     forcing it.
+
 ---
 
 ## Gotchas we hit (worth knowing, may bite again)

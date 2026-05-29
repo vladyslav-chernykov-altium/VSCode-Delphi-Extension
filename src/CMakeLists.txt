@@ -1,5 +1,11 @@
 add_library(rsm2pdb_core STATIC
   rsm/rsm_reader.cpp
+  rsm/rsm_primitives.cpp
+  rsm/rsm_procs_vars.cpp
+  rsm/rsm_unit_tables.cpp
+  rsm/rsm_aggregates.cpp
+  rsm/rsm_dump.cpp
+  rsm/rsm_decorate.cpp
   map/map_reader.cpp
   model/model.cpp
   compose/frame.cpp
