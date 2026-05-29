@@ -288,14 +288,16 @@ void PdbWriter::emitAggregates() {
           a.name,
           std::string{});
       fwd_inner_ti = tpi_table_.writeLeafType(fwd);
-      // ThisType for class methods is `const TDog*` -- Pascal Self
-      // is a "const this pointer" (cannot rebind to a different
-      // instance), matching the C++ convention cppvsdbg expects.
-      // Without Const flag VS reports "type qualifiers that are
-      // not compatible with the member function".
+      // ThisType for class methods is a plain Near64 pointer with
+      // PointerOptions::None. Matches MSVC's emission (verified
+      // via cl /Zi baseline at examples/99_cpp_baseline/) -- the
+      // `Const` we used in FE.1 was the cause of cppvsdbg's "type
+      // qualifiers not compatible with the member function" error,
+      // not its fix. MSVC's LF_MFUNCTION points at a const-less
+      // this-ptr; cppvsdbg expects exactly that.
       codeview::PointerRecord fwd_pr(
           fwd_inner_ti, codeview::PointerKind::Near64,
-          codeview::PointerMode::Pointer, codeview::PointerOptions::Const,
+          codeview::PointerMode::Pointer, codeview::PointerOptions::None,
           /*size=*/8);
       fwd_ptr_ti = tpi_table_.writeLeafType(fwd_pr);
       // Empty LF_ARGLIST, cached per emitAggregates call.

@@ -43,6 +43,14 @@ bool PdbWriter::emitModules() {
 
   shared_strings_ = std::make_shared<codeview::DebugStringTableSubsection>();
 
+  // Reserve the scoped-name buffer to its final size so .c_str()
+  // pointers handed off to BulkPublic stay valid across all the
+  // push_backs in the method loop below. (method_type_by_qname_
+  // was fully populated by emitAggregates and has exactly one
+  // entry per class method that needs a scoped public + PROCREF.)
+  method_scoped_names_.reserve(method_type_by_qname_.size());
+  pending_scoped_publics_.reserve(method_type_by_qname_.size());
+
   // Helper: look up section Characteristics by 1-based segment index
   // so each SectionContrib carries the same flags as the PE section.
   auto sectionCharacteristics = [&](std::uint16_t seg) -> std::uint32_t {
@@ -96,13 +104,24 @@ bool PdbWriter::emitModules() {
       // FE.1: if emitAggregates registered an LF_MFUNCTION for this
       // method's qualified name, link it. method_type_by_qname_ is
       // populated in emitAggregates from PdbInputs::aggregates[*]
-      // ::methods. Also emit an additional S_PUB32 with C++-scoped
-      // name (`TDog::GetBarkCount`) so cppvsdbg's expression
-      // evaluator can resolve the method's address from the
-      // `obj.method()` Watch call site (without it VS reports
-      // "Function has no address, possibly due to compiler
-      // optimizations").
+      // ::methods.
+      //
+      // FE.1.5: ALSO emit a scoped public + S_PROCREF for the
+      // method so cppvsdbg's `obj.method()` Watch call site can
+      // resolve the address through both paths:
+      //   - S_PUB32  `TDog::GetBarkCount` -> (segment, offset)
+      //   - S_PROCREF `TDog::GetBarkCount` -> (mod_index, sym_off)
+      //                                      -> S_GPROC32 (this proc)
+      // Without the PROCREF, cppvsdbg finds the public but its
+      // expression evaluator reports "Function has no address" --
+      // it needs the globals-stream PROCREF chain to confirm the
+      // public refers to a callable procedure with a known
+      // signature (the LF_MFUNCTION on the S_GPROC32). Mirrors
+      // lld/COFF/PDB.cpp's addGlobalSymbol(S_GPROC32 -> PROCREF)
+      // pattern.
       proc.FunctionType = codeview::TypeIndex::None();
+      const char *scoped_name_for_procref = nullptr;
+      std::uint32_t scoped_name_len_for_procref = 0;
       if (auto it = method_type_by_qname_.find(fn.name);
           it != method_type_by_qname_.end()) {
         proc.FunctionType = it->second;
@@ -114,22 +133,38 @@ bool PdbWriter::emitModules() {
                 fn.name.substr(second_dot + 1, last_dot - second_dot - 1)
                 + "::" + fn.name.substr(last_dot + 1);
             method_scoped_names_.push_back(std::move(scoped));
+            const auto &sname = method_scoped_names_.back();
+            scoped_name_for_procref = sname.c_str();
+            scoped_name_len_for_procref =
+                static_cast<std::uint32_t>(sname.size());
             BulkPublic b{};
-            b.Name = method_scoped_names_.back().c_str();
-            b.NameLen = static_cast<std::uint32_t>(
-                method_scoped_names_.back().size());
+            b.Name = scoped_name_for_procref;
+            b.NameLen = scoped_name_len_for_procref;
             b.Segment = fn.segment;
             b.Offset = fn.offset;
             b.setFlags(codeview::PublicSymFlags::Function);
-            std::vector<BulkPublic> one{b};
-            builder_.getGsiBuilder().addPublicSymbols(std::move(one));
+            pending_scoped_publics_.push_back(b);
           }
         }
       }
       proc.CodeOffset = fn.offset;
       proc.Segment = fn.segment;
       proc.Flags = codeview::ProcSymFlags::None;
-      proc.Name = fn.name;
+      // FE.1.5: for method-bearing functions, use the C++-scoped
+      // name (`TDog::GetBarkCount`) on S_GPROC32 instead of the
+      // Pascal-dot qualified name. Verified against MSVC baseline
+      // (examples/99_cpp_baseline/): cppvsdbg's expression
+      // evaluator looks up `obj.method()` by walking the type's
+      // LF_ONEMETHOD list, constructing `Class::Method`, then
+      // matching against S_GPROC32 names. Without scoped-form on
+      // S_GPROC32 the lookup falls back to S_PUB32 (which carries
+      // segment+offset but no FunctionType binding) -- hence
+      // "Function has no address". The Pascal-dot name still
+      // lives on its dedicated S_PUB32 for cdb-style `.call`.
+      proc.Name = (scoped_name_for_procref != nullptr)
+                      ? llvm::StringRef(scoped_name_for_procref,
+                                        scoped_name_len_for_procref)
+                      : llvm::StringRef(fn.name);
       auto cv_proc = codeview::SymbolSerializer::writeOneSymbol(
           proc, alloc_, codeview::CodeViewContainer::Pdb);
       // The serializer wrote into a buffer owned by `alloc_`.
@@ -219,6 +254,28 @@ bool PdbWriter::emitModules() {
       codeview::ScopeEndSym end_sym(codeview::SymbolRecordKind::ScopeEndSym);
       m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
           end_sym, alloc_, codeview::CodeViewContainer::Pdb));
+
+      // FE.1.5: PROCREF in GSI globals stream chains the scoped
+      // method name back to this S_GPROC32 (module mod_index,
+      // symbol offset proc_offset). LLVM's GSIStreamBuilder
+      // serialises ProcRefSym onto its own allocator inside
+      // addGlobalSymbol(), so the StringRef name only needs to
+      // be valid for the duration of this call.
+      if (scoped_name_for_procref != nullptr) {
+        codeview::ProcRefSym pref(codeview::SymbolRecordKind::ProcRefSym);
+        // lld/COFF/PDB.cpp uses (modi + 1); MSVC's PDB format
+        // expects 1-based module indices in PROCREF. Use DBI's
+        // own assigned module index (m.getModuleIndex()) rather
+        // than our local mod_index counter to guarantee the
+        // PROCREF lookup chain resolves on the debugger side.
+        pref.Module =
+            static_cast<std::uint16_t>(m.getModuleIndex() + 1);
+        pref.SymOffset = proc_offset;
+        pref.SumName = 0;
+        pref.Name = llvm::StringRef(scoped_name_for_procref,
+                                    scoped_name_len_for_procref);
+        builder_.getGsiBuilder().addGlobalSymbol(pref);
+      }
 
       SectionContrib sc{};
       sc.ISect = fn.segment;

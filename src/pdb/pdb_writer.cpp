@@ -67,8 +67,6 @@ bool PdbWriter::run() {
 
   emitAggregates();
 
-  emitPublicsAndGlobals();
-
   // SectionMap (derived from PE section headers). PUBSYM resolution
   // relies on this; without it the debugger can't translate
   // (segment, offset) -> RVA at lookup time.
@@ -91,8 +89,17 @@ bool PdbWriter::run() {
     }
   }
 
+  // FE.1.5: emitModules must run BEFORE emitPublicsAndGlobals so
+  // that scoped method publics (`TDog::GetBarkCount`) collected
+  // during S_GPROC32 emission can be batched into the single
+  // gsi.addPublicSymbols() call. LLVM's GSIStreamBuilder asserts
+  // that addPublicSymbols is called at most once; calling it
+  // per-method (the FE.1 approach) silently dropped all but the
+  // last scoped public in release builds.
   if (!emitModules())
     return false;
+
+  emitPublicsAndGlobals();
 
   // Push any LF_ARRAY records (byte[N] for non-{1,2,4,8} variable
   // widths) into the TPI stream so the symbol-level TypeIndex

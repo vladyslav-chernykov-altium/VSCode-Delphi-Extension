@@ -9,6 +9,7 @@
 #include "llvm/DebugInfo/CodeView/AppendingTypeTableBuilder.h"
 #include "llvm/DebugInfo/CodeView/DebugStringTableSubsection.h"
 #include "llvm/DebugInfo/CodeView/TypeIndex.h"
+#include "llvm/DebugInfo/PDB/Native/GSIStreamBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/PDBFileBuilder.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/Allocator.h"
@@ -126,8 +127,14 @@ private:
   // `obj.method()` calls; without a matching public it reports
   // "Function has no address". The strings must outlive
   // gsi.addPublicSymbols() until commit(), hence the member-side
-  // backing store.
+  // backing store. Reserved in emitModules() to its final size so
+  // .c_str() pointers stay valid across the push loop.
   std::vector<std::string> method_scoped_names_;
+  // FE.1.5: scoped BulkPublics collected during emitModules() and
+  // flushed in a single gsi.addPublicSymbols() call from
+  // emitPublicsAndGlobals(). LLVM's GSIStreamBuilder asserts that
+  // addPublicSymbols is called at most once -- so we batch.
+  std::vector<llvm::pdb::BulkPublic> pending_scoped_publics_;
   // Stripped-of-prefix names for S_GDATA32 globals (cppvsdbg parses
   // `.` as field access so `Watch: two_units.S` fails -- we emit the
   // unqualified `S` instead). The strings must outlive

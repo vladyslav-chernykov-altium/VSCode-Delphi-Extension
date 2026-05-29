@@ -408,6 +408,14 @@ void composeModules(Context &ctx) {
         // proc has explicit Pascal params (FE.2 territory) -- we
         // accept <=1 RSM-level param (Self only). VA + return-type
         // default (Int32) recorded for the writer.
+        //
+        // FE.1.5: if the class isn't in inputs.aggregates yet,
+        // lazy-register it from rsm_reader.aggregates(). Without
+        // this, methods declared on a class that is only used via
+        // a function-local (e.g. 08_inherit_props's TDog) are
+        // silently skipped, because their method-functions are
+        // emitted in source-declaration order BEFORE the user
+        // function whose local triggers class registration.
         if (have_rsm) {
           if (const auto *pr = rsm_reader.findProcedureAt(r.va)) {
             if (pr->params.size() <= 1) {
@@ -424,6 +432,7 @@ void composeModules(Context &ctx) {
                   const std::string method_name =
                       name.substr(last_dot + 1);
                   // Find class aggregate by name (any unit).
+                  bool registered = false;
                   for (auto& a : inputs.aggregates) {
                     if (a.kind != rsm2pdb::pdb::AggregateKind::Class)
                       continue;
@@ -434,7 +443,31 @@ void composeModules(Context &ctx) {
                     // return_kind defaults to Int32 / 4 bytes in
                     // FE.1 (RSM 0x23 decode is FE.x scope).
                     a.methods.push_back(std::move(am));
+                    registered = true;
                     break;
+                  }
+                  if (!registered) {
+                    // Lazy-register the class from RSM. agg_by_name
+                    // was populated by enrichGlobalsViaRsm; pick
+                    // the first Class entry matching this name.
+                    const rsm2pdb::rsm::AggregateType *foreign = nullptr;
+                    auto r2 = agg_by_name.equal_range(class_name);
+                    for (auto it = r2.first; it != r2.second; ++it) {
+                      if (it->second->kind
+                          == rsm2pdb::rsm::AggregateKind::Class) {
+                        foreign = it->second;
+                        break;
+                      }
+                    }
+                    if (foreign != nullptr) {
+                      if (auto idx = registerAggr(foreign)) {
+                        rsm2pdb::pdb::AggregateMethod am;
+                        am.name = method_name;
+                        am.qualified_name = mf_out.name;
+                        inputs.aggregates[*idx].methods.push_back(
+                            std::move(am));
+                      }
+                    }
                   }
                 }
               }

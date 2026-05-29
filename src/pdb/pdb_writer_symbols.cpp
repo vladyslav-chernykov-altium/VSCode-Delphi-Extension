@@ -47,7 +47,7 @@ void PdbWriter::emitPublicsAndGlobals() {
   auto &gsi = builder_.getGsiBuilder();
 
   std::vector<BulkPublic> bulks;
-  bulks.reserve(inputs_.publics.size());
+  bulks.reserve(inputs_.publics.size() + pending_scoped_publics_.size());
   for (const auto &p : inputs_.publics) {
     BulkPublic b{};
     b.Name = p.name.c_str();
@@ -58,6 +58,14 @@ void PdbWriter::emitPublicsAndGlobals() {
                              : codeview::PublicSymFlags::None);
     bulks.push_back(b);
   }
+  // FE.1.5: append the C++-scoped method publics collected during
+  // emitModules(). Their backing strings live in
+  // method_scoped_names_ (reserved to its final size before the
+  // loop, so .c_str() pointers in pending_scoped_publics_ remain
+  // valid). One bulk call satisfies LLVM's addPublicSymbols
+  // assert-once contract.
+  for (const auto &b : pending_scoped_publics_)
+    bulks.push_back(b);
   if (!bulks.empty()) {
     gsi.addPublicSymbols(std::move(bulks));
   }
