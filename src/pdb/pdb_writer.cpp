@@ -1,800 +1,121 @@
+// PDB writer entry point. Thin wrapper over the PdbWriter class
+// declared in pdb_writer_internal.h. Phase methods live in
+// pdb_writer_types.cpp / _symbols.cpp / _modules.cpp; only
+// run() + the wrapper stay here.
+
 #include "pdb/pdb_writer.h"
+#include "pdb/pdb_writer_internal.h"
 
 #include "llvm/BinaryFormat/COFF.h"
-#include "llvm/DebugInfo/CodeView/AppendingTypeTableBuilder.h"
-#include "llvm/DebugInfo/CodeView/CodeView.h"
-#include "llvm/DebugInfo/CodeView/DebugChecksumsSubsection.h"
-#include "llvm/DebugInfo/CodeView/DebugLinesSubsection.h"
-#include "llvm/DebugInfo/CodeView/DebugStringTableSubsection.h"
 #include "llvm/DebugInfo/CodeView/GUID.h"
-#include "llvm/DebugInfo/CodeView/Line.h"
-#include "llvm/DebugInfo/CodeView/SymbolRecord.h"
-#include "llvm/DebugInfo/CodeView/SymbolSerializer.h"
-#include "llvm/ADT/APSInt.h"
-#include "llvm/DebugInfo/CodeView/ContinuationRecordBuilder.h"
-#include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/MSF/MSFBuilder.h"
-#include "llvm/DebugInfo/PDB/Native/DbiModuleDescriptorBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/DbiStreamBuilder.h"
-#include "llvm/DebugInfo/PDB/Native/GSIStreamBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/InfoStreamBuilder.h"
-#include "llvm/DebugInfo/PDB/Native/PDBFileBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/PDBStringTableBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/RawConstants.h"
-#include "llvm/DebugInfo/PDB/Native/RawTypes.h"
 #include "llvm/DebugInfo/PDB/Native/TpiStreamBuilder.h"
-#include "llvm/Object/COFF.h"
-#include "llvm/Support/Allocator.h"
 #include "llvm/Support/Error.h"
-#include "llvm/Support/MD5.h"
-#include "llvm/Support/MemoryBuffer.h"
 
 #include <cstring>
-#include <unordered_map>
 
 namespace rsm2pdb::pdb {
 
-namespace {
+namespace { using detail::PdbWriter; }
 
-// Materialise our CoffSection list into the LLVM-native packed
-// `coff_section` layout (== IMAGE_SECTION_HEADER on disk). The
-// SectionMap entries DbiStreamBuilder writes derive solely from this
-// data so the debugger can map (segment, offset) -> RVA.
-std::vector<llvm::object::coff_section>
-toLlvmCoffSections(const std::vector<CoffSection>& src) {
-    std::vector<llvm::object::coff_section> dst(src.size());
-    for (std::size_t i = 0; i < src.size(); ++i) {
-        auto& d = dst[i];
-        std::memset(&d, 0, sizeof(d));
-        const auto& s = src[i];
-        const std::size_t n = std::min<std::size_t>(s.name.size(),
-                                                    sizeof(d.Name));
-        std::memcpy(d.Name, s.name.data(), n);
-        d.VirtualSize        = s.virtual_size;
-        d.VirtualAddress     = s.virtual_address;
-        d.SizeOfRawData      = s.size_of_raw_data;
-        d.PointerToRawData   = s.pointer_to_raw_data;
-        d.Characteristics    = s.characteristics;
+bool PdbWriter::run() {
+  using namespace llvm;
+  using namespace llvm::pdb;
+
+  if (auto e = builder_.initialize(4096)) {
+    error_out_ = "PDBFileBuilder::initialize: " + toString(std::move(e));
+    return false;
+  }
+
+  // Reserve well-known stream slots (Old MSF Dir / Info / TPI / DBI /
+  // IPI). PDBFileBuilder::initialize() doesn't allocate these and
+  // commit() fails with "stream too short" without them.
+  for (std::uint32_t i = 0; i < kSpecialStreamCount; ++i) {
+    if (auto e = builder_.getMsfBuilder().addStream(0).takeError()) {
+      error_out_ = "MSFBuilder::addStream reserved: " + toString(std::move(e));
+      return false;
     }
-    return dst;
+  }
+
+  // -- Info stream
+  auto &info = builder_.getInfoBuilder();
+  info.setVersion(PdbImplVC70);
+  info.setHashPDBContentsToGUID(false);
+  info.setAge(inputs_.age);
+  codeview::GUID cv_guid{};
+  std::memcpy(&cv_guid.Guid, inputs_.guid.data(), inputs_.guid.size());
+  info.setGuid(cv_guid);
+  info.addFeature(PdbRaw_FeatureSig::VC140);
+
+  // -- DBI stream
+  auto &dbi = builder_.getDbiBuilder();
+  dbi.setVersionHeader(PdbDbiV70);
+  dbi.setAge(static_cast<std::uint16_t>(inputs_.age));
+  dbi.setMachineType(COFF::IMAGE_FILE_MACHINE_AMD64);
+  dbi.setBuildNumber(14, 11); // pretend to be VS2017+; many debuggers
+                              // refuse to load PDBs with version 0.
+
+  // -- TPI + IPI: IPI stays empty; TPI receives any LF_ARRAY records
+  //    we build for non-{1,2,4,8}-byte variables. Built up as we walk
+  //    modules, then bulk-pushed below.
+  builder_.getTpiBuilder().setVersionHeader(PdbTpiV80);
+  builder_.getIpiBuilder().setVersionHeader(PdbTpiV80);
+
+  emitAggregates();
+
+  emitPublicsAndGlobals();
+
+  // SectionMap (derived from PE section headers). PUBSYM resolution
+  // relies on this; without it the debugger can't translate
+  // (segment, offset) -> RVA at lookup time.
+  const auto llvm_sections = toLlvmCoffSections(inputs_.sections);
+  dbi.createSectionMap(llvm_sections);
+
+  // Write the COFF section headers verbatim into the PDB's
+  // DbgStream[SectionHdr]. vsdbg / WinDbg use this to convert the
+  // (segment, offset) pairs stored in symbols + line tables into
+  // module-relative RVAs. Without it, vsdbg raises "Unexpected
+  // symbol reader error" when resolving a breakpoint to a PC.
+  if (!llvm_sections.empty()) {
+    ArrayRef<std::uint8_t> hdr_bytes(
+        reinterpret_cast<const std::uint8_t *>(llvm_sections.data()),
+        llvm_sections.size() * sizeof(object::coff_section));
+    if (auto e = dbi.addDbgStream(DbgHeaderType::SectionHdr, hdr_bytes)) {
+      error_out_ = "DbiStreamBuilder::addDbgStream(SectionHdr): " +
+                   toString(std::move(e));
+      return false;
+    }
+  }
+
+  if (!emitModules())
+    return false;
+
+  // Push any LF_ARRAY records (byte[N] for non-{1,2,4,8} variable
+  // widths) into the TPI stream so the symbol-level TypeIndex
+  // references we emitted above resolve at debug time.
+  for (auto rec : tpi_table_.records()) {
+    builder_.getTpiBuilder().addTypeRecord(rec, std::nullopt);
+  }
+
+  // Publish the shared string table into the PDB-global /names
+  // stream once, after every module has registered its file paths.
+  builder_.getStringTableBuilder().setStrings(*shared_strings_);
+
+  codeview::GUID out_guid{};
+  if (auto e = builder_.commit(path_, &out_guid)) {
+    error_out_ = "PDBFileBuilder::commit: " + toString(std::move(e));
+    return false;
+  }
+  return true;
 }
 
-} // namespace
-
-
-bool writePdb(const std::string& path,
-              const PdbInputs& inputs,
-              std::string& error_out) {
-    using namespace llvm;
-    using namespace llvm::pdb;
-
-    BumpPtrAllocator alloc;
-    PDBFileBuilder builder(alloc);
-
-    if (auto e = builder.initialize(4096)) {
-        error_out = "PDBFileBuilder::initialize: " + toString(std::move(e));
-        return false;
-    }
-
-    // Reserve well-known stream slots (Old MSF Dir / Info / TPI / DBI /
-    // IPI). PDBFileBuilder::initialize() doesn't allocate these and
-    // commit() fails with "stream too short" without them.
-    for (std::uint32_t i = 0; i < kSpecialStreamCount; ++i) {
-        if (auto e = builder.getMsfBuilder().addStream(0).takeError()) {
-            error_out = "MSFBuilder::addStream reserved: " +
-                        toString(std::move(e));
-            return false;
-        }
-    }
-
-    // -- Info stream
-    auto& info = builder.getInfoBuilder();
-    info.setVersion(PdbImplVC70);
-    info.setHashPDBContentsToGUID(false);
-    info.setAge(inputs.age);
-    codeview::GUID cv_guid{};
-    std::memcpy(&cv_guid.Guid, inputs.guid.data(), inputs.guid.size());
-    info.setGuid(cv_guid);
-    info.addFeature(PdbRaw_FeatureSig::VC140);
-
-    // -- DBI stream
-    auto& dbi = builder.getDbiBuilder();
-    dbi.setVersionHeader(PdbDbiV70);
-    dbi.setAge(static_cast<std::uint16_t>(inputs.age));
-    dbi.setMachineType(COFF::IMAGE_FILE_MACHINE_AMD64);
-    dbi.setBuildNumber(14, 11);   // pretend to be VS2017+; many debuggers
-                                  // refuse to load PDBs with version 0.
-
-    // -- TPI + IPI: IPI stays empty; TPI receives any LF_ARRAY records
-    //    we build for non-{1,2,4,8}-byte variables. Built up as we walk
-    //    modules, then bulk-pushed below.
-    builder.getTpiBuilder().setVersionHeader(PdbTpiV80);
-    builder.getIpiBuilder().setVersionHeader(PdbTpiV80);
-
-    codeview::AppendingTypeTableBuilder tpi_table(alloc);
-    std::unordered_map<std::uint32_t, codeview::TypeIndex> byte_array_cache;
-
-    // Pick a CodeView TypeIndex for a stack variable of `size` bytes.
-    //   1/2/4/8 -> simple built-in (UCHAR/USHORT/UINT32/UINT64) so the
-    //              debugger displays them as plain hex of the right
-    //              width;
-    //   N other -> LF_ARRAY of UCHAR with that count, cached per size;
-    //   0       -> void* (8-byte hex), our "unknown size" fallback.
-    auto typeForSize = [&](std::uint32_t size) -> codeview::TypeIndex {
-        switch (size) {
-            case 0: return codeview::TypeIndex::VoidPointer64();
-            case 1: return codeview::TypeIndex::UnsignedCharacter();
-            case 2: return codeview::TypeIndex::UInt16Short();
-            case 4: return codeview::TypeIndex::UInt32();
-            case 8: return codeview::TypeIndex::UInt64();
-            default: break;
-        }
-        auto it = byte_array_cache.find(size);
-        if (it != byte_array_cache.end()) return it->second;
-        codeview::ArrayRecord rec(
-            codeview::TypeIndex::UnsignedCharacter(),
-            codeview::TypeIndex::UInt32(),
-            size,
-            std::string{});
-        const auto ti = tpi_table.writeLeafType(rec);
-        byte_array_cache.emplace(size, ti);
-        return ti;
-    };
-    // Pick a CodeView TypeIndex for a Pascal primitive kind. Falls
-    // back to size-based selection when the kind is unset or doesn't
-    // map cleanly (e.g. Float80 which CodeView doesn't have a simple
-    // type for -- emit as 10-byte array).
-    auto typeForKindParts =
-        [&](std::uint32_t byte_size,
-            const std::optional<model::PrimitiveKind>& prim_kind)
-            -> codeview::TypeIndex {
-        if (!prim_kind) return typeForSize(byte_size);
-        // Local shim so the existing kind-switch below keeps reading
-        // off a `v.byte_size` / `*v.prim_kind` pair unchanged.
-        struct V {
-            std::uint32_t                       byte_size;
-            std::optional<model::PrimitiveKind> prim_kind;
-        };
-        const V v{byte_size, prim_kind};
-        using K = model::PrimitiveKind;
-        switch (*v.prim_kind) {
-            // Booleans: CodeView's Boolean8/16/32 simple types render
-            // as `true`/`false` rather than 0/1, matching Pascal's
-            // expected display.
-            case K::Bool:
-                switch (v.byte_size) {
-                    case 1: return codeview::TypeIndex(
-                                codeview::SimpleTypeKind::Boolean8);
-                    case 2: return codeview::TypeIndex(
-                                codeview::SimpleTypeKind::Boolean16);
-                    case 4: return codeview::TypeIndex(
-                                codeview::SimpleTypeKind::Boolean32);
-                    case 8: return codeview::TypeIndex(
-                                codeview::SimpleTypeKind::Boolean64);
-                    default: return typeForSize(v.byte_size);
-                }
-            // AnsiChar -> NarrowCharacter (T_CHAR, 1 byte).
-            case K::Char:  return codeview::TypeIndex::NarrowCharacter();
-            // Char / WideChar -> WideCharacter (T_WCHAR, 2 byte).
-            case K::WChar: return codeview::TypeIndex::WideCharacter();
-            // Signed integers.
-            case K::Int8:  return codeview::TypeIndex::SignedCharacter();
-            case K::Int16: return codeview::TypeIndex::Int16Short();
-            case K::Int32: return codeview::TypeIndex::Int32();
-            case K::Int64: return codeview::TypeIndex::Int64Quad();
-            // Unsigned integers.
-            case K::UInt8:  return codeview::TypeIndex::UnsignedCharacter();
-            case K::UInt16: return codeview::TypeIndex::UInt16Short();
-            case K::UInt32: return codeview::TypeIndex::UInt32();
-            case K::UInt64: return codeview::TypeIndex::UInt64();
-            // Floats.
-            case K::Float32: return codeview::TypeIndex::Float32();
-            case K::Float64: return codeview::TypeIndex::Float64();
-            // Float80 (Pascal Extended on x86) has no CodeView simple
-            // type; emit as a 10-byte hex array.
-            case K::Float80: return typeForSize(v.byte_size);
-            // Pointer-to-char primitives -- CodeView lets us encode
-            // these as a SimpleTypeKind paired with a 64-bit pointer
-            // mode, no LF_POINTER TPI record needed. cdb / VS render
-            // the pointee as a string starting at the address.
-            case K::PChar:
-                return codeview::TypeIndex(
-                    codeview::SimpleTypeKind::NarrowCharacter,
-                    codeview::SimpleTypeMode::NearPointer64);
-            case K::PWChar:
-                return codeview::TypeIndex(
-                    codeview::SimpleTypeKind::WideCharacter,
-                    codeview::SimpleTypeMode::NearPointer64);
-        }
-        return typeForSize(v.byte_size);
-    };
-    // -- LF_FIELDLIST + LF_STRUCTURE / LF_CLASS + LF_POINTER ----------
-    //
-    // Phase D + E: emit a TPI record for every user aggregate.
-    //
-    //   Record (TPoint, TPerson, TBox, TPacked, TBig, ...)
-    //     LF_FIELDLIST -- one LF_MEMBER per field.
-    //     LF_STRUCTURE -- references the field list.
-    //     A variable of this type references the LF_STRUCTURE
-    //     directly (records are value types in Pascal).
-    //
-    //   Class (TShape, TCircle, TBag, ...)
-    //     LF_FIELDLIST -- optional LF_BCLASS first, then LF_MEMBERs.
-    //     LF_CLASS     -- references the field list.
-    //     LF_POINTER   -- 8-byte Near64 pointer to LF_CLASS.
-    //     A variable of this type references the LF_POINTER (Pascal
-    //     class instances live on the heap; `var X: TShape` is a
-    //     pointer slot, not an inline structure).
-    //
-    // We keep two parallel TypeIndex vectors:
-    //   aggregate_inner_ti -- the LF_STRUCTURE / LF_CLASS itself,
-    //                         used for LF_BCLASS base references
-    //                         and LF_MEMBER nested-record fields.
-    //   aggregate_var_ti   -- what variables / globals reference:
-    //                         records  == aggregate_inner_ti
-    //                         classes  == LF_POINTER -> inner_ti
-    //
-    // Single-pass emission is correct for Phase D + E because the
-    // cli_cmd_pdb registrar walks composite refs AND class bases
-    // depth-first, so dependents (base classes, nested records) are
-    // always registered before their containers / derived classes.
-    std::vector<codeview::TypeIndex> aggregate_inner_ti;
-    std::vector<codeview::TypeIndex> aggregate_var_ti;
-    aggregate_inner_ti.reserve(inputs.aggregates.size());
-    aggregate_var_ti.reserve(inputs.aggregates.size());
-
-    // Resolve a field's TypeIndex.
-    auto fieldTypeIndex =
-        [&](const AggregateField& f) -> codeview::TypeIndex {
-            if (f.nested_aggregate) {
-                const auto idx = *f.nested_aggregate;
-                if (idx < aggregate_var_ti.size()) return aggregate_var_ti[idx];
-                // Forward ref not supported; fall back to UCHAR to
-                // avoid an invalid TypeIndex landing in the debugger.
-                return codeview::TypeIndex::UnsignedCharacter();
-            }
-            return typeForKindParts(
-                f.byte_size != 0 ? f.byte_size : 4u, f.prim_kind);
-        };
-
-    for (const auto& a : inputs.aggregates) {
-        // Phase F+ Sets: Pascal `set of TColor` becomes an LF_STRUCTURE
-        // of LF_BITFIELD members, one bit per enumerator. The bit's
-        // BitOffset = enumerator ordinal, BitSize = 1. cdb / VS show
-        // each enumerator's state (`clRed: 0y1, clBlue: 0y1, ...`)
-        // instead of an opaque hex byte. Set width matches Delphi's
-        // power-of-two rounding (1/2/4/8 bytes), so the underlying
-        // integer width is taken from a.byte_size.
-        if (a.kind == AggregateKind::Set) {
-            const codeview::TypeIndex underlying =
-                  a.byte_size == 1 ? codeview::TypeIndex::UnsignedCharacter()
-                : a.byte_size == 2 ? codeview::TypeIndex::UInt16Short()
-                : a.byte_size == 4 ? codeview::TypeIndex::UInt32()
-                                   : codeview::TypeIndex::UInt64();
-            codeview::ContinuationRecordBuilder sb;
-            sb.begin(codeview::ContinuationRecordKind::FieldList);
-            for (const auto& e : a.enumerators) {
-                codeview::BitFieldRecord bfr(
-                    underlying,
-                    /*BitSize=*/ 1,
-                    /*BitOffset=*/ static_cast<std::uint8_t>(e.value));
-                const auto bf_ti = tpi_table.writeLeafType(bfr);
-                codeview::DataMemberRecord dmr(
-                    codeview::MemberAccess::Public,
-                    bf_ti,
-                    /*offset=*/ 0,
-                    e.name);
-                sb.writeMemberType(dmr);
-            }
-            const auto set_fl_ti = tpi_table.insertRecord(sb);
-            codeview::ClassRecord sr(
-                codeview::TypeRecordKind::Struct,
-                static_cast<std::uint16_t>(a.enumerators.size()),
-                codeview::ClassOptions::None,
-                set_fl_ti,
-                codeview::TypeIndex::None(),
-                codeview::TypeIndex::None(),
-                a.byte_size,
-                a.name,
-                std::string{});
-            const auto set_ti = tpi_table.writeLeafType(sr);
-            aggregate_inner_ti.push_back(set_ti);
-            aggregate_var_ti.push_back(set_ti);  // value type
-            continue;
-        }
-
-        // Phase F: enum types take a different shape -- LF_ENUM
-        // wrapping an LF_FIELDLIST of LF_ENUMERATEs (one per
-        // enumerator). The underlying integer type is picked from
-        // the precomputed byte_size (1 -> UChar, 2 -> UShort,
-        // 4 -> UInt32) so cdb / VS know how wide to read the
-        // memory slot.
-        if (a.kind == AggregateKind::Enum) {
-            codeview::ContinuationRecordBuilder ecb;
-            ecb.begin(codeview::ContinuationRecordKind::FieldList);
-            for (const auto& e : a.enumerators) {
-                llvm::APSInt apv(64, /*isUnsigned=*/ false);
-                apv = e.value;
-                codeview::EnumeratorRecord er(
-                    codeview::MemberAccess::Public,
-                    apv,
-                    e.name);
-                ecb.writeMemberType(er);
-            }
-            const auto enum_fl_ti = tpi_table.insertRecord(ecb);
-            const codeview::TypeIndex underlying =
-                a.byte_size == 1
-                    ? codeview::TypeIndex::UnsignedCharacter()
-                    : a.byte_size == 2
-                        ? codeview::TypeIndex::UInt16Short()
-                        : codeview::TypeIndex::UInt32();
-            codeview::EnumRecord er_rec(
-                static_cast<std::uint16_t>(a.enumerators.size()),
-                codeview::ClassOptions::None,
-                enum_fl_ti,
-                a.name,
-                std::string{},
-                underlying);
-            const auto enum_ti = tpi_table.writeLeafType(er_rec);
-            aggregate_inner_ti.push_back(enum_ti);
-            aggregate_var_ti.push_back(enum_ti);  // value type
-            continue;
-        }
-
-        const bool is_class = (a.kind == AggregateKind::Class);
-
-        codeview::ContinuationRecordBuilder crb;
-        crb.begin(codeview::ContinuationRecordKind::FieldList);
-        std::uint16_t member_count = 0;
-        // LF_BCLASS for class with explicit base (Phase E
-        // inheritance). The base lives at field-list position 0; its
-        // TypeIndex must be the LF_CLASS, not the pointer wrapper.
-        if (is_class && a.base
-            && *a.base < aggregate_inner_ti.size()) {
-            codeview::BaseClassRecord bcr(
-                codeview::MemberAccess::Public,
-                aggregate_inner_ti[*a.base],
-                /*offset=*/ 0);
-            crb.writeMemberType(bcr);
-            ++member_count;
-        }
-        for (const auto& f : a.fields) {
-            codeview::DataMemberRecord dmr(
-                codeview::MemberAccess::Public,
-                fieldTypeIndex(f),
-                f.byte_offset,
-                f.name);
-            crb.writeMemberType(dmr);
-            ++member_count;
-        }
-        const auto field_list_ti = tpi_table.insertRecord(crb);
-        codeview::ClassRecord cr(
-            is_class ? codeview::TypeRecordKind::Class
-                     : codeview::TypeRecordKind::Struct,
-            member_count,
-            codeview::ClassOptions::None,
-            field_list_ti,
-            codeview::TypeIndex::None(),
-            codeview::TypeIndex::None(),
-            a.byte_size,
-            a.name,
-            std::string{});
-        const auto inner_ti = tpi_table.writeLeafType(cr);
-        aggregate_inner_ti.push_back(inner_ti);
-
-        if (is_class) {
-            // Wrap in an 8-byte Near64 LF_POINTER. Variables of class
-            // type are pointers; the pointer is what S_REGREL32 /
-            // S_GDATA32 ultimately reference.
-            codeview::PointerRecord pr(
-                inner_ti,
-                codeview::PointerKind::Near64,
-                codeview::PointerMode::Pointer,
-                codeview::PointerOptions::None,
-                /*size=*/ 8);
-            aggregate_var_ti.push_back(tpi_table.writeLeafType(pr));
-        } else {
-            aggregate_var_ti.push_back(inner_ti);
-        }
-    }
-
-    // Route a (byte_size, prim_kind, optional aggregate_index) tuple
-    // to the right TypeIndex. aggregate_index wins when set.
-    auto resolveTypeIndex =
-        [&](std::uint32_t byte_size,
-            const std::optional<model::PrimitiveKind>& prim_kind,
-            const std::optional<std::size_t>& aggregate_index)
-            -> codeview::TypeIndex {
-            if (aggregate_index && *aggregate_index < aggregate_var_ti.size()) {
-                return aggregate_var_ti[*aggregate_index];
-            }
-            return typeForKindParts(byte_size, prim_kind);
-        };
-    auto typeForKind = [&](const ModuleLocal& v) -> codeview::TypeIndex {
-        return resolveTypeIndex(v.byte_size, v.prim_kind, v.aggregate_index);
-    };
-    auto typeForKindPublic = [&](const PublicSymbol& p) -> codeview::TypeIndex {
-        return resolveTypeIndex(p.byte_size, p.prim_kind, p.aggregate_index);
-    };
-
-    // -- GSI: publish caller-supplied publics
-    auto& gsi = builder.getGsiBuilder();
-
-    std::vector<BulkPublic> bulks;
-    bulks.reserve(inputs.publics.size());
-    for (const auto& p : inputs.publics) {
-        BulkPublic b{};
-        b.Name    = p.name.c_str();
-        b.NameLen = static_cast<std::uint32_t>(p.name.size());
-        b.Segment = p.segment;
-        b.Offset  = p.offset;
-        b.setFlags(p.is_function
-                       ? codeview::PublicSymFlags::Function
-                       : codeview::PublicSymFlags::None);
-        bulks.push_back(b);
-    }
-    if (!bulks.empty()) {
-        gsi.addPublicSymbols(std::move(bulks));
-    }
-
-    // For each non-function public, also emit an S_GDATA32 into the
-    // globals stream so cppvsdbg / WinDbg surface the variable in the
-    // Watch view. Two reasons we don't use the .map's fully-qualified
-    // Pascal name here:
-    //   (1) cppvsdbg's expression evaluator treats `.` as field access
-    //       (Pascal's namespace separator is a syntax error to it), so
-    //       `Watch: two_units.S` reports "two_units undefined".
-    //   (2) Without a real type the debugger can't display the value,
-    //       so we default everything to `void*` -- 8-byte hex view
-    //       that doubles as a freely-castable handle in Watch
-    //       (e.g. `(char*)PChar, 10` shows 10 chars; `*(int*)&I`
-    //       reads 4 bytes at a variable's address).
-    // The fully-qualified name still lives in S_PUB32 for stack traces.
-    // Stored strings must outlive gsi.addGlobalSymbol() so we hold them
-    // in a vector kept alive until commit().
-    std::vector<std::string> global_unqualified;
-    global_unqualified.reserve(inputs.publics.size());
-    for (const auto& p : inputs.publics) {
-        if (p.is_function) continue;
-        const auto dot = p.name.find_last_of('.');
-        global_unqualified.push_back(
-            dot == std::string::npos ? p.name : p.name.substr(dot + 1));
-    }
-    {
-        std::size_t idx = 0;
-        for (const auto& p : inputs.publics) {
-            if (p.is_function) continue;
-            codeview::DataSym data(codeview::SymbolRecordKind::GlobalData);
-            data.Type       = typeForKindPublic(p);
-            data.DataOffset = p.offset;
-            data.Segment    = p.segment;
-            data.Name       = global_unqualified[idx++];
-            gsi.addGlobalSymbol(data);
-        }
-    }
-
-    dbi.setPublicsStreamIndex(gsi.getPublicsStreamIndex());
-    dbi.setGlobalsStreamIndex(gsi.getGlobalsStreamIndex());
-    dbi.setSymbolRecordStreamIndex(gsi.getRecordStreamIndex());
-
-    // SectionMap (derived from PE section headers). PUBSYM resolution
-    // relies on this; without it the debugger can't translate
-    // (segment, offset) -> RVA at lookup time.
-    const auto llvm_sections = toLlvmCoffSections(inputs.sections);
-    dbi.createSectionMap(llvm_sections);
-
-    // Write the COFF section headers verbatim into the PDB's
-    // DbgStream[SectionHdr]. vsdbg / WinDbg use this to convert the
-    // (segment, offset) pairs stored in symbols + line tables into
-    // module-relative RVAs. Without it, vsdbg raises "Unexpected
-    // symbol reader error" when resolving a breakpoint to a PC.
-    if (!llvm_sections.empty()) {
-        ArrayRef<std::uint8_t> hdr_bytes(
-            reinterpret_cast<const std::uint8_t*>(llvm_sections.data()),
-            llvm_sections.size() * sizeof(object::coff_section));
-        if (auto e = dbi.addDbgStream(DbgHeaderType::SectionHdr, hdr_bytes)) {
-            error_out = "DbiStreamBuilder::addDbgStream(SectionHdr): " +
-                        toString(std::move(e));
-            return false;
-        }
-    }
-
-    // -- Modules: one DBI module per Pascal compile unit. Each carries
-    //    S_GPROC32 / S_END procedure symbols and a C13 line subsection
-    //    so the debugger can map VAs to source lines for breakpoints.
-    //
-    //    All modules share one DebugStringTableSubsection so the
-    //    PDB-global /names stream resolves every file path correctly.
-    //    lld follows the same pattern.
-    auto shared_strings =
-        std::make_shared<codeview::DebugStringTableSubsection>();
-
-    // Helper: look up section Characteristics by 1-based segment index
-    // so each SectionContrib carries the same flags as the PE section.
-    auto sectionCharacteristics = [&](std::uint16_t seg) -> std::uint32_t {
-        if (seg == 0 || seg > inputs.sections.size()) return 0;
-        return inputs.sections[seg - 1].characteristics;
-    };
-
-    // Section contributions: collected per-function and sorted by
-    // (Section, Offset) before submission. PDB spec requires this
-    // ordering so debuggers can binary-search. Without sorting,
-    // vsdbg fails to resolve breakpoints for functions whose
-    // contribs land "before" earlier-listed ones (manifested as: BP
-    // works only in some source files).
-    std::vector<SectionContrib> pending_contribs;
-
-    std::uint16_t mod_index = 0;
-    for (const auto& mod : inputs.modules) {
-        auto m_or_err = dbi.addModuleInfo(mod.name);
-        if (!m_or_err) {
-            error_out = "DbiStreamBuilder::addModuleInfo: " +
-                        toString(m_or_err.takeError());
-            return false;
-        }
-        auto& m = *m_or_err;
-        m.setObjFileName(mod.name + ".obj");
-        for (const auto& src : mod.sources) {
-            if (src.source_path.empty()) continue;
-            if (auto e = dbi.addModuleSourceFile(m, src.source_path)) {
-                error_out = "DbiStreamBuilder::addModuleSourceFile: " +
-                            toString(std::move(e));
-                return false;
-            }
-        }
-
-        // S_GPROC32 + S_FRAMEPROC + S_REGREL32 (params, locals) + S_END.
-        // ProcSym.End is patched to point at the matching S_END's
-        // stream offset; otherwise the scope is "open" and vsdbg
-        // won't associate locals with the function.
-        for (const auto& fn : mod.functions) {
-            const std::uint32_t proc_offset = m.getNextSymbolOffset();
-
-            codeview::ProcSym proc(
-                codeview::SymbolRecordKind::GlobalProcSym);
-            proc.Parent      = 0;
-            proc.End         = 0;       // patched below via raw bytes
-            proc.Next        = 0;
-            proc.CodeSize    = fn.size;
-            proc.DbgStart    = 0;
-            proc.DbgEnd      = fn.size;
-            proc.FunctionType = codeview::TypeIndex::None();
-            proc.CodeOffset  = fn.offset;
-            proc.Segment     = fn.segment;
-            proc.Flags       = codeview::ProcSymFlags::None;
-            proc.Name        = fn.name;
-            auto cv_proc = codeview::SymbolSerializer::writeOneSymbol(
-                proc, alloc, codeview::CodeViewContainer::Pdb);
-            // The serializer wrote into a buffer owned by `alloc`.
-            // Grab a writable pointer so we can patch End later.
-            std::uint8_t* proc_bytes = const_cast<std::uint8_t*>(
-                cv_proc.data().data());
-            m.addSymbol(cv_proc);
-
-            // S_FRAMEPROC: tells vsdbg which register holds the frame
-            // pointer for locals + params. Without this, the
-            // S_REGREL32 records below are written but vsdbg can't
-            // resolve them, so Locals stays empty.
-            // Encoding: bits 14-15 = local FP, 16-17 = param FP;
-            // EncodedFramePtrReg::FramePtr (= 2) maps to RBP on x64.
-            codeview::FrameProcSym frame(
-                codeview::SymbolRecordKind::FrameProcSym);
-            frame.TotalFrameBytes           = fn.size;
-            frame.PaddingFrameBytes         = 0;
-            frame.OffsetToPadding           = 0;
-            frame.BytesOfCalleeSavedRegisters = 0;
-            frame.OffsetOfExceptionHandler  = 0;
-            frame.SectionIdOfExceptionHandler = 0;
-            frame.Flags = static_cast<codeview::FrameProcedureOptions>(
-                (2u << 14) | (2u << 16));
-            m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
-                frame, alloc, codeview::CodeViewContainer::Pdb));
-
-            for (const auto& v : fn.locals) {
-                if (v.register_id != 0) {
-                    // Variable lives in a CPU register for the whole
-                    // function range. Emit S_LOCAL + S_DEFRANGE_REGISTER
-                    // covering [fn.offset, fn.offset + fn.size).
-                    codeview::LocalSym loc(
-                        codeview::SymbolRecordKind::LocalSym);
-                    loc.Type  = typeForKind(v);
-                    loc.Flags = v.is_param
-                                ? codeview::LocalSymFlags::IsParameter
-                                : codeview::LocalSymFlags::None;
-                    loc.Name  = v.name;
-                    m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
-                        loc, alloc, codeview::CodeViewContainer::Pdb));
-
-                    codeview::DefRangeRegisterSym dr(
-                        codeview::SymbolRecordKind::DefRangeRegisterSym);
-                    dr.Hdr.Register = v.register_id;
-                    dr.Hdr.MayHaveNoName = 0;
-                    dr.Range.OffsetStart = fn.offset;
-                    dr.Range.ISectStart  = fn.segment;
-                    dr.Range.Range = static_cast<std::uint16_t>(
-                        std::min<std::uint32_t>(fn.size,
-                            codeview::MaxDefRange));
-                    m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
-                        dr, alloc, codeview::CodeViewContainer::Pdb));
-                    continue;
-                }
-                if (v.optimized_out) {
-                    // S_LOCAL alone (no S_DEFRANGE_*) tells the
-                    // debugger the variable exists at this scope but
-                    // has no known runtime location. cppvsdbg surfaces
-                    // it as `<optimized away>` in Locals.
-                    codeview::LocalSym loc(
-                        codeview::SymbolRecordKind::LocalSym);
-                    loc.Type  = typeForKind(v);
-                    loc.Flags = v.is_param
-                                ? codeview::LocalSymFlags::IsParameter
-                                : codeview::LocalSymFlags::None;
-                    loc.Name  = v.name;
-                    m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
-                        loc, alloc, codeview::CodeViewContainer::Pdb));
-                    continue;
-                }
-                codeview::RegRelativeSym reg(
-                    codeview::SymbolRecordKind::RegRelativeSym);
-                reg.Offset   = static_cast<std::uint32_t>(v.offset);
-                reg.Type     = typeForKind(v);
-                reg.Register = codeview::RegisterId::RBP;
-                reg.Name     = v.name;
-                m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
-                    reg, alloc, codeview::CodeViewContainer::Pdb));
-            }
-
-            // S_END is about to land at this offset; patch the proc's
-            // End field now (it's at byte offset 8 = 4-byte CVHeader
-            // + 4-byte Parent field).
-            const std::uint32_t end_offset = m.getNextSymbolOffset();
-            std::memcpy(proc_bytes + 8, &end_offset, 4);
-            (void)proc_offset;  // proc_offset == module_offset of proc,
-                                // useful for debugging if needed.
-
-            codeview::ScopeEndSym end_sym(
-                codeview::SymbolRecordKind::ScopeEndSym);
-            m.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
-                end_sym, alloc, codeview::CodeViewContainer::Pdb));
-
-            SectionContrib sc{};
-            sc.ISect          = fn.segment;
-            sc.Off            = fn.offset;
-            sc.Size           = fn.size;
-            sc.Characteristics = sectionCharacteristics(fn.segment);
-            sc.Imod           = mod_index;
-            sc.DataCrc        = 0;
-            sc.RelocCrc       = 0;
-            pending_contribs.push_back(sc);
-        }
-
-        // C13 line info. Skip cleanly when there's nothing to emit --
-        // but first bump mod_index so the next module's SectionContribs
-        // get the right Imod. (Forgetting this collapsed every
-        // line-less module's contribs onto a single bogus Imod.)
-        bool any_lines = false;
-        for (const auto& src : mod.sources) {
-            if (!src.lines.empty() && !src.source_path.empty()) {
-                any_lines = true; break;
-            }
-        }
-        if (!any_lines) { ++mod_index; continue; }
-
-        // One DebugChecksumsSubsection per module holds an entry for
-        // every source file referenced by this module's line tables.
-        // cppvsdbg refuses to resolve BPs in modules whose checksums
-        // are FileChecksumKind::None, so we compute MD5 of each path
-        // (zero-filled MD5 when the file is unreadable -- BPs still
-        // bind, just with a "source changed" warning).
-        auto checksums = std::make_shared<codeview::DebugChecksumsSubsection>(
-            *shared_strings);
-        for (const auto& src : mod.sources) {
-            if (src.source_path.empty()) continue;
-            std::array<std::uint8_t, 16> md5{};
-            if (auto buf_or = MemoryBuffer::getFile(src.source_path)) {
-                MD5 hasher;
-                hasher.update((*buf_or)->getBuffer());
-                MD5::MD5Result result;
-                hasher.final(result);
-                std::memcpy(md5.data(), result.data(), 16);
-            }
-            checksums->addChecksum(src.source_path,
-                                   codeview::FileChecksumKind::MD5,
-                                   md5);
-        }
-        m.addDebugSubsection(checksums);
-
-        // Build a per-source sorted index of line entries so we can
-        // binary-search by (segment, offset) for each function instead
-        // of scanning every line every time. Skipping this turned the
-        // composition phase O(F * L) per module which on AdvPCB (~336k
-        // functions / ~1.8M line entries) burned minutes.
-        struct LineIdx {
-            const ModuleSource* src;
-            const ModuleLine*   line;
-        };
-        std::vector<LineIdx> sorted_lines;
-        std::size_t total_lines = 0;
-        for (const auto& s : mod.sources) total_lines += s.lines.size();
-        sorted_lines.reserve(total_lines);
-        for (const auto& s : mod.sources) {
-            for (const auto& l : s.lines) sorted_lines.push_back({&s, &l});
-        }
-        std::sort(sorted_lines.begin(), sorted_lines.end(),
-            [](const LineIdx& a, const LineIdx& b) {
-                if (a.line->segment != b.line->segment)
-                    return a.line->segment < b.line->segment;
-                return a.line->offset < b.line->offset;
-            });
-
-        // One DebugLinesSubsection per function. lower_bound jumps us
-        // to the first line at or after fn.offset; iterate until we
-        // run past the function's end. A function's lines are assumed
-        // to live in one source file (true in practice for Delphi).
-        for (const auto& fn : mod.functions) {
-            ModuleLine key{};
-            key.segment = fn.segment;
-            key.offset  = fn.offset;
-            auto first = std::lower_bound(
-                sorted_lines.begin(), sorted_lines.end(), key,
-                [](const LineIdx& a, const ModuleLine& k) {
-                    if (a.line->segment != k.segment)
-                        return a.line->segment < k.segment;
-                    return a.line->offset < k.offset;
-                });
-            const std::uint32_t fn_end =
-                fn.offset + std::max<std::uint32_t>(fn.size, 1);
-            const ModuleSource* fn_src = nullptr;
-            std::vector<const ModuleLine*> fn_lines;
-            for (auto it = first; it != sorted_lines.end(); ++it) {
-                if (it->line->segment != fn.segment) break;
-                if (it->line->offset >= fn_end) break;
-                if (!fn_src) fn_src = it->src;
-                fn_lines.push_back(it->line);
-            }
-            if (fn_lines.empty()) continue;
-
-            auto lines = std::make_shared<codeview::DebugLinesSubsection>(
-                *checksums, *shared_strings);
-            lines->setRelocationAddress(fn.segment, fn.offset);
-            lines->setCodeSize(fn.size);
-            lines->setFlags(codeview::LineFlags::LF_None);
-            lines->createBlock(fn_src->source_path);
-            for (const auto* l : fn_lines) {
-                lines->addLineInfo(
-                    l->offset - fn.offset,
-                    codeview::LineInfo(l->line, l->line, /*isStmt*/true));
-            }
-            m.addDebugSubsection(lines);
-        }
-        ++mod_index;
-    }
-
-    // Submit collected section contributions in (ISect, Off) order.
-    std::sort(pending_contribs.begin(), pending_contribs.end(),
-        [](const SectionContrib& a, const SectionContrib& b) {
-            if (a.ISect != b.ISect) return a.ISect < b.ISect;
-            return a.Off < b.Off;
-        });
-    for (const auto& sc : pending_contribs) dbi.addSectionContrib(sc);
-
-    // Push any LF_ARRAY records (byte[N] for non-{1,2,4,8} variable
-    // widths) into the TPI stream so the symbol-level TypeIndex
-    // references we emitted above resolve at debug time.
-    for (auto rec : tpi_table.records()) {
-        builder.getTpiBuilder().addTypeRecord(rec, std::nullopt);
-    }
-
-    // Publish the shared string table into the PDB-global /names
-    // stream once, after every module has registered its file paths.
-    builder.getStringTableBuilder().setStrings(*shared_strings);
-
-    codeview::GUID out_guid{};
-    if (auto e = builder.commit(path, &out_guid)) {
-        error_out = "PDBFileBuilder::commit: " + toString(std::move(e));
-        return false;
-    }
-    return true;
+bool writePdb(const std::string &path, const PdbInputs &inputs,
+              std::string &error_out) {
+  return PdbWriter(path, inputs, error_out).run();
 }
 
 } // namespace rsm2pdb::pdb
