@@ -947,6 +947,171 @@ delivered together. Remaining sub-milestones below are deferred.
          synthesis). Tracked as Step 11b roadmap below.
 
 
+----- CURRENT FOCUS: function-eval from debugger -----
+
+Goal: support `obj.func(...)` invocation directly from Watch / Locals
+in cppvsdbg (VS native debugger) and cdb. Today the debugger has no
+way to call into a Pascal method -- it shows fields fine but the
+property accessors needed for read-only / computed properties (Pascal
+`property X: T read GetX` pattern) are inert. Implementation path is
+the same for both subtasks: emit CodeView function-type info
+(LF_MFUNCTION + LF_ARGLIST) and link methods to their owning class
+via LF_ONEMETHOD entries in the class field-list.
+
+Pre-flight (~3-5 budget; mandatory before committing to estimates):
+
+[x] FE.0 DONE 2026-05-29. Cost ~17 budget (3-5 est, overshoot per
+         directive #2 retro). Outcome: GREEN LIGHT for function-
+         eval via cdb `.call`. cppvsdbg has Pascal-PDB-specific
+         limitations exposed by FE.1 (see below); cdb's `??`
+         evaluator never invokes methods (cdb limitation, not
+         our PDB).
+
+[x] FE.0a NOT done -- deferred to FE.x as part of full return-
+         type decode. FE.1 uses Int32 default (works for property
+         getters which are the dominant case).
+
+Main work:
+
+[~] FE.1 Subtask 1 -- parameterless methods. PARTIAL DONE
+         2026-05-29.
+         Done:
+         a. LF_MFUNCTION emission per registered class method.
+         b. Empty LF_ARGLIST cached (per emitAggregates call).
+         c. Forward-decl + complete LF_CLASS pattern for classes
+            with methods (cycle-breaks the LF_MFUNCTION <-> class
+            type circular dependency).
+         d. LF_ONEMETHOD entries appended to class LF_FIELDLIST.
+         e. S_GPROC32.FunctionType wired via method_type_by_qname_.
+         f. Additional S_PUB32 with C++-scoped name `Class::Method`
+            so cppvsdbg's name lookup can resolve via that form.
+         g. `PointerOptions::Const` on the ThisType LF_POINTER
+            (Pascal Self is "const this").
+
+         Verified working:
+         - cdb `.call inherit_props!inherit_props.TDog.GetBarkCount
+           (@@c++(lDog))` correctly invokes the method (cdb
+           verifies signature, sets up the call, runs to completion,
+           prints `.call returns: int 0nXXX`).
+
+         Verified NOT working:
+         - cdb `?? @@c++(lDog->GetBarkCount())` -> "Type does not
+           have given member". cdb's `??` evaluator never invokes
+           methods regardless of PDB structure (cdb limitation,
+           not our PDB).
+         - VS-native (cppvsdbg) Watch `lDog.GetBarkCount()` ->
+           "the object has type qualifiers that are not compatible
+           with the member function TDog::GetBarkCount" +
+           "Function TDog::GetBarkCount has no address, possibly
+           due to compiler optimizations". cppvsdbg sees the
+           method via LF_ONEMETHOD but cannot resolve to address
+           even with C++-scoped S_PUB32. Deeper PDB infrastructure
+           needed (see FE.1.5 below).
+
+         FE.1 closes here as PARTIAL deliverable. cdb `.call`
+         supported is a real win for tooling-driven invocation
+         (test harnesses, scripted dumps). User-facing Watch
+         `obj.method()` deferred to FE.1.5.
+
+[ ] FE.1.5 cppvsdbg `obj.method()` Watch syntax via IPI stream
+         + S_GPROC32_ID. After FE.1 we have LF_MFUNCTION (TPI)
+         + scoped S_PUB32 but cppvsdbg still reports "no address".
+         The missing piece is likely:
+         a. LF_MFUNC_ID (Item ID) in the IPI stream, referencing
+            the LF_MFUNCTION + carrying name + scope.
+         b. S_GPROC32_ID (modern symbol kind) in module stream
+            referencing the LF_MFUNC_ID instead of LF_MFUNCTION.
+         c. S_PROCREF in GSI globals stream cross-referencing
+            module-local S_GPROC32_ID by (module_index, sym_offset)
+            so name-based lookup from publics can chain back to
+            the procedure entry.
+         d. Possibly populate TPI hash stream so type-by-name
+            (e.g. `dt inherit_props!TDog`) resolves -- cdb
+            currently says "Symbol not found" despite our PDB
+            having the type.
+
+         Estimate: 8-12 budget. Risk: each piece may or may not
+         move cppvsdbg's evaluator forward; investigation has
+         already cost >30 budget across FE.0+FE.1 with this
+         residual gap. Worth one more bounded attempt with
+         tighter tripwire (3-cdb-iteration limit per directive
+         #3); if no progress, accept VS-Watch as known limit
+         and ship NatVis sidecar for field-backed properties
+         only.
+
+[ ] FE.2 Subtask 2 -- methods with parameters.
+         a. LF_ARGLIST builder reusing the Phase D/E type pipeline
+            (params already typed in ResolvedFunction).
+         b. LF_MFUNCTION takes non-empty ArgList; paramcount set.
+         c. Test: `obj.GetPair(5, 'foo')` in cdb.
+         Effort: +0.5-1 day incremental = +4-6 budget.
+
+Next after function-eval:
+
+[ ] FE.3 Same machinery for INTERFACE-typed locals. Calling a method
+         through an interface reference (e.g. `iface.DoThing()` where
+         iface: IFoo) goes through the VMT/IMT trampoline. Likely
+         needs LF_VTSHAPE + LF_VFUNCTAB + careful this-type encoding.
+         examples/06_interface is the fixture. Effort: estimate
+         after FE.1/FE.2 land; depends on FE.1 design choices.
+
+----- Bugs surfaced during FE.0 (track separately, not gating) -----
+
+[ ] BUG-1 Wrong field-offsets / inherited-field layout in PDB
+          LF_CLASS for 3-level Pascal inheritance.
+
+          Repro: examples/08_inherit_props, BP at
+          `inherit_props.dpr:152` (inside ProbeAll), then `?? lDog`
+          in cdb. Expected: lDog renders with fName="Rex",
+          fAge=5, fFurColor="brown", fBreed="Labrador",
+          fBarkCount=42. Actual:
+              class TDog * 0x...0254cce0
+                 +0x008 fName     : "Whiskers"   <- lMammal's name
+                 +0x010 fAge      : 0n3          <- lMammal's age
+                 +0x018 fFurColor : "gray"       <- lMammal's color
+                 +0x020 fBreed    : (null)
+                 +0x028 fBarkCount: 0n39110608   <- garbage
+
+          The lDog pointer itself is correct (0x0254cce0, distinct
+          from lMammal at 0x0254cc80). Field expansion is reading
+          from offsets that match lMammal's heap allocation
+          contents, not lDog's. Possible causes (need bisection):
+          - LF_BCLASS base-offset for TMammal->TAnimal chain
+            uses wrong base offset (should be 0 for single-
+            inheritance in Pascal heap classes).
+          - field byte_offsets recorded for inherited fields are
+            relative to TAnimal-base, not TDog-base.
+          - LF_POINTER -> LF_CLASS uses wrong size (Pascal heap
+            object has a hidden VMT pointer at offset 0; if our
+            LF_CLASS doesn't account for it, all field offsets
+            are +8 shifted).
+
+          The hidden-VMT-pointer hypothesis is the most likely:
+          field offsets +0x008/0x010/... look exactly like
+          "PASCAL_HEADER_8_BYTES + 0, +8, +16" pattern -- which
+          is correct for TAnimal alone. But TDog's heap object
+          STARTS at the same address as its TAnimal portion,
+          plus TMammal-extras, plus TDog-extras. So fName/fAge
+          really should be at +8/+16 relative to lDog pointer.
+          And the values displayed for fName/fAge match... TMammal's
+          name/age. Why?
+
+          Need careful investigation -- not a simple offset fix.
+          Likely a layout issue: our PDB layout puts lDog's
+          fields at the SAME offsets as lMammal's fields, so
+          when we dereference an lDog pointer and read fields,
+          cdb reads memory at addresses that overlap with
+          lMammal's allocation (since lMammal/lDog allocations
+          are 0x60 bytes apart but TDog is sized larger).
+
+          Effort: ~3-5 budget (TPI layout debugging via
+          llvm-pdbutil dump of LF_FIELDLIST + walking actual
+          heap memory). NOT BLOCKING any FE.x work; FE work
+          adds LF_MFUNCTION on top of (potentially wrong)
+          class layout.
+
+-----
+
 ----- Step 11b roadmap (records / classes / enums in PDB + DWARF) -----
 
 Decomposed into letter-phases. Each phase is one commit with tests

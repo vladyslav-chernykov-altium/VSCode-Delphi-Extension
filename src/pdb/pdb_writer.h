@@ -67,6 +67,26 @@ struct AggregateEnumerator {
     std::int64_t value = 0;
 };
 
+// One method (function / procedure) attached to a class. Drives
+// LF_MFUNCTION + LF_ONEMETHOD emission so the debugger's Watch /
+// expression evaluator can invoke `obj.method(...)`. FE.1 scope is
+// PARAMETERLESS methods only; FE.2 will extend with parameters.
+//
+// `function_va` is the absolute VA of the entry point (same VA used
+// in the matching S_GPROC32 in the module stream); the writer keys
+// the LF_MFUNCTION lookup on it so it can wire S_GPROC32.FunctionType.
+struct AggregateMethod {
+    std::string name;             // unqualified method name ("GetBarkCount")
+    std::string qualified_name;   // matches ModuleFunction::name verbatim
+                                  // ("inherit_props.TDog.GetBarkCount"),
+                                  // used to wire S_GPROC32.FunctionType.
+    // Return type. FE.1 defaults to Int32 for parameterless methods
+    // (most common case: property getters); FE.x will RE the RSM 0x23
+    // sub-record for proper return-type decoding.
+    model::PrimitiveKind return_kind = model::PrimitiveKind::Int32;
+    std::uint32_t        return_size = 4;
+};
+
 // A user-declared record / class. PDB writer emits one LF_STRUCTURE
 // (records) or LF_CLASS + LF_POINTER (classes) per entry. Variable
 // / public symbols reference it by index via `aggregate_index`; the
@@ -80,6 +100,10 @@ struct AggregateRecord {
                                                     //   (sets borrow them
                                                     //   from their base enum
                                                     //   to name the bits)
+    // Methods attached for FE.1+ function-eval support. Only
+    // meaningful when kind == Class. Triggers forward-decl +
+    // complete LF_CLASS pattern in TPI emission.
+    std::vector<AggregateMethod> methods;
     // Index into PdbInputs::aggregates of the immediate base class
     // (Phase E inheritance). Only meaningful when kind == Class;
     // nullopt for records and for classes whose only base is the

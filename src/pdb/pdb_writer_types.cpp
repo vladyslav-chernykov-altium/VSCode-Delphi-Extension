@@ -263,6 +263,66 @@ void PdbWriter::emitAggregates() {
     }
 
     const bool is_class = (a.kind == AggregateKind::Class);
+    const bool has_methods = is_class && !a.methods.empty();
+
+    // FE.1: classes with methods use the forward-decl + complete
+    // CodeView pattern. LF_MFUNCTION needs to reference the class
+    // type, but LF_ONEMETHOD (which goes INTO the field-list) needs
+    // to reference LF_MFUNCTION. The cycle is broken by emitting an
+    // LF_CLASS with ForwardReference flag first, deriving the
+    // LF_POINTER + LF_MFUNCTION(s) off it, then building the
+    // field-list (with LF_ONEMETHOD entries), then the COMPLETE
+    // LF_CLASS. cdb resolves forward refs by NAME at consumption.
+    codeview::TypeIndex fwd_inner_ti = codeview::TypeIndex::None();
+    codeview::TypeIndex fwd_ptr_ti   = codeview::TypeIndex::None();
+    std::vector<codeview::TypeIndex> method_mfunc_ti;
+    if (has_methods) {
+      codeview::ClassRecord fwd(
+          codeview::TypeRecordKind::Class,
+          /*member_count=*/0,
+          codeview::ClassOptions::ForwardReference,
+          /*field_list=*/codeview::TypeIndex::None(),
+          /*derivation_list=*/codeview::TypeIndex::None(),
+          /*vshape=*/codeview::TypeIndex::None(),
+          /*size=*/0,
+          a.name,
+          std::string{});
+      fwd_inner_ti = tpi_table_.writeLeafType(fwd);
+      // ThisType for class methods is `const TDog*` -- Pascal Self
+      // is a "const this pointer" (cannot rebind to a different
+      // instance), matching the C++ convention cppvsdbg expects.
+      // Without Const flag VS reports "type qualifiers that are
+      // not compatible with the member function".
+      codeview::PointerRecord fwd_pr(
+          fwd_inner_ti, codeview::PointerKind::Near64,
+          codeview::PointerMode::Pointer, codeview::PointerOptions::Const,
+          /*size=*/8);
+      fwd_ptr_ti = tpi_table_.writeLeafType(fwd_pr);
+      // Empty LF_ARGLIST, cached per emitAggregates call.
+      static thread_local codeview::TypeIndex cached_empty_arglist_ti{};
+      // (Can't actually cache across emitAggregates invocations
+      // because tpi_table_ resets per writer; emit one per class
+      // for now -- cheap.)
+      std::vector<codeview::TypeIndex> empty_args;
+      codeview::ArgListRecord empty_arglist(
+          codeview::TypeRecordKind::ArgList, empty_args);
+      const auto empty_arglist_ti = tpi_table_.writeLeafType(empty_arglist);
+      method_mfunc_ti.reserve(a.methods.size());
+      for (const auto& m : a.methods) {
+        codeview::MemberFunctionRecord mfunc(
+            /*ReturnType=*/codeview::TypeIndex::Int32(),
+            /*ClassType=*/fwd_inner_ti,
+            /*ThisType=*/fwd_ptr_ti,
+            /*CallConv=*/codeview::CallingConvention::NearC,
+            /*Options=*/codeview::FunctionOptions::None,
+            /*ParameterCount=*/0,
+            /*ArgumentList=*/empty_arglist_ti,
+            /*ThisPointerAdjustment=*/0);
+        const auto ti = tpi_table_.writeLeafType(mfunc);
+        method_mfunc_ti.push_back(ti);
+        method_type_by_qname_[m.qualified_name] = ti;
+      }
+    }
 
     codeview::ContinuationRecordBuilder crb;
     crb.begin(codeview::ContinuationRecordKind::FieldList);
@@ -282,6 +342,19 @@ void PdbWriter::emitAggregates() {
                                      fieldTypeIndex(f), f.byte_offset, f.name);
       crb.writeMemberType(dmr);
       ++member_count;
+    }
+    if (has_methods) {
+      for (std::size_t mi = 0; mi < a.methods.size(); ++mi) {
+        codeview::OneMethodRecord omr(
+            /*Type=*/method_mfunc_ti[mi],
+            /*Access=*/codeview::MemberAccess::Public,
+            /*MK=*/codeview::MethodKind::Vanilla,
+            /*Options=*/codeview::MethodOptions::None,
+            /*VFTableOffset=*/0,
+            /*Name=*/a.methods[mi].name);
+        crb.writeMemberType(omr);
+        ++member_count;
+      }
     }
     const auto field_list_ti = tpi_table_.insertRecord(crb);
     codeview::ClassRecord cr(is_class ? codeview::TypeRecordKind::Class

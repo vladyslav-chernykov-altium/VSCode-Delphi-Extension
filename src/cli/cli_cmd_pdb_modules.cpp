@@ -402,6 +402,46 @@ void composeModules(Context &ctx) {
           }
         }
 
+        // FE.1: register PARAMETERLESS class methods so emitAggregates
+        // can wire LF_MFUNCTION + LF_ONEMETHOD for them. Naming
+        // convention: `<unit>.<ClassName>.<MethodName>`. Skip if the
+        // proc has explicit Pascal params (FE.2 territory) -- we
+        // accept <=1 RSM-level param (Self only). VA + return-type
+        // default (Int32) recorded for the writer.
+        if (have_rsm) {
+          if (const auto *pr = rsm_reader.findProcedureAt(r.va)) {
+            if (pr->params.size() <= 1) {
+              const auto& name = mf_out.name;
+              // Split `<rest>.<Class>.<Method>` from the right.
+              const auto last_dot = name.find_last_of('.');
+              if (last_dot != std::string::npos && last_dot > 0) {
+                const auto second_dot =
+                    name.find_last_of('.', last_dot - 1);
+                if (second_dot != std::string::npos) {
+                  const std::string class_name =
+                      name.substr(second_dot + 1,
+                                  last_dot - second_dot - 1);
+                  const std::string method_name =
+                      name.substr(last_dot + 1);
+                  // Find class aggregate by name (any unit).
+                  for (auto& a : inputs.aggregates) {
+                    if (a.kind != rsm2pdb::pdb::AggregateKind::Class)
+                      continue;
+                    if (a.name != class_name) continue;
+                    rsm2pdb::pdb::AggregateMethod am;
+                    am.name = method_name;
+                    am.qualified_name = mf_out.name;
+                    // return_kind defaults to Int32 / 4 bytes in
+                    // FE.1 (RSM 0x23 decode is FE.x scope).
+                    a.methods.push_back(std::move(am));
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+
         pdb_mod.functions.push_back(std::move(mf_out));
       }
 

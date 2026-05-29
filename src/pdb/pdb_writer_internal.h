@@ -113,6 +113,21 @@ private:
   //                 classes                == LF_POINTER -> inner_ti
   std::vector<llvm::codeview::TypeIndex> aggregate_inner_ti_;
   std::vector<llvm::codeview::TypeIndex> aggregate_var_ti_;
+  // FE.1: LF_MFUNCTION TypeIndex per registered class method, keyed
+  // by qualified function name ("unit.Class.Method"). Populated by
+  // emitAggregates from AggregateRecord::methods; consumed by
+  // emitModules to wire S_GPROC32.FunctionType.
+  std::unordered_map<std::string, llvm::codeview::TypeIndex>
+      method_type_by_qname_;
+  // FE.1: C++-scoped names (`TDog::GetBarkCount`) emitted as
+  // additional S_PUB32 entries alongside the Pascal-dot S_GPROC32.
+  // cppvsdbg's expression evaluator constructs the expected symbol
+  // name from class scope (`<Class>::<Method>`) when resolving
+  // `obj.method()` calls; without a matching public it reports
+  // "Function has no address". The strings must outlive
+  // gsi.addPublicSymbols() until commit(), hence the member-side
+  // backing store.
+  std::vector<std::string> method_scoped_names_;
   // Stripped-of-prefix names for S_GDATA32 globals (cppvsdbg parses
   // `.` as field access so `Watch: two_units.S` fails -- we emit the
   // unqualified `S` instead). The strings must outlive

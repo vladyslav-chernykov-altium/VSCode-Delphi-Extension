@@ -93,7 +93,39 @@ bool PdbWriter::emitModules() {
       proc.CodeSize = fn.size;
       proc.DbgStart = 0;
       proc.DbgEnd = fn.size;
+      // FE.1: if emitAggregates registered an LF_MFUNCTION for this
+      // method's qualified name, link it. method_type_by_qname_ is
+      // populated in emitAggregates from PdbInputs::aggregates[*]
+      // ::methods. Also emit an additional S_PUB32 with C++-scoped
+      // name (`TDog::GetBarkCount`) so cppvsdbg's expression
+      // evaluator can resolve the method's address from the
+      // `obj.method()` Watch call site (without it VS reports
+      // "Function has no address, possibly due to compiler
+      // optimizations").
       proc.FunctionType = codeview::TypeIndex::None();
+      if (auto it = method_type_by_qname_.find(fn.name);
+          it != method_type_by_qname_.end()) {
+        proc.FunctionType = it->second;
+        const auto last_dot = fn.name.find_last_of('.');
+        if (last_dot != std::string::npos && last_dot > 0) {
+          const auto second_dot = fn.name.find_last_of('.', last_dot - 1);
+          if (second_dot != std::string::npos) {
+            std::string scoped =
+                fn.name.substr(second_dot + 1, last_dot - second_dot - 1)
+                + "::" + fn.name.substr(last_dot + 1);
+            method_scoped_names_.push_back(std::move(scoped));
+            BulkPublic b{};
+            b.Name = method_scoped_names_.back().c_str();
+            b.NameLen = static_cast<std::uint32_t>(
+                method_scoped_names_.back().size());
+            b.Segment = fn.segment;
+            b.Offset = fn.offset;
+            b.setFlags(codeview::PublicSymFlags::Function);
+            std::vector<BulkPublic> one{b};
+            builder_.getGsiBuilder().addPublicSymbols(std::move(one));
+          }
+        }
+      }
       proc.CodeOffset = fn.offset;
       proc.Segment = fn.segment;
       proc.Flags = codeview::ProcSymFlags::None;
