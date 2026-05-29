@@ -300,25 +300,48 @@ void PdbWriter::emitAggregates() {
           codeview::PointerMode::Pointer, codeview::PointerOptions::None,
           /*size=*/8);
       fwd_ptr_ti = tpi_table_.writeLeafType(fwd_pr);
-      // Empty LF_ARGLIST, cached per emitAggregates call.
-      static thread_local codeview::TypeIndex cached_empty_arglist_ti{};
-      // (Can't actually cache across emitAggregates invocations
-      // because tpi_table_ resets per writer; emit one per class
-      // for now -- cheap.)
-      std::vector<codeview::TypeIndex> empty_args;
-      codeview::ArgListRecord empty_arglist(
-          codeview::TypeRecordKind::ArgList, empty_args);
-      const auto empty_arglist_ti = tpi_table_.writeLeafType(empty_arglist);
+      // FE.2: one LF_ARGLIST per method (deduplicated only for the
+      // empty-args case, since most parameterless methods share
+      // it). Param TypeIndices come from AggregateMethod::params,
+      // each entry routed through resolveTypeIndex like fields are.
+      std::optional<codeview::TypeIndex> empty_arglist_ti;
       method_mfunc_ti.reserve(a.methods.size());
       for (const auto& m : a.methods) {
+        codeview::TypeIndex arglist_ti;
+        if (m.params.empty()) {
+          if (!empty_arglist_ti) {
+            std::vector<codeview::TypeIndex> empty_args;
+            codeview::ArgListRecord empty_arglist(
+                codeview::TypeRecordKind::ArgList, empty_args);
+            empty_arglist_ti = tpi_table_.writeLeafType(empty_arglist);
+          }
+          arglist_ti = *empty_arglist_ti;
+        } else {
+          std::vector<codeview::TypeIndex> arg_tis;
+          arg_tis.reserve(m.params.size());
+          for (const auto& p : m.params) {
+            arg_tis.push_back(
+                resolveTypeIndex(p.byte_size, p.prim_kind,
+                                 p.aggregate_index));
+          }
+          codeview::ArgListRecord arglist(
+              codeview::TypeRecordKind::ArgList, arg_tis);
+          arglist_ti = tpi_table_.writeLeafType(arglist);
+        }
+        // Pascal `procedure` (no return) -> T_VOID. `function`
+        // gets the Int32 default until RSM 0x23 return-type
+        // decode lands (FE.x).
+        const codeview::TypeIndex return_ti =
+            m.returns_void ? codeview::TypeIndex::Void()
+                           : codeview::TypeIndex::Int32();
         codeview::MemberFunctionRecord mfunc(
-            /*ReturnType=*/codeview::TypeIndex::Int32(),
+            /*ReturnType=*/return_ti,
             /*ClassType=*/fwd_inner_ti,
             /*ThisType=*/fwd_ptr_ti,
             /*CallConv=*/codeview::CallingConvention::NearC,
             /*Options=*/codeview::FunctionOptions::None,
-            /*ParameterCount=*/0,
-            /*ArgumentList=*/empty_arglist_ti,
+            /*ParameterCount=*/static_cast<std::uint16_t>(m.params.size()),
+            /*ArgumentList=*/arglist_ti,
             /*ThisPointerAdjustment=*/0);
         const auto ti = tpi_table_.writeLeafType(mfunc);
         method_mfunc_ti.push_back(ti);

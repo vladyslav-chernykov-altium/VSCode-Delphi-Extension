@@ -399,74 +399,98 @@ void composeModules(Context &ctx) {
               }
               mf_out.locals.push_back(std::move(ml));
             }
-          }
-        }
 
-        // FE.1: register PARAMETERLESS class methods so emitAggregates
-        // can wire LF_MFUNCTION + LF_ONEMETHOD for them. Naming
-        // convention: `<unit>.<ClassName>.<MethodName>`. Skip if the
-        // proc has explicit Pascal params (FE.2 territory) -- we
-        // accept <=1 RSM-level param (Self only). VA + return-type
-        // default (Int32) recorded for the writer.
-        //
-        // FE.1.5: if the class isn't in inputs.aggregates yet,
-        // lazy-register it from rsm_reader.aggregates(). Without
-        // this, methods declared on a class that is only used via
-        // a function-local (e.g. 08_inherit_props's TDog) are
-        // silently skipped, because their method-functions are
-        // emitted in source-declaration order BEFORE the user
-        // function whose local triggers class registration.
-        if (have_rsm) {
-          if (const auto *pr = rsm_reader.findProcedureAt(r.va)) {
-            if (pr->params.size() <= 1) {
-              const auto& name = mf_out.name;
-              // Split `<rest>.<Class>.<Method>` from the right.
-              const auto last_dot = name.find_last_of('.');
-              if (last_dot != std::string::npos && last_dot > 0) {
-                const auto second_dot =
-                    name.find_last_of('.', last_dot - 1);
-                if (second_dot != std::string::npos) {
-                  const std::string class_name =
-                      name.substr(second_dot + 1,
-                                  last_dot - second_dot - 1);
-                  const std::string method_name =
-                      name.substr(last_dot + 1);
-                  // Find class aggregate by name (any unit).
-                  bool registered = false;
-                  for (auto& a : inputs.aggregates) {
-                    if (a.kind != rsm2pdb::pdb::AggregateKind::Class)
-                      continue;
-                    if (a.name != class_name) continue;
-                    rsm2pdb::pdb::AggregateMethod am;
-                    am.name = method_name;
-                    am.qualified_name = mf_out.name;
-                    // return_kind defaults to Int32 / 4 bytes in
-                    // FE.1 (RSM 0x23 decode is FE.x scope).
-                    a.methods.push_back(std::move(am));
-                    registered = true;
+            // FE.1.5 + FE.2: register class method into its owning
+            // aggregate so emitAggregates can wire LF_MFUNCTION +
+            // LF_ONEMETHOD. Naming convention:
+            // `<unit>.<ClassName>.<MethodName>`. Lives inside the
+            // rf-scope (rather than a separate `if (have_rsm)`
+            // block) so we can harvest resolved param types from
+            // `rf.vars` for the LF_ARGLIST builder.
+            //
+            // FE.1.5 (lazy-register): if the class isn't in
+            // inputs.aggregates yet, register it from RSM on demand
+            // -- methods are emitted in source-declaration order
+            // BEFORE the user function whose local would trigger
+            // registration (e.g. 08_inherit_props's TDog).
+            //
+            // FE.2 (params): drop the FE.1 `pr->params.size() <= 1`
+            // gate. Collect non-Self params from rf.vars in order;
+            // the writer turns them into an LF_ARGLIST and links
+            // it from this method's LF_MFUNCTION. Also detect
+            // `procedure` vs `function` from whether the proc has
+            // a local named "Result" -- procedures get T_VOID
+            // return type, functions get the Int32 default.
+            const auto& name = mf_out.name;
+            const auto last_dot = name.find_last_of('.');
+            if (last_dot != std::string::npos && last_dot > 0) {
+              const auto second_dot =
+                  name.find_last_of('.', last_dot - 1);
+              if (second_dot != std::string::npos) {
+                const std::string class_name =
+                    name.substr(second_dot + 1,
+                                last_dot - second_dot - 1);
+                const std::string method_name =
+                    name.substr(last_dot + 1);
+
+                rsm2pdb::pdb::AggregateMethod am;
+                am.name = method_name;
+                am.qualified_name = mf_out.name;
+                for (const auto &rv : rf.vars) {
+                  if (!rv.is_param || rv.is_self || rv.is_static_link)
+                    continue;
+                  // Hidden Pascal-only params like `.` (the unnamed
+                  // byref-return-string slot) -- skip; cppvsdbg can't
+                  // call them with a meaningful value anyway.
+                  if (rv.name.empty() || rv.name == ".")
+                    continue;
+                  rsm2pdb::pdb::AggregateMethod::Param p;
+                  p.prim_kind = rv.prim_kind;
+                  p.byte_size = rv.byte_size;
+                  if (rv.aggregate_hash != 0) {
+                    const rsm2pdb::rsm::AggregateType *a =
+                        rsm_reader.findAggregateInUnit(
+                            rv.unit_anchor_offset, rv.aggregate_hash);
+                    if (a == nullptr)
+                      a = rsm_reader.findAggregateByHash(rv.aggregate_hash);
+                    if (auto idx = registerAggr(a))
+                      p.aggregate_index = idx;
+                  }
+                  am.params.push_back(std::move(p));
+                }
+                bool has_result_local = false;
+                for (const auto &l : pr->locals) {
+                  if (l.name == "Result") {
+                    has_result_local = true;
                     break;
                   }
-                  if (!registered) {
-                    // Lazy-register the class from RSM. agg_by_name
-                    // was populated by enrichGlobalsViaRsm; pick
-                    // the first Class entry matching this name.
-                    const rsm2pdb::rsm::AggregateType *foreign = nullptr;
-                    auto r2 = agg_by_name.equal_range(class_name);
-                    for (auto it = r2.first; it != r2.second; ++it) {
-                      if (it->second->kind
-                          == rsm2pdb::rsm::AggregateKind::Class) {
-                        foreign = it->second;
-                        break;
-                      }
+                }
+                am.returns_void = !has_result_local;
+
+                bool registered = false;
+                for (auto& a : inputs.aggregates) {
+                  if (a.kind != rsm2pdb::pdb::AggregateKind::Class)
+                    continue;
+                  if (a.name != class_name) continue;
+                  a.methods.push_back(std::move(am));
+                  registered = true;
+                  break;
+                }
+                if (!registered) {
+                  // Lazy-register the class from RSM.
+                  const rsm2pdb::rsm::AggregateType *foreign = nullptr;
+                  auto r2 = agg_by_name.equal_range(class_name);
+                  for (auto it = r2.first; it != r2.second; ++it) {
+                    if (it->second->kind
+                        == rsm2pdb::rsm::AggregateKind::Class) {
+                      foreign = it->second;
+                      break;
                     }
-                    if (foreign != nullptr) {
-                      if (auto idx = registerAggr(foreign)) {
-                        rsm2pdb::pdb::AggregateMethod am;
-                        am.name = method_name;
-                        am.qualified_name = mf_out.name;
-                        inputs.aggregates[*idx].methods.push_back(
-                            std::move(am));
-                      }
+                  }
+                  if (foreign != nullptr) {
+                    if (auto idx = registerAggr(foreign)) {
+                      inputs.aggregates[*idx].methods.push_back(
+                          std::move(am));
                     }
                   }
                 }

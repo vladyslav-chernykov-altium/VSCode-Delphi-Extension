@@ -69,20 +69,36 @@ struct AggregateEnumerator {
 
 // One method (function / procedure) attached to a class. Drives
 // LF_MFUNCTION + LF_ONEMETHOD emission so the debugger's Watch /
-// expression evaluator can invoke `obj.method(...)`. FE.1 scope is
-// PARAMETERLESS methods only; FE.2 will extend with parameters.
+// expression evaluator can invoke `obj.method(...)`.
 //
-// `function_va` is the absolute VA of the entry point (same VA used
-// in the matching S_GPROC32 in the module stream); the writer keys
-// the LF_MFUNCTION lookup on it so it can wire S_GPROC32.FunctionType.
+// FE.2 scope: methods with parameters. Each Param describes one
+// non-Self argument; the writer builds an LF_ARGLIST from the
+// `params` vector and links it from the per-method LF_MFUNCTION.
+//
+// `qualified_name` keys the LF_MFUNCTION lookup so S_GPROC32 can
+// link its FunctionType field to the right TPI record.
 struct AggregateMethod {
     std::string name;             // unqualified method name ("GetBarkCount")
     std::string qualified_name;   // matches ModuleFunction::name verbatim
                                   // ("inherit_props.TDog.GetBarkCount"),
                                   // used to wire S_GPROC32.FunctionType.
-    // Return type. FE.1 defaults to Int32 for parameterless methods
-    // (most common case: property getters); FE.x will RE the RSM 0x23
-    // sub-record for proper return-type decoding.
+    // FE.2: per-parameter type info (excluding Self). Empty for
+    // parameterless methods (FE.1 scope, still supported). Each
+    // entry mirrors AggregateField's shape so it can route through
+    // either primitive kind or an aggregate index.
+    struct Param {
+        std::optional<model::PrimitiveKind> prim_kind;
+        std::uint32_t                       byte_size = 0;
+        std::optional<std::size_t>          aggregate_index;
+    };
+    std::vector<Param> params;
+    // FE.2: Pascal `procedure` (no return) vs `function` (has
+    // return). Detected by the presence of a local named "Result"
+    // in the RSM procedure record. When true, LF_MFUNCTION's
+    // ReturnType is T_VOID; otherwise it falls through to
+    // return_kind (FE.1 default Int32; proper RSM 0x23 decode is
+    // FE.x).
+    bool                 returns_void = false;
     model::PrimitiveKind return_kind = model::PrimitiveKind::Int32;
     std::uint32_t        return_size = 4;
 };

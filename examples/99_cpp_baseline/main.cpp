@@ -25,6 +25,9 @@ class TDog : public TMammal {
 public:
     int fBarkCount;
     int GetBarkCount() { return fBarkCount; }
+    // FE.2 baseline: one-param + multi-param methods.
+    void SetBarkCount(int v) { fBarkCount = v; }
+    int  AddBarks(int a, int b) { return a + b; }
 };
 
 int main() {
@@ -33,7 +36,10 @@ int main() {
     d.fFurLen = 10;
     d.fBarkCount = 42;
 
-    // BP here -- try Watch `d.GetBarkCount()` in cppvsdbg.
+    // BP here -- try Watch `d.GetBarkCount()`, `d.SetBarkCount(99)`,
+    // `d.AddBarks(2, 3)` in cppvsdbg.
     int x = d.GetBarkCount();
-    return x;
+    d.SetBarkCount(99);
+    int y = d.AddBarks(2, 3);
+    return x + y;
 }
