@@ -135,18 +135,18 @@ begin
 end;
 
 function TShape.Describe: string;
+begin
+  Result := fName + ' (base)';
+end;
+
+constructor TCircle.Create(AArea: Double; ARadius: Double);
 Type
     TSaveFormat = (eASCII, eBinary3, eBinary4, eBinary5, eBinary6, eBinaryPCBWorks, eBinaryCS, eBinaryCM, eExternal);
 var
     r : set of TSaveFormat;
 begin
-  r := { eASCII, eBinaryCS };
-  Result := fName + ' (base)';
-end;
-
-constructor TCircle.Create(AArea: Double; ARadius: Double);
-begin
   inherited Create('Circle', AArea);
+   r := [ eASCII, eBinaryCS ];
   fRadius := ARadius;
 end;
 

@@ -460,6 +460,11 @@ int cmdPdb(int argc, char** argv) {
     // Keyed by class name so cdb sees a single typed pointer per
     // class instead of one synthetic LF_CLASS per method.
     std::map<std::string, std::size_t> self_opaque_cache;
+    // Anonymous in-proc set placeholders. Keyed by (unit_anchor,
+    // base_enum_own_hash) so multiple `r: set of TXxx` locals
+    // sharing the same enum get one LF_BITFIELD struct.
+    std::map<std::pair<std::uint64_t, std::uint16_t>,
+             std::size_t> inproc_set_cache;
     // Pre-built indexes over rsm_reader.aggregates() so the per-Self
     // class-name lookup runs in O(1) instead of O(N) per call.
     // Without these, an AdvPCB-scale build (~3k class methods,
@@ -895,6 +900,87 @@ int cmdPdb(int argc, char** argv) {
                                     if (inputs.aggregates[*idx].byte_size)
                                         ml.byte_size =
                                             inputs.aggregates[*idx].byte_size;
+                                }
+                            }
+                            // Anonymous in-proc `set of TXxx` local.
+                            // Delphi declares the set's type
+                            // implicitly (no 0x2a record), so r's
+                            // type_hash won't resolve. The companion
+                            // 0x2a record for the BASE ENUM sits a
+                            // few hashes earlier in the same unit;
+                            // empirically the set's hash =
+                            // enum_hash + 4. If we find one within
+                            // a small window, synthesise an
+                            // LF_BITFIELD-struct view using the
+                            // enum's enumerators -- cdb / VS show
+                            // which bits are set instead of an
+                            // opaque void*.
+                            if (rv.aggregate_hash != 0
+                                && !ml.aggregate_index
+                                && !rv.is_self) {
+                                const rsm2pdb::rsm::AggregateType*
+                                    enum_a = nullptr;
+                                int best_diff = 16;
+                                for (const auto& a :
+                                     rsm_reader.aggregates()) {
+                                    if (a.kind != rsm2pdb::rsm
+                                            ::AggregateKind::Enum)
+                                        continue;
+                                    if (a.unit_anchor_offset
+                                        != rv.unit_anchor_offset)
+                                        continue;
+                                    const int diff =
+                                        static_cast<int>(
+                                            rv.aggregate_hash)
+                                        - static_cast<int>(a.own_hash);
+                                    if (diff >= 1 && diff <= best_diff) {
+                                        best_diff = diff;
+                                        enum_a    = &a;
+                                    }
+                                }
+                                if (enum_a != nullptr) {
+                                    const auto key = std::make_pair(
+                                        rv.unit_anchor_offset,
+                                        enum_a->own_hash);
+                                    std::size_t set_idx;
+                                    auto it = inproc_set_cache.find(key);
+                                    if (it != inproc_set_cache.end()) {
+                                        set_idx = it->second;
+                                    } else {
+                                        rsm2pdb::pdb::AggregateRecord rec;
+                                        rec.kind = rsm2pdb::pdb
+                                            ::AggregateKind::Set;
+                                        rec.name = "set of "
+                                                 + enum_a->name;
+                                        std::int64_t max_ord = 0;
+                                        rec.enumerators.reserve(
+                                            enum_a->enum_entries.size());
+                                        for (const auto& e :
+                                             enum_a->enum_entries) {
+                                            rsm2pdb::pdb
+                                                ::AggregateEnumerator ae;
+                                            ae.name  = e.name;
+                                            ae.value = e.ordinal;
+                                            rec.enumerators
+                                                .push_back(std::move(ae));
+                                            if (e.ordinal > max_ord)
+                                                max_ord = e.ordinal;
+                                        }
+                                        rec.byte_size =
+                                              max_ord <= 7   ? 1
+                                            : max_ord <= 15  ? 2
+                                            : max_ord <= 31  ? 4
+                                                             : 8;
+                                        set_idx =
+                                            inputs.aggregates.size();
+                                        inputs.aggregates.push_back(
+                                            std::move(rec));
+                                        inproc_set_cache[key] = set_idx;
+                                    }
+                                    ml.aggregate_index = set_idx;
+                                    ml.byte_size =
+                                        inputs.aggregates[set_idx]
+                                            .byte_size;
                                 }
                             }
                             // Self of a class method: ALWAYS derive

@@ -599,7 +599,34 @@ update this section first and explain why in the commit message.
     unordered_multimap<(unit_anchor, name), ...> so each Self
     lookup is O(1). Back to baseline 46s.
 
-31. **Pascal `property` declarations don't make it into the PDB.**
+31. **Anonymous in-proc `set of` locals need synthesis from a
+    nearby enum.** When a Pascal function declares both a NESTED
+    `Type X = (...)` enum and a `var r: set of X` local, RSM
+    emits the enum as a regular 0x2a record but does NOT emit a
+    standalone 0x2a record for the anonymous set type. The
+    local's RSM type_hash points at a hash that isn't anywhere
+    else in the metadata, so the aggregate registrar returns
+    nullopt and the local falls through to void*. User report:
+    `r` in `TCircle.Create` (records.dpr after the enum-inline
+    edit) showed as `type = 0x0603 (void*)`.
+
+    Fix (cli_cmd_pdb.cpp): when a local has aggregate_hash != 0
+    but doesn't resolve, scan the same unit's aggregates for an
+    Enum kind whose own_hash is within +1..+16 of the local's
+    hash. Empirically Delphi assigns the anonymous set's hash =
+    enum_hash + 4 (07_records: TSaveFormat 0x1aa9, r 0x1aad).
+    If a match is found, synthesise an LF_BITFIELD struct named
+    `set of <EnumName>` using the enum's enumerators (same
+    machinery as the named-set path from Phase F+, gotcha #29's
+    sibling). Set width = ceil(max_ord / 8) bytes.
+    inproc_set_cache keyed by (unit_anchor, enum_own_hash) so
+    multiple set-of-same-enum locals share one TPI record.
+
+    Verification: 07_records `r := [eASCII, eBinaryCS]` now
+    emits `type = 0x1025 (set of TSaveFormat)`. cdb shows each
+    enumerator's bit individually. AdvPCB still 45s.
+
+32. **Pascal `property` declarations don't make it into the PDB.**
     CodeView has no `LF_PROPERTY` counterpart. What survives the
     Delphi -> RSM -> CodeView pipeline:
       - backing FIELDS (LF_MEMBER `fName`, `fBarkCount`, ...);
