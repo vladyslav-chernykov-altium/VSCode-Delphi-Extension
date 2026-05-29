@@ -946,14 +946,26 @@ bool Reader::open(const std::string& path) {
             !isPrintAscii(buf.data() + a + 2, nl)) {
             ++a; continue;
         }
-        // Look for `02 70 <fnl> <printable>.{pas,dpr,inc,tmp}` within
-        // the next 200 bytes -- the source-file signature.
+        // Look for `<prefix> 70 <fnl> <printable>.{pas,dpr,inc,tmp}`
+        // within the next 200 bytes -- the source-file signature.
+        // Empirically the prefix byte is one of:
+        //   0x02 -- used by .dpr-style anchors (cross_unit.dpr's
+        //           own self-reference)
+        //   0x3c -- used by .pas unit anchors (Shapes, Items, Layout
+        //           in examples/09_cross_unit; AdvPCB's RTL units
+        //           also frequently)
+        // The byte after the prefix is always 0x70 and what follows
+        // is the standard `<fnl> <filename>` shape. Without 0x3c
+        // acceptance our parser only finds the .dpr anchor in
+        // multi-unit projects, losing the per-unit type scoping for
+        // every other unit.
         const std::size_t scan_lo = a + 2 + nl;
         const std::size_t scan_hi = std::min(buf.size(), scan_lo + 200);
         bool matched = false;
         for (std::size_t s = scan_lo; s + 8 < scan_hi; ++s) {
-            if (static_cast<std::uint8_t>(buf[s]) != 0x02 ||
-                static_cast<std::uint8_t>(buf[s + 1]) != 0x70) continue;
+            const auto b0 = static_cast<std::uint8_t>(buf[s]);
+            if ((b0 != 0x02 && b0 != 0x3c)
+                || static_cast<std::uint8_t>(buf[s + 1]) != 0x70) continue;
             const auto fnl = static_cast<std::uint8_t>(buf[s + 2]);
             if (fnl < 4 || fnl > 80) continue;
             if (s + 3 + fnl > buf.size()) continue;
@@ -985,7 +997,7 @@ bool Reader::open(const std::string& path) {
     // marker N (always even, >= 0x02) is the (N/2)-th entry.
     struct TypeTable {
         std::size_t              start;
-        std::vector<std::string> names;
+        std::vector<UnitTypeEntry> entries;
     };
     std::vector<TypeTable> primary_tables;
     primary_tables.reserve(unit_anchors.size());
@@ -1004,6 +1016,25 @@ bool Reader::open(const std::string& path) {
         const std::size_t scan_lo = lo + 0x20;  // past unit name etc.
         for (std::size_t cur = scan_lo; cur + 10 < hi; ) {
             const auto b0 = static_cast<std::uint8_t>(buf[cur]);
+            // Multi-unit `uses` clause separator: between blocks of
+            // 0x66/0x67 entries that belong to different imported
+            // units, the table carries a small separator record
+            //     63 64 <fnl> <imported_unit_name> 00 00 00
+            // (e.g. examples/09_cross_unit Items.pas has separators
+            // `63 64 07 SysInit 00 00 00` and `63 64 06 Shapes
+            // 00 00 00` before its 0x66 entries for TPoint / TSize
+            // / TColor imported from Shapes). Walk past these so
+            // the cross-unit 0x66 entries don't get lost.
+            if (b0 == 0x63 && cur + 4 < hi
+                && static_cast<std::uint8_t>(buf[cur + 1]) == 0x64) {
+                const auto fnl = static_cast<std::uint8_t>(buf[cur + 2]);
+                if (fnl >= 2 && fnl <= 64
+                    && cur + 3 + fnl + 3 <= hi
+                    && isPrintAscii(buf.data() + cur + 3, fnl)) {
+                    cur += 3 + fnl + 3;
+                    continue;
+                }
+            }
             // Both 0x66 and 0x67 records share the
             // `<tag> <namelen> <name> <4-byte hash>` shape.
             if (b0 != kVarPayloadSubTag0 && b0 != 0x67) {
@@ -1011,7 +1042,7 @@ bool Reader::open(const std::string& path) {
                 // haven't reached the table yet (try next byte) or
                 // we ran off the end (give up after ~500 bytes
                 // without finding a 0x66 entry).
-                if (!tab.names.empty()) break;
+                if (!tab.entries.empty()) break;
                 if (cur - scan_lo > 500) break;
                 ++cur;
                 continue;
@@ -1020,12 +1051,24 @@ bool Reader::open(const std::string& path) {
             if (c_nl < 2 || c_nl > 80 ||
                 cur + 2 + c_nl + 4 > hi ||
                 !isPrintAscii(buf.data() + cur + 2, c_nl)) {
-                if (!tab.names.empty()) break;
+                if (!tab.entries.empty()) break;
                 ++cur;
                 continue;
             }
             if (b0 == kVarPayloadSubTag0) {
-                tab.names.emplace_back(buf.data() + cur + 2, c_nl);
+                UnitTypeEntry e;
+                e.name.assign(buf.data() + cur + 2, c_nl);
+                // 4-byte hash immediately follows the name -- a
+                // globally-unique type identifier whose low 16 bits
+                // are the type's own_hash in its DECLARING unit.
+                // Phase X.2 follows this back to the foreign-unit
+                // aggregate for cross-unit field rendering.
+                const std::size_t h = cur + 2 + c_nl;
+                e.hash4 = static_cast<std::uint8_t>(buf[h])
+                       | (static_cast<std::uint8_t>(buf[h + 1]) << 8)
+                       | (static_cast<std::uint8_t>(buf[h + 2]) << 16)
+                       | (static_cast<std::uint8_t>(buf[h + 3]) << 24);
+                tab.entries.push_back(std::move(e));
             }
             cur += 2 + c_nl + 4;
         }
@@ -1037,7 +1080,7 @@ bool Reader::open(const std::string& path) {
     std::unordered_map<std::size_t /*anchor offset*/,
                        const TypeTable*> primary_table;
     for (std::size_t k = 0; k < unit_anchors.size(); ++k) {
-        if (!primary_tables[k].names.empty()) {
+        if (!primary_tables[k].entries.empty()) {
             primary_table[unit_anchors[k].file_offset] = &primary_tables[k];
         }
     }
@@ -1059,9 +1102,9 @@ bool Reader::open(const std::string& path) {
         --it;
         auto pit = primary_table.find(it->file_offset);
         if (pit == primary_table.end() || pit->second == nullptr) return;
-        const auto& names = pit->second->names;
-        if (idx > names.size()) return;
-        v.pascal_type = names[idx - 1];
+        const auto& entries = pit->second->entries;
+        if (idx > entries.size()) return;
+        v.pascal_type = entries[idx - 1].name;
     };
     for (auto& v : variables_) resolvePascalType(v);
     for (auto& p : procedures_) {
@@ -1111,8 +1154,8 @@ bool Reader::open(const std::string& path) {
     for (std::size_t k = 0; k < unit_anchors.size(); ++k) {
         if (k >= primary_tables.size()) break;
         const auto& tt = primary_tables[k];
-        if (tt.names.empty()) continue;
-        primary_table_by_anchor_[unit_anchors[k].file_offset] = tt.names;
+        if (tt.entries.empty()) continue;
+        primary_table_by_anchor_[unit_anchors[k].file_offset] = tt.entries;
     }
 
     // -- Aggregate types (Step 11b Phase B.1) -------------------------
@@ -1149,6 +1192,12 @@ bool Reader::open(const std::string& path) {
                  std::vector<FieldEntry>> pending_fields_by_unit;
         std::unordered_map<std::uint16_t,
                            std::vector<EnumEntry>>  pending_enums;
+        // Per-unit-scoped pending enums (same rationale as
+        // pending_fields_by_unit -- multiple units can declare
+        // enums with the same per-unit own_hash, e.g.
+        // Shapes.TColor and some System enum both at 0x0405).
+        std::map<std::pair<std::uint64_t, std::uint16_t>,
+                 std::vector<EnumEntry>> pending_enums_by_unit;
         // For class header back-references (base_hash, total_size).
         // The class header's `47 00 10 00 00 <own_hash u16>` pattern
         // lets us pick out base-class refs even though they're in a
@@ -1323,7 +1372,18 @@ bool Reader::open(const std::string& path) {
                 EnumEntry e;
                 e.name    = std::string(buf.data() + i + 2, nl);
                 e.ordinal = static_cast<std::int64_t>(ord_x2) / 2;
-                pending_enums[parent].push_back(std::move(e));
+                // Stamp the enum entry with its enclosing unit
+                // anchor so the per-unit attach defeats cross-
+                // unit hash collisions (Shapes.TColor 0x0405 vs
+                // System.SomeEnum 0x0405).
+                const std::uint64_t eua = unitAnchorFor(
+                    static_cast<std::uint64_t>(i));
+                if (eua != 0) {
+                    pending_enums_by_unit[{eua, parent}]
+                        .push_back(std::move(e));
+                } else {
+                    pending_enums[parent].push_back(std::move(e));
+                }
                 i = at + 8;
                 continue;
             }
@@ -1419,6 +1479,105 @@ bool Reader::open(const std::string& path) {
             }
         }
 
+        // class_hashes -- set of all 0x47 own_hashes. Used both
+        // by the X.3 same-unit chaining below and by the
+        // classifier further down.
+        std::unordered_set<std::uint16_t> class_hashes;
+        class_hashes.reserve(class_headers.size());
+        for (const auto& ch : class_headers) class_hashes.insert(ch.own_hash);
+
+        // Phase X.3: same-unit hash chaining. A class declared
+        // within one unit shows up under FOUR different hashes:
+        //
+        //   NAME       = 0x2a own_hash
+        //   LINKED     = 0x2a's secondary hash (+7/+8 from kind,
+        //                only when kind & 0x80)
+        //   CLS_HEADER = 0x47 own_hash
+        //   FLD_PARENT = 0x2c parent_hash (the parent of fields)
+        //
+        // Two encoding patterns observed across fixtures:
+        //
+        //   AdvPCB (kind=0xa8, single-record):
+        //       LINKED == CLS_HEADER == FLD_PARENT.
+        //       The 0x47 header + fields all share one own_hash;
+        //       the 0x2a record's linked_hash points straight at
+        //       it. Already handled by the linked_hash indexing
+        //       above (CLS_HEADER own_hash gets registered).
+        //
+        //   09_cross_unit (kind=0xa8, split layout):
+        //       LINKED.low == CLS_HEADER.low  (high bytes differ)
+        //       FLD_PARENT = (CLS_HEADER.low << 8) | 0x08
+        //       e.g. TItem: LINKED 0x0712, CLS 0xb112, FLD 0x1208.
+        //
+        // For the latter, scan class_headers and link them to
+        // pending 0x2a aggregates by low-byte match in same unit.
+        // Then ALSO register the aggregate under both the
+        // CLS_HEADER own_hash AND the derived FLD_PARENT so the
+        // field-attach loop below finds them.
+        for (std::size_t k = 0; k < aggregates_.size(); ++k) {
+            auto& a = aggregates_[k];
+            if (a.linked_hash == 0 || a.unit_anchor_offset == 0) continue;
+            // Universal formula derived from per-unit observation:
+            //     FLD_PARENT = ((LINKED & 0xff) << 8) | 0x08
+            // holds for BOTH classes and records:
+            //   records.dpr TPoint    : own=0x1a71 (records.dpr
+            //     fixture has the older format and doesn't use
+            //     linked_hash chaining -- the direct-attach path
+            //     still handles it).
+            //   09 Items.TItem        : LINKED=0x0712 -> FLD 0x1208 ✓
+            //   09 Layout.TLayout     : LINKED=0x0710 -> FLD 0x1008 ✓
+            //   09 Shapes.TPoint      : LINKED=0x0706 -> FLD 0x0608 ✓
+            //   09 Shapes.TSize       : LINKED=0x8708 -> FLD 0x0808 ✓
+            //   AdvPCB TPCBCommands   : LINKED == own_hash of class
+            //     header (already aliased by the prior linked_hash
+            //     loop) -- formula yields FLD 0x0508 which the
+            //     attach loop won't find any fields for, harmless.
+            const std::uint16_t fld_parent =
+                static_cast<std::uint16_t>(
+                    (static_cast<std::uint16_t>(a.linked_hash & 0xff) << 8)
+                    | 0x08u);
+            UnitHashKey uk_fld{a.unit_anchor_offset, fld_parent};
+            if (aggr_by_unit_hash_.find(uk_fld)
+                == aggr_by_unit_hash_.end()) {
+                aggr_by_unit_hash_[uk_fld] = k;
+            }
+            if (aggr_by_hash_.find(fld_parent) == aggr_by_hash_.end()) {
+                aggr_by_hash_[fld_parent] = k;
+            }
+            // For CLASSES specifically: 09-style classes link the
+            // 0x2a record's linked_hash to a 0x47 class header via
+            // low-byte match (linked.low == header.low). Find it.
+            if (class_hashes.count(a.linked_hash)) {
+                // AdvPCB direct match (linked == cls_own) -- the
+                // aggregate is already aliased to that hash and
+                // gets force-classified below.
+                a.kind = AggregateKind::Class;
+            } else {
+                const std::uint8_t link_low = a.linked_hash & 0xff;
+                std::uint16_t cls_own = 0;
+                for (const auto& ch : class_headers) {
+                    if ((ch.own_hash & 0xff) != link_low) continue;
+                    if (cls_own == 0) {
+                        cls_own = ch.own_hash;
+                    } else if (cls_own != ch.own_hash) {
+                        cls_own = 0;
+                        break;
+                    }
+                }
+                if (cls_own != 0) {
+                    UnitHashKey uk_cls{a.unit_anchor_offset, cls_own};
+                    if (aggr_by_unit_hash_.find(uk_cls)
+                        == aggr_by_unit_hash_.end()) {
+                        aggr_by_unit_hash_[uk_cls] = k;
+                    }
+                    if (aggr_by_hash_.find(cls_own) == aggr_by_hash_.end()) {
+                        aggr_by_hash_[cls_own] = k;
+                    }
+                    a.kind = AggregateKind::Class;
+                }
+            }
+        }
+
         // Attach pending fields by (unit, parent_hash) -- this is
         // the precise version that survives cross-unit hash
         // collisions (e.g. System.TTextRec.own_hash collides with
@@ -1438,11 +1597,18 @@ bool Reader::open(const std::string& path) {
             auto& a = aggregates_[it->second];
             if (a.fields.empty()) a.fields = std::move(v);
         }
+        for (auto& [k, v] : pending_enums_by_unit) {
+            auto it = aggr_by_unit_hash_.find(
+                UnitHashKey{k.first, k.second});
+            if (it == aggr_by_unit_hash_.end()) continue;
+            auto& a = aggregates_[it->second];
+            a.enum_entries = std::move(v);
+        }
         for (auto& [h, v] : pending_enums) {
             auto it = aggr_by_hash_.find(h);
             if (it == aggr_by_hash_.end()) continue;
             auto& a = aggregates_[it->second];
-            a.enum_entries = std::move(v);
+            if (a.enum_entries.empty()) a.enum_entries = std::move(v);
         }
         // Attach class header data (base_hash) when own_hash matches.
         for (const auto& ch : class_headers) {
@@ -1466,11 +1632,12 @@ bool Reader::open(const std::string& path) {
         // class -- field-storage byte encodes visibility, not kind
         // (TBag with public fields has storage 0x02 just like a
         // record's members).
-        std::unordered_set<std::uint16_t> class_hashes;
-        class_hashes.reserve(class_headers.size());
-        for (const auto& ch : class_headers) class_hashes.insert(ch.own_hash);
-
         // Classification:
+        //   Skip aggregates whose kind is already set by X.3
+        //   (low-byte-chained classes).  Without this guard the
+        //   classifier below would overwrite Class with Unknown
+        //   because own_hash isn't in class_hashes -- only the
+        //   chained cls_own is.
         //   - has enum_entries                          -> Enum
         //   - own_hash in class_hashes                  -> Class
         //   - has fields with storage 0xa0              -> PackedRecord
@@ -1478,6 +1645,7 @@ bool Reader::open(const std::string& path) {
         //   - no fields, no enum entries, no class hdr  -> Unknown
         //                                                  (Set candidate)
         for (auto& a : aggregates_) {
+            if (a.kind == AggregateKind::Class) continue;  // pinned by X.3
             if (!a.enum_entries.empty()) {
                 a.kind = AggregateKind::Enum;
                 continue;
@@ -1541,11 +1709,11 @@ bool Reader::open(const std::string& path) {
     for (auto& v : variables_) {
         v.unit_anchor_offset = unitAnchorFor(v.file_offset);
     }
-    for (auto& p : procedures_) {
-        for (auto& v : p.params) {
+    for (auto& proc : procedures_) {
+        for (auto& v : proc.params) {
             v.unit_anchor_offset = unitAnchorFor(v.file_offset);
         }
-        for (auto& v : p.locals) {
+        for (auto& v : proc.locals) {
             v.unit_anchor_offset = unitAnchorFor(v.file_offset);
         }
     }
@@ -1591,11 +1759,11 @@ bool Reader::open(const std::string& path) {
         for (auto& v : variables_) {
             if (resolveAggrFor(v)) ++typed_globals;
         }
-        for (auto& p : procedures_) {
-            for (auto& v : p.params) {
+        for (auto& proc : procedures_) {
+            for (auto& v : proc.params) {
                 if (resolveAggrFor(v)) ++typed_params;
             }
-            for (auto& v : p.locals) {
+            for (auto& v : proc.locals) {
                 if (resolveAggrFor(v)) ++typed_locals;
             }
         }
@@ -1655,6 +1823,12 @@ std::uint64_t Reader::unitAnchorFor(std::uint64_t file_offset) const {
 }
 
 const std::string* Reader::primitiveNameForMarker(
+        std::uint64_t unit_anchor_offset, std::uint8_t marker) const {
+    const auto* e = unitTypeEntryForMarker(unit_anchor_offset, marker);
+    return e ? &e->name : nullptr;
+}
+
+const Reader::UnitTypeEntry* Reader::unitTypeEntryForMarker(
         std::uint64_t unit_anchor_offset, std::uint8_t marker) const {
     if (unit_anchor_offset == 0) return nullptr;
     if (marker == 0 || (marker & 0x01) != 0) return nullptr;

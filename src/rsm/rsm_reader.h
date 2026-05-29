@@ -287,6 +287,28 @@ public:
         std::uint64_t unit_anchor_offset,
         std::uint8_t marker) const;
 
+    // One entry from a unit's per-unit 0x66 type table. Each unit
+    // declares a flat list of types it references; primitives
+    // (Integer, string, ...) AND cross-unit type imports (TPoint
+    // imported by Items.pas from Shapes.pas) share the table.
+    // The `hash4` 4-byte hash is globally unique per Pascal type
+    // -- two units that both reference Shapes.TPoint carry the
+    // same hash4 (low 16 bits = TPoint's own_hash in Shapes's
+    // declaring scope). That's the link Phase X.2 uses to walk
+    // a cross-unit reference back to the declaring aggregate.
+    struct UnitTypeEntry {
+        std::string   name;
+        std::uint32_t hash4 = 0;
+    };
+
+    // Look up the (name, hash4) for a marker position in a unit's
+    // 0x66 table. Returns nullptr when the marker is out-of-range
+    // or the unit isn't decoded. Same lookup as
+    // primitiveNameForMarker but exposes the 4-byte hash too.
+    const UnitTypeEntry* unitTypeEntryForMarker(
+        std::uint64_t unit_anchor_offset,
+        std::uint8_t marker) const;
+
     void dump(std::FILE* out) const;
 
 private:
@@ -332,12 +354,11 @@ private:
     // primary-type-table scan but kept as a member here so the
     // aggregate parser + downstream callers can both use it.
     std::vector<std::uint64_t>                     unit_anchor_offsets_;
-    // Per-unit primary type-table name list, keyed by the unit's
-    // anchor offset. Position N within the list is the Pascal type
-    // name for marker = 2 * (N+1). Used by aggregate-field decoration
-    // to resolve a field's primitive_marker to a CodeView TypeKind.
+    // Per-unit primary type-table, keyed by the unit's anchor
+    // offset. Each entry is one 0x66 record (name + 4-byte hash);
+    // position N -> marker = 2 * (N + 1).
     std::unordered_map<std::uint64_t,
-                       std::vector<std::string>>   primary_table_by_anchor_;
+                       std::vector<UnitTypeEntry>> primary_table_by_anchor_;
 };
 
 // Decorate a populated model::Module with type information derived

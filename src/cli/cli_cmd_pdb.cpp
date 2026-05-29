@@ -647,18 +647,59 @@ int cmdPdb(int argc, char** argv) {
                 }
                 f.nested_aggregate = registerAggr(sub);
             } else if (fe.primitive_marker != 0) {
-                if (const auto* nm = rsm_reader.primitiveNameForMarker(
-                        a->unit_anchor_offset, fe.primitive_marker)) {
+                // Phase X.2: a "primitive marker" can mean one of
+                // three things:
+                //   1. A real Pascal primitive (Integer, string, ...)
+                //      whose name resolves via resolvePrimitive.
+                //   2. A CROSS-UNIT type reference (TPoint, TItem, ...)
+                //      whose name + 4-byte hash come from the
+                //      enclosing unit's 0x66 table. To render
+                //      these as proper records / classes we have
+                //      to walk back to the DECLARING unit's
+                //      aggregate via the 4-byte hash (low 16 bits
+                //      = own_hash in declaring unit).
+                //   3. An RTL-only type we don't decode -- falls
+                //      through to UChar.
+                if (const auto* entry =
+                        rsm_reader.unitTypeEntryForMarker(
+                            a->unit_anchor_offset,
+                            fe.primitive_marker)) {
                     if (auto rp = rsm2pdb::rsm::Reader::resolvePrimitive(
-                            *nm)) {
+                            entry->name)) {
+                        // Case 1: real primitive.
                         f.prim_kind = rp->kind;
                         f.byte_size = rp->byte_size;
+                    } else if (entry->hash4 != 0) {
+                        // Case 2: cross-unit composite. Look up
+                        // declaring aggregate by (name, low 16
+                        // bits of hash4). agg_by_name was built
+                        // earlier (Phase E Self synth) -- reuse.
+                        const std::uint16_t target_own =
+                            entry->hash4 & 0xFFFFu;
+                        const rsm2pdb::rsm::AggregateType* foreign =
+                            nullptr;
+                        auto r = agg_by_name.equal_range(entry->name);
+                        for (auto it = r.first;
+                             it != r.second && !foreign; ++it) {
+                            if (it->second->own_hash == target_own) {
+                                foreign = it->second;
+                            }
+                        }
+                        // Pass 2: any aggregate with the name
+                        // (low-16-of-hash4 didn't match -- maybe
+                        // because the foreign aggregate's own_hash
+                        // was overwritten by chained re-indexing).
+                        if (foreign == nullptr
+                            && r.first != r.second) {
+                            foreign = r.first->second;
+                        }
+                        if (foreign != nullptr) {
+                            f.nested_aggregate = registerAggr(foreign);
+                        }
                     }
                 }
-                // f.prim_kind stays nullopt when the marker's name
-                // isn't a known primitive (e.g. ShortString or an
-                // RTL-only type we don't decode) -- writer falls
-                // back to UChar.
+                // f.prim_kind stays nullopt when nothing resolves;
+                // writer falls back to UChar.
             }
             rec.fields.push_back(std::move(f));
         }
