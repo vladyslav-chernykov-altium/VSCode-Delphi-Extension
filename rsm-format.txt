@@ -2258,3 +2258,66 @@ shows:
         trailer table boundaries.
       - Check if the variable record's flag byte after inline_type_id
         (0xf0/0xe0/... for cross_unit locals) encodes a unit ID.
+
+---------------------------------------------------------------------------
+2026-05-29 (Tier 2.1 attempt -- cross-unit local typing, DEEPER RE)
+---------------------------------------------------------------------------
+
+Second pass at the parked cross-unit local-typing gap. Documented
+more empirical findings without resolving the mapping. The gap stays
+parked.
+
+[FACT] cross_unit.dpr's 0x66 import table at @3463808+ has 402+
+    type entries (markers 0x02..0xfe and beyond). The first user
+    type TPoint is at position 402 of the 0x66 table. With marker
+    formula 2*(pos+1), TPoint's nominal marker would be 0x326 --
+    too big for the 8-bit primitive_marker slot in field/variable
+    records.
+
+[FACT] cross_unit's lPoint local has inline_type_id = 0x064d. The
+    trailer table at @3516606..3522890 has 0x064d at entry 251.
+    Position 402 (0x66 table) and position 251 (trailer table)
+    don't match, so the two tables aren't 1:1.
+
+[FACT] TItem's 0x2a record in Items.pas carries the global hash4
+    (0x7645e64a) at offset +3 past the kind byte (4 bytes), with
+    a 2-byte linked_hash at offset +7. The hash4 matches the
+    cross_unit's 0x66 import entry for TItem byte-for-byte. So
+    hash4 IS the universal identifier per type.
+
+[GUESS] inline_type_id for cross-unit composite-form vars is NOT
+    derived from hash4 by any simple transformation:
+      lItem.inline_type_id = 0x0659
+      TItem.hash4          = 0x7645e64a
+      hash4 & 0xFFFF       = 0xe64a (doesn't match 0x0659)
+      hash4 % 2^16         = 0xe64a (same)
+      hash4 >> 16          = 0x7645 (doesn't match either)
+    No correlation between inline_type_id and hash4 visible by
+    eye on 5 samples.
+
+[GUESS] The trailer table at @3516606+ assigns each type a unique
+    2-byte global id sequentially. lPoint=0x064d, lSize=0x0651, ...,
+    lLayout=0x065d -- five consecutive entries (+4 step). Maybe
+    Delphi keeps the global-id<->hash4 / name map in a structure
+    we haven't found. Candidates still to investigate:
+      - 1695 0x66 entries in cross_unit's region (3461670..3526402);
+        maybe each has an implicit "next trailer-id" counter.
+      - 0x67 entries (function/method refs) interleaved with 0x66
+        type entries. Both are flat-counted by some pointer
+        somewhere (else compiler can't link them either).
+      - The variable record's flag byte after inline_type_id
+        (0xf0/0xe0/0xde/0xc0/0xb0 for cross_unit's locals; decreases
+        per local). Probably a stack-slot depth, not type info,
+        but worth one more probe.
+
+[DECISION] Park EXTENDED. The Tier 2 NatVis Items work correctly
+    on single-unit fixtures (08_inherit_props). Cross-unit class-
+    as-local resolution is a deeper RE round than fits within a
+    Tier 2 budget. The same gap was the original PARK in 2026-05-28
+    "cross-unit 8a-enum linkage"; that family of issues needs a
+    dedicated RE pass against a real Delphi project that triggers
+    the pattern.
+
+    Reactivation criteria (unchanged): real-project request +
+    dedicated RE budget. The findings in this entry + the previous
+    Tier 2 park entry give the next investigator a head start.
