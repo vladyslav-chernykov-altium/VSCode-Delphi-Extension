@@ -52,6 +52,10 @@ Most recent commit on `main` explains the latest delta in its body
 | `spike/` | History of the de-risking spikes. Not compiled. See `spike/README.md`. |
 | `scripts/install-deps.ps1` | One-time installer for MSYS2 + LLVM. |
 | `scripts/delphi-debug.ps1` | Convenience PowerShell wrapper; superseded by vscode-ext for interactive use. |
+| `scripts/b.sh` | Build rsm2pdb + rsm2pdb_tests (vcvars wrap + cmake --build Debug). Replaces the 200-char incantation. Pipe to `tail` / `grep` as needed. |
+| `scripts/t.sh` | Run rsm2pdb_tests; defaults to `tail -3` summary. `full` arg = unfiltered; `-tc=X` passes through to doctest filter. |
+| `scripts/be.sh` | Build + filter to errors/FAILED only. Use when a build is failing -- read ALL errors at once per frugality directive #4 (batch fixes -- one edit pass per all errors, then rebuild). |
+| `scripts/smoke.sh <fixture>` | PDB pipeline smoke on a named fixture (`locals` / `types` / `iface` / `records` / `inherit_props` / `cross_unit`). `all` arg = regression sweep across all 6 with grep'd key metrics (modules / globals / wrote / adjuster). |
 | `vscode-ext/` | TypeScript extension — **production-grade**. Build/Make/Rebuild/Debug/Cancel commands with keybindings. See `docs/05-vscode-extension.md`. |
 | `.vscode/` | tasks.json + launch.json + settings.json for the rsm2pdb workspace itself. |
 
@@ -183,9 +187,24 @@ manipulation phase. Grouped by phase of work.
 
 6. **ONE-LINER HELPERS FOR 3+ REPEATS.** The moment a command's
    boilerplate (vcvars wrapping, cd-into-build chains) appears
-   3+ times, write a tiny helper script (`build/_b.sh` for build,
-   `build/_t.sh` for test) and use it. Re-typing 150-char
-   incantations is pure waste.
+   3+ times, write a tiny helper script in `scripts/` and use it.
+   Re-typing 150-char incantations is pure waste. Existing
+   helpers (see also "Where things live"):
+   - `scripts/b.sh`  -- build rsm2pdb + tests
+   - `scripts/t.sh`  -- run rsm2pdb_tests (tail -3 by default)
+   - `scripts/be.sh` -- build + filter errors only (pairs with
+     directive #4: read ALL errors at once, batch fixes)
+   - `scripts/smoke.sh <fixture|all>` -- PDB pipeline smoke /
+     regression sweep on examples/04..09
+   NOTE: deliberately NO `scripts/dump_all.sh` or research-style
+   "show me everything" helper. Generic dumping without a
+   hypothesis is the anti-pattern that cost ~1 unit on the
+   2026-05-29 registerAggr fix (RSM dump grep'd 4000+ lines for
+   method-table data while the bug lived in aggregate-table
+   sequencing). Diagnostic = instrumentation in the SUSPECTED
+   code + targeted stderr probe; not external dump. If a third
+   ad-hoc instance of the same narrow query surfaces, then add
+   a targeted helper -- never a "dump all".
 
 7. **ASK ABOUT TOOLING UP-FRONT.** At session start, when you
    can predict you'll run scripts / heredocs / cmd.exe wrappers,
