@@ -102,12 +102,17 @@ Most recent commit on `main` explains the latest delta in its body
 
 ## Frugality directives (STRONG — review before any refactor / build / text-manip phase)
 
-Locked in by the 2026-05-29 retro after two back-to-back monster-
-function refactors (`rsm/` + `pdb/`). Each item maps to a specific
-recurring waste pattern that was observed compounding across the
-session. Treat this section as a checklist, not optional reading --
-glance it before entering any refactor / multi-step build / bulk
-text-manipulation phase.
+Locked in by the 2026-05-29 retro after four back-to-back refactors
+(`rsm/` + `pdb/` + `dwarf/` + `cli_cmd_pdb`). The 28-budget overrun
+on `cli_cmd_pdb` (vs estimated 15-18) drove a consolidation pass:
+13 directives -> 11, with numeric triggers replacing soft language
+("drift" -> ">5 build errors / >1.5x time / new phase surfaced").
+
+Treat this section as a checklist, not optional reading -- glance
+it before entering any refactor / multi-step build / bulk text-
+manipulation phase. Grouped by phase of work.
+
+### A. Plan (before starting)
 
 1. **SCAN BEFORE EXTEND -- AT THE RIGHT TRIGGER.** Before adding
    a **logically new chunk / phase >= 30 lines** to an existing
@@ -128,93 +133,117 @@ text-manipulation phase.
    that way), not the tight 200-line function doing one thing
    well.
 
-2. **THREE STRIKES ON A HEURISTIC.** If a discriminator gets a
+2. **BUDGET = PLAN, NOT PRIVACY CAP. RE-PLAN ON NUMERIC DRIFT.**
+   Before any non-trivial task: surface a per-phase estimate to
+   the user (scope X, phases A/B/C, est cost x/y/z). Then execute
+   the full plan. DO NOT silently narrow scope mid-task to "fit"
+   a budget -- the task always wins; the budget is the plan, not
+   a hidden cap. **Re-plan triggers (any one fires -> STOP and
+   bring revised plan to the user):**
+   - First build with >5 errors after a refactor step (design
+     drift -- preamble incomplete, scope underestimated).
+   - Elapsed effort >1.5x the original estimate for the current
+     phase.
+   - A new previously-unforeseen phase surfaces.
+   - An assumption from the plan turns out wrong on inspection.
+   Never patch-in overruns silently. Never half-do the task to
+   stay under the original number. Reference failure modes: 2026-
+   05-29 dwarf/ (silent scope-cut: file split skipped to "save"
+   budget; caught by user); cli_cmd_pdb (28 vs 15-18 estimated --
+   first-build-fail-with-20-errors should have triggered re-plan,
+   instead I plowed through fix-build cycles).
+
+### B. Verify (during work)
+
+3. **VERIFY AT THE SMALLEST MEANINGFUL MILESTONE.** Not every
+   edit; not only at the end. A "milestone" = a self-contained
+   verifiable chunk whose failure has a manageable rollback. A
+   complex refactor has 3-5 internal milestones (Context design
+   compiles -> 1st phase extracts cleanly -> ... -> final split).
+   Don't burn cycles on full-build after every micro-edit
+   (trust compiler diagnostics there); equally, don't defer
+   ALL verification to the end (rollback explodes if it fails).
+
+4. **WHEN BUILD FAILS -- BATCH FIXES.** If a build returns
+   multiple errors (>=2 distinct root causes), read ALL of them
+   FIRST, batch the corresponding edits into a SINGLE pass,
+   THEN rebuild. Don't edit-build-edit-build cycles -- they
+   compound friction. If errors >5: this is also a directive
+   #2 re-plan trigger.
+
+5. **THREE STRIKES ON A HEURISTIC.** If a discriminator gets a
    third condition (`X && Y && Z`) or a third "but on real data
    we also see..." carve-out, STOP adding clauses. Dump fresh
    hex from 3-5 real samples, find the actual format invariant,
    rewrite the discriminator. The Nth condition is technical debt
-   that compounds across releases (see gotchas #17, #29, #31 for
-   what this looks like when ignored).
+   that compounds across releases (see gotchas #17, #29, #31 in
+   `docs/06-gotchas.md` for what this looks like when ignored).
 
-3. **VERIFY AT MILESTONE BOUNDARIES, NOT EVERY EDIT.** Inside a
-   multi-step refactor, run full build + tests + smoke ONCE per
-   logical milestone (e.g. "all 5 extractions done"), not after
-   each micro-edit. Trust compiler diagnostics for micro-steps;
-   full verification is the exit gate, not the per-step gate.
-   11 build cycles × 30s burned a noticeable chunk of the pdb/
-   refactor.
+### C. Execute
 
-4. **ONE-LINER HELPERS FOR REPEATED COMMANDS.** The moment a
-   command's boilerplate (vcvars wrapping, cd-into-build chains)
-   appears 3+ times, write a tiny helper script (`build/_b.sh`
-   for build, `build/_t.sh` for test) and use it. Re-typing
-   150-char incantations is pure waste.
+6. **ONE-LINER HELPERS FOR 3+ REPEATS.** The moment a command's
+   boilerplate (vcvars wrapping, cd-into-build chains) appears
+   3+ times, write a tiny helper script (`build/_b.sh` for build,
+   `build/_t.sh` for test) and use it. Re-typing 150-char
+   incantations is pure waste.
 
-5. **ASK ABOUT TOOLING UP-FRONT.** At session start, when you
+7. **ASK ABOUT TOOLING UP-FRONT.** At session start, when you
    can predict you'll run scripts / heredocs / cmd.exe wrappers,
    ask the user about broader permission allow-list patterns
    BEFORE getting blocked mid-flow. One question saves N mid-
    work interruptions and tool-call retries.
 
-6. **IN-MEMORY OVER TEMP FILES.** When transforming text across
-   multiple Python operations, keep intermediate state in
-   variables, not in `build/*.txt`. Disk temp files only when
-   data must outlive the script (between separate tool calls
-   that can't share state). One Python invocation, one in-memory
-   pipeline.
+8. **PYTHON FILE I/O: ALWAYS `newline=''`.** Default to
+   `io.open(path, 'r'/'w', encoding='utf-8', newline='')`.
+   Without it, Python silently translates LF <-> CRLF on
+   Windows and breaks EOL conformance in committed code (we
+   hit this once already; not a third time).
 
-7. **FORMAT-AS-YOU-EXTRACT.** Run `clang-format` on the affected
-   file IMMEDIATELY after each text-move step. Don't accumulate
-   indent debt and clean up at the end with one giant format
-   pass -- the diff explodes (one 1500-line clang-format diff
-   landed in the pdb commit because of this).
+9. **TRANSFORMATION-SCRIPT PRE-FLIGHT.** Before running ANY
+   slice/transform script (Python, sed, awk) over source files:
+   - **Endpoints**: verify each slice's `head -3` and `tail -3`
+     -- a closing `}` / `return X;` / `;` off-by-one disappears
+     silently until first compile of the consuming code.
+   - **Bare references**: for each slice that becomes a new
+     function with a Context preamble (alias list),
+     `grep -oE '\b[a-z_][a-zA-Z0-9_]*\b' slice | sort -u` and
+     match against the alias list. Anything in the slice but not
+     aliased = missing reference = future build failure.
+   - **Sibling-file pre-reads**: when writing a new .cpp next to
+     an existing one, READ the existing file's includes /
+     namespace / using-declarations first. Don't guess header
+     paths (`compose/compose.h` vs the real `compose/frame.h`).
+   - **Temp .py on disk is OK** when the script is >50 lines
+     and you might need to re-read it for debugging, BUT delete
+     it at the end of the stage (cleanup mandate). FORMAT-as-
+     you-extract: run `clang-format` on the affected file
+     IMMEDIATELY after the script's output, not at the end of
+     the refactor.
 
-8. **NO SUMMARY TABLES UNLESS REQUESTED.** After a refactor
-   step, report in one sentence: "Step N done, run() now X
-   lines, tests green." Skip the 7-row "what file holds what"
-   tables -- the user sees file sizes with `wc -l`. Context
-   window is a shared resource.
+### D. Communicate
 
-9. **GREP FIRST, READ SECOND.** To find a function / symbol /
-   boundary, use `Grep -n -A/-B/-C`. Only Read when you need
-   >20 contiguous lines or context above an unknown location.
-   Don't Read 100 lines to find a 5-line region grep would
-   pinpoint in one call.
+10. **NO TABLES IN STATUS UPDATES.** During work, report in one
+    sentence: "Step N done, run() now X lines, tests green."
+    Skip the 7-row "what file holds what" tables -- the user
+    sees file sizes with `wc -l`. Context window is a shared
+    resource. **Exception**: structural before/after delta
+    tables at the END of a multi-stage refactor are fine when
+    they convey new information (sizes, file split, metric
+    drift).
 
-10. **DON'T RE-READ AFTER YOU EDIT.** Edit / Write guarantees
-    the write succeeded (or errors out). The system reminder
-    shows post-edit content if it's noteworthy. Re-reading is
-    double the tokens for zero new info.
-
-11. **DON'T READ SCHEMA DUMPS / ERROR EXPANSIONS.** When a
-    tool returns a 500-line schema in an error message
-    (settings.json validation, etc.), DON'T ingest the full
-    dump. Read 1-2 lines of the actual error and infer the fix.
-    Skim only -- the schema isn't the user's question.
-
-12. **PYTHON FILE I/O: ALWAYS `newline=''`.** Default to
-    `io.open(path, 'r'/'w', encoding='utf-8', newline='')`.
-    Without it, Python silently translates LF <-> CRLF on
-    Windows and breaks EOL conformance in committed code (we
-    hit this once already; not a third time).
-
-13. **BUDGET = PLAN, NOT PRIVACY CAP. RE-PLAN ON DRIFT.** When
-    approaching a task, first plan + optimize the budget across
-    its phases and surface that plan to the user (task scope X,
-    phases A/B/C, est cost x/y/z). Then execute the full plan.
-    DO NOT silently narrow scope mid-task to "fit" a budget --
-    the task always wins; the budget is the plan, not a hidden
-    cap. If reality diverges (a phase overshoots, a new phase
-    surfaces, an assumption fails), STOP, RE-PLAN the WHOLE
-    task, and bring the new plan + new estimate to the user.
-    Never patch-in overruns silently and never half-do the task
-    to stay under the original number. Common failure (caught
-    on the 2026-05-29 dwarf/ refactor): file was 785 lines,
-    rule #1 said split-required, but the agent did only
-    function-extraction and skipped the file split to "save
-    budget" -- without flagging the scope cut. The right move
-    was: surface estimate 10, do full split, deliver 100% of
-    the task.
+11. **DON'T INGEST UNNECESSARY TEXT.** Three related cases:
+    - **After Edit/Write**: don't re-read the file -- the tool
+      guarantees the write succeeded (or errored), and the
+      system reminder shows post-edit content if noteworthy.
+    - **Schema dumps / error expansions**: when a tool returns
+      a 500-line schema (settings.json validation, type-deep
+      errors), DON'T ingest the full dump. Read 1-2 lines of
+      the actual error and infer the fix.
+    - **Find by Grep, not by Read**: use `Grep -n -A/-B/-C` for
+      symbols / boundaries; Read only when you need >20
+      contiguous lines or context above an unknown location.
+    All three rules share one principle: every token you read
+    is a token you can't spend on thinking.
 
 ---
 
