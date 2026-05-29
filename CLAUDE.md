@@ -66,6 +66,7 @@ body. `git log --oneline` for the recent history.
 | `examples/06_interface/` | Interface-dispatch patterns + adjuster thunks (Item 21). Used to verify `.natstepfilter` + hybrid auto-skip. |
 | `examples/07_records/` | Records / classes (with single-level inheritance) / enums / sets. Drove Step 11b phases D / E / F / F+. TBig has 40 Integer fields to exercise the 2-byte offset form (R6). |
 | `examples/08_inherit_props/` | 3-level inheritance (TAnimal -> TMammal -> TDog) + Pascal `property` (field-backed / read-only / getter-setter). Surfaced the variable-length class-header bug (gotcha #26); confirmed properties are invisible to CodeView. |
+| `examples/09_cross_unit/` | Multi-unit project: Shapes.pas declares TPoint/TColor/TSize, Items.pas declares TItem with those as fields, Layout.pas declares TLayout referencing both, cross_unit.dpr uses all three. Drove the cross-unit type-resolution work (gotchas #33..#36): per-unit 4-hash-per-class chaining, 0x66 imports table with 4-byte hash, multi-uses 0x63 0x64 separators, cross-unit composite field resolution via name + low-16-of-hash4. |
 | `test/fixtures/` | Committed .exe/.rsm/.map sample inputs (hello, two_units, primitives, records). |
 | `spike/` | History of the de-risking spikes. Not compiled. See `spike/README.md`. |
 | `scripts/install-deps.ps1` | One-time installer for MSYS2 + LLVM. |
@@ -667,7 +668,88 @@ update this section first and explain why in the commit message.
     emits `type = 0x1025 (set of TSaveFormat)`. cdb shows each
     enumerator's bit individually. AdvPCB still 45s.
 
-33. **Pascal `property` declarations don't make it into the PDB.**
+33. **Unit anchor source-file marker has TWO byte patterns.**
+    The anchor scanner originally only accepted `02 70 <fnl>
+    <unitname>.pas` as the source-file signature within 200
+    bytes of an `02 <nl> <unit>` anchor. Empirically:
+       0x02 0x70 ... is used by .dpr-style self-anchors
+                    (cross_unit.dpr finds its own .dpr through
+                    this).
+       0x3c 0x70 ... is used by .pas unit anchors
+                    (Shapes / Items / Layout in
+                    examples/09_cross_unit; AdvPCB RTL units
+                    commonly).
+    Without 0x3c acceptance multi-unit projects only register
+    the .dpr anchor (Shapes/Items/Layout invisible -> their
+    types fall into the global last-wins bucket and collide
+    with System types of the same per-unit hash). Fix: accept
+    either prefix byte, both followed by 0x70 + valid .pas/.dpr
+    file (src/rsm/rsm_reader.cpp, gotcha first observed in
+    examples/09_cross_unit).
+
+34. **A unit's 0x66 primary type table has multi-uses
+    SEPARATORS.** Between blocks of 0x66/0x67 entries that
+    belong to different imported units the table inserts a
+    short record:
+        63 64 <fnl> <imported_unit_name> 00 00 00
+    e.g. examples/09_cross_unit Items.pas carries
+    `63 64 07 SysInit 00 00 00` and `63 64 06 Shapes 00 00 00`
+    before the 0x66 entries for TPoint / TSize / TColor (the
+    Shapes-imported types). Without walking past the separator
+    the parser stops at the first non-(0x66/0x67) byte and the
+    cross-unit imports get lost. Walk-past fix: when seeing
+    `63 64 <fnl> <printable> 00 00 00`, advance by 6 + fnl
+    bytes and continue collecting 0x66 entries.
+
+35. **The 0x66 table is the cross-unit IMPORT table; each
+    entry carries a globally-unique 4-byte type hash.** Each
+    0x66 record's `<4-byte hash trailer>` is a globally-stable
+    identifier per Pascal type. Two units that both reference
+    Shapes.TPoint carry the same hash4 0x0c6d2cf6 in their
+    respective 0x66 tables. The LOW 16 bits of hash4 equal
+    the type's own_hash in the DECLARING unit -- that's the
+    cross-unit link.
+
+    Cross-unit field resolution (cli_cmd_pdb.cpp X.2):
+      1. Field's primitive_marker -> unit's 0x66 entry at
+         position marker/2 - 1 -> (name, hash4).
+      2. If `name` resolves via resolvePrimitive() -> real
+         primitive (Integer / string / ...). Use existing path.
+      3. Else: search agg_by_name[name] for an aggregate whose
+         own_hash equals hash4 & 0xFFFF. That's the foreign-
+         unit declaring aggregate. Register it; nested_aggregate
+         points at its TypeIndex.
+    With this, `Items.TItem.fPos: TPoint` in 09_cross_unit
+    renders as `LF_MEMBER Type=0x1001` where 0x1001 is the
+    Shapes.TPoint LF_STRUCTURE -- cdb expands fPos into X / Y
+    rather than showing a bare `unsigned`.
+
+36. **A Pascal class declared in one unit shows up under
+    FOUR hashes in that unit's metadata.** Surfaced by
+    09_cross_unit's TItem and TLayout. The roles:
+        NAME       = 0x2a own_hash
+        LINKED     = 0x2a's secondary hash at byte +7..+8
+                     from kind (only when kind & 0x80)
+        CLS_HEADER = 0x47 own_hash
+        FLD_PARENT = 0x2c parent_hash
+    Empirical formulas (verified on records.dpr, 09_cross_unit,
+    AdvPCB):
+        FLD_PARENT = ((LINKED & 0xff) << 8) | 0x08
+                     (UNIVERSAL across records + classes)
+        For CLASSES:
+            either LINKED == CLS_HEADER own_hash
+                   (AdvPCB direct-match, kind=0xa8)
+                or LINKED.low == CLS_HEADER.low
+                   (09_cross_unit, kind=0xa8 too but split
+                   high bytes)
+    Phase X.3 fix: ALIAS the aggregate in aggr_by_unit_hash_
+    under all derived hashes (CLS_HEADER own_hash AND
+    FLD_PARENT), and FORCE-CLASSIFY as Class when a chain to
+    a 0x47 header succeeds. Without the aliasing, 0x2c fields
+    parented to FLD_PARENT 0x1208 never find their TItem
+    aggregate (which has own_hash 0x424c, NAME hash).
+
+37. **Pascal `property` declarations don't make it into the PDB.**
     CodeView has no `LF_PROPERTY` counterpart. What survives the
     Delphi -> RSM -> CodeView pipeline:
       - backing FIELDS (LF_MEMBER `fName`, `fBarkCount`, ...);
@@ -779,17 +861,56 @@ keep them — they're invaluable for future RSM RE):
 
 ---
 
-*Last updated: 2026-05-28 (late evening), after AdvPCB-scale
-verification + STATUS_STACK_OVERFLOW fix in the aggregate
-registrar (gotcha #28). End-to-end on AdvPCB (947k publics, 142k
-line-tables, 66k aggregates, 207k aggregate-typed globals): clean
-exit, 46 seconds wall-time, 136 user records routed via TPI +
-2,825 aggregates registered. Phase E's recursive registrar was
-the culprit -- cyclic base / composite-field references in deep
-VCL hierarchies blew the 1 MB Windows stack at depth ~thousands.
-Fixed with an `aggr_in_progress` set returning nullopt on
-recursive re-entry; preserves the writer's children-before-
-referrers dependency invariant.
+*Last updated: 2026-05-28 (night), after Phase X --
+cross-unit type resolution + 4-hash-per-class chaining. Added
+examples/09_cross_unit fixture (4 source files: Shapes /
+Items / Layout / cross_unit) and the parser plumbing to
+make Items.TItem.fPos render as Shapes.TPoint instead of
+opaque `unsigned`. Six pipeline changes:
+  - X.0  unit anchor detector also accepts `3c 70` source-file
+         marker (was only `02 70`); finds 4 of 4 user units
+         in 09_cross_unit (was 1).
+  - X.0bis 0x66 table parser walks past multi-uses separators
+           `63 64 <fnl> <imported_unit_name> 00 00 00`.
+  - X.1  per-unit 0x66 entries now carry the 4-byte hash, not
+         just name. 4-byte hash = globally-unique type ID
+         (low 16 = own_hash in declaring unit).
+  - X.3  same-unit chaining via empirical formulas: FLD_PARENT
+         = ((LINKED & 0xff) << 8) | 0x08, and for classes
+         either LINKED == CLS_HEADER (AdvPCB) or
+         LINKED.low == CLS_HEADER.low (09).  Aliases aggregate
+         under all derived hashes; force-classifies as Class
+         when chain reaches a 0x47 header.
+  - X.2  cross-unit composite field resolution: marker -> name +
+         hash4 -> agg_by_name search for own_hash matching
+         hash4.low. Cross-unit composites (TPoint, TSize) now
+         render as proper LF_STRUCTUREs with field-by-field
+         Watch expansion.
+  - Per-unit pending_enums_by_unit (parallel to pending_fields_
+    by_unit, gotcha #29) defeats cross-unit enum-entry hash
+    collisions.
+
+End-to-end:
+  - 09_cross_unit -- TPoint / TSize cross-unit composites in
+    TItem render correctly. TColor enum cross-unit still
+    shows as `unsigned` (different `8a 00 00 ...` enum-entry
+    marker format than AdvPCB's `0a 00 00`; parent linkage
+    not yet decoded). TLayout.fLeadItem class-pointer cross-
+    unit also off (registerAggr returns wrong nested_aggregate
+    index -- cache / sequence bug under investigation).
+  - 04..08 regression sweep clean.
+  - AdvPCB 43s end-to-end (faster than prior 46s baseline
+    thanks to tighter classifier).
+
+Earlier (afternoon): AdvPCB STATUS_STACK_OVERFLOW fix in the
+aggregate registrar (gotcha #28). End-to-end on AdvPCB (947k
+publics, 142k line-tables, 66k aggregates, 207k aggregate-typed
+globals): clean exit, 46 seconds wall-time, 136 user records
+routed via TPI + 2,825 aggregates registered. Phase E's
+recursive registrar was the culprit -- cyclic base / composite-
+field references in deep VCL hierarchies blew the 1 MB Windows
+stack at depth ~thousands. Fixed with an `aggr_in_progress`
+set returning nullopt on recursive re-entry.
 
 Earlier the same day: 08_inherit_props fixture + variable-length
 class-header fix (commit 394e12a). The new fixture exercises

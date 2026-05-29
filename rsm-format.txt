@@ -1806,3 +1806,159 @@ the block grew by 1 byte.
        methods + fields but not the property -- documented as
        gotcha #28 in CLAUDE.md.
 
+---------------------------------------------------------------------------
+2026-05-28 (night) -- cross-unit type-reference encoding
+---------------------------------------------------------------------------
+
+Discovered via examples/09_cross_unit (Shapes / Items / Layout /
+cross_unit.dpr layered fixture). Three groups of empirical
+facts; collectively they let cross-unit composite fields
+(Items.TItem.fPos -> Shapes.TPoint with X / Y fields) round-trip
+into the PDB.
+
+[FACT] Unit anchor source-file marker has TWO byte patterns.
+       The `02 <nl> <unit_name>` anchor is followed within ~200
+       bytes by a source-file signature. Empirically:
+
+         02 70 <fnl> <filename>     -- used by .dpr-style
+                                       self-anchors (the .dpr
+                                       finds its own source via
+                                       this).
+         3c 70 <fnl> <filename>     -- used by .pas unit anchors
+                                       (Shapes / Items / Layout
+                                       in 09_cross_unit; AdvPCB
+                                       RTL units routinely).
+
+       The trailing structure (`fnl` byte, filename, optional
+       `.pas` / `.dpr` / `.inc` / `.tmp` extension) is the same
+       in both cases. Parser accepts either prefix.
+
+[FACT] Per-unit 0x66 type table = cross-unit IMPORT TABLE.
+       Each 0x66 entry has shape:
+           66 <nl> <name> <4-byte hash trailer>
+       For each Pascal type the unit REFERENCES (declared OR
+       imported), the unit's 0x66 table carries an entry with
+       that type's globally-unique 4-byte hash.
+
+       Examples from 09_cross_unit Items.pas region (0x34b62e):
+         66 07 TObject              4byte=0x93630ec3
+         66 0d UnicodeString        4byte=0xcb0cbc2c
+         66 07 Integer              4byte=0xb573cea0
+         66 06 string               4byte=0xcb0cbc2c
+         66 06 TPoint               4byte=0x0c6d2cf6  <- imported
+         66 05 TSize                4byte=0x3ed57bdf  <- from
+         66 06 TColor               4byte=0x5e4acac6  <- Shapes
+
+       cross_unit.dpr's 0x66 table contains the same hash4 for
+       TPoint (0x0c6d2cf6) plus its own imports (TItem
+       0x95e4424c, TLayout 0x14e07925).
+
+       The LOW 16 BITS of a 4-byte hash equal the type's
+       own_hash in its declaring unit. For TPoint (Shapes.pas
+       declares it with own_hash 0x2cf6), low 16 of 0x0c6d2cf6
+       is 0x2cf6 -- exact match.
+
+       Cross-unit resolution algorithm:
+         field.primitive_marker
+              -> unit's 0x66 entry at position marker/2 - 1
+              -> (name, hash4)
+              -> if name is primitive, resolve via
+                 kPrimitiveTable.
+              -> else search aggregates() for one with
+                 own_hash == (hash4 & 0xFFFF) AND name match.
+                 That's the declaring-unit aggregate.
+
+[FACT] The 0x66 table CAN have multi-uses SEPARATORS between
+       blocks. When a unit `uses` multiple other units, blocks
+       of 0x66 entries are interleaved with short separator
+       records:
+           63 64 <fnl> <imported_unit_name> 00 00 00
+       (length 6 + fnl bytes). Empirically Items.pas has
+           63 64 07 SysInit 00 00 00
+           63 64 06 Shapes  00 00 00
+       between its TObject-method 0x67 entries and the
+       Shapes-imported 0x66 entries (TPoint / TSize / TColor).
+
+       Parser must walk past these and continue collecting
+       0x66/0x67 records, otherwise cross-unit imports get
+       lost (the loop stops at the first non-(0x66/0x67) byte).
+
+[FACT] Same-unit "4 hashes per class" pattern.
+
+       A Pascal class declared within ONE unit carries FOUR
+       distinct 2-byte hashes serving four different roles:
+
+         NAME       = 0x2a own_hash
+         LINKED     = 0x2a's secondary hash @ +7..+8 from kind
+                      (only present when kind has bit 0x80 set)
+         CLS_HEADER = 0x47 own_hash
+         FLD_PARENT = 0x2c parent_hash (what fields parent to)
+
+       Samples:
+         records.dpr TPoint        : own=0x1a71 (old format,
+                                     no linked_hash; direct
+                                     attach works)
+         09 Items.TItem            : NAME=0x424c, LINKED=0x0712,
+                                     CLS_HEADER=0xb112,
+                                     FLD_PARENT=0x1208
+         09 Layout.TLayout         : NAME=0x7925, LINKED=0x0710,
+                                     CLS_HEADER=0x7d10,
+                                     FLD_PARENT=0x1008
+         09 Shapes.TPoint (record) : NAME=0x2cf6, LINKED=0x0706,
+                                     no CLS_HEADER (records
+                                     have no 0x47),
+                                     FLD_PARENT=0x0608
+         09 Shapes.TSize  (record) : NAME=0xe97c, LINKED=0x8708,
+                                     FLD_PARENT=0x0808
+         AdvPCB TPCBCommands       : NAME=0xd0cf, LINKED=0x0405,
+                                     CLS_HEADER=0x0405,
+                                     FLD_PARENT=0x0405
+                                     (all three equal --
+                                     "direct match" form)
+
+       Empirical formulas (universal across records + classes):
+         FLD_PARENT = ((LINKED & 0xff) << 8) | 0x08
+
+       For CLASSES specifically two patterns observed:
+         pattern A (AdvPCB-style):  LINKED == CLS_HEADER own_hash
+         pattern B (09-style):      LINKED.low == CLS_HEADER.low
+                                    (high bytes differ)
+
+       Resolution (src/rsm/rsm_reader.cpp, "Phase X.3"):
+         1. Compute FLD_PARENT from LINKED via formula above.
+            Register aggregate under FLD_PARENT hash in
+            aggr_by_unit_hash_ so fields find it.
+         2. If class_hashes already has LINKED -> AdvPCB direct
+            match, kind = Class.
+         3. Else search class_headers for one with own_hash low
+            byte matching LINKED.low (09 pattern). If unique
+            match, register under CLS_HEADER own_hash too;
+            kind = Class.
+         4. Classifier respects already-set kind to avoid
+            re-classifying chained Class as Unknown.
+
+[GUESS] AdvPCB and 09 use the same `kind=0xa8` (0x80 bit set)
+       but the LINKED-vs-CLS_HEADER relationship differs.
+       Probably reflects compiler-version differences in the
+       per-class linker encoding. Both patterns covered by the
+       resolution logic above.
+
+[FACT] 09-format enum entries use a DIFFERENT marker layout
+       than AdvPCB. AdvPCB uses
+           25 <nl> <name> 0a 00 00 <parent u16> 00 00 <ord_x2>
+       and parent_hash sits at +3..+4 from the `0a`.
+       09 uses
+           25 <nl> <name> 8a 00 00 <entry_id u32> 04 00 00 <ord>
+       with NO direct parent_hash field at that offset. Each
+       entry carries its own sequential 4-byte ID; the repeated
+       value across all entries (`48 f1 04` at +5..+7 for the
+       clRed..clYellow batch) might be a back-pointer but
+       doesn't match TColor's own_hash directly.
+
+       Consequence: TColor cross-unit field still renders as
+       `unsigned` in 09 -- the parent linkage hasn't been
+       decoded yet. Records (TPoint, TSize) work; enums don't.
+       This is a known limitation called out in CLAUDE.md.
+
+
+

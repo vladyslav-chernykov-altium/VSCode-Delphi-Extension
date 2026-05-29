@@ -1055,6 +1055,44 @@ green; user-visible payoff lands at D for records and E for classes.
          (S_GPROC32); the property name itself is invisible.
          Limitation, not a bug -- documented for future readers.
 
+[~] X    Cross-unit type-reference pipeline + 09_cross_unit
+         fixture (Shapes/Items/Layout/cross_unit.dpr).
+         Partial DONE 2026-05-28 (commit f29b841). Five
+         pipeline changes (X.0 unit-anchor `3c 70` marker,
+         X.0bis multi-uses 0x63 0x64 separators, X.1 0x66
+         4-byte hash, X.3 same-unit 4-hash-per-class chaining
+         via universal formula, X.2 cross-unit composite
+         resolution via name + low-16-of-hash4). Per-unit
+         pending_enums_by_unit (parallel fix to
+         pending_fields_by_unit, gotcha #29).
+
+         Working:
+           - Cross-unit RECORDS: TItem.fPos / fSize render as
+             Shapes.TPoint / TSize LF_STRUCTUREs (correct
+             field-by-field Watch).
+           - Same-unit CLASS field linking via 4-hash chain
+             (TItem itself emits with its real fields, not as
+             empty LF_CLASS placeholder).
+           - AdvPCB regression-free, 43s baseline.
+           - Documented as gotchas #33..#36 in CLAUDE.md;
+             empirical findings in rsm-format.txt
+             2026-05-28-night entry.
+
+         Known limitations (left for follow-up):
+           - Cross-unit ENUM fields (TItem.fColor : TColor):
+             09's enum-entry marker format `8a 00 00 ...`
+             doesn't carry parent_hash at the AdvPCB-style
+             +3..+4 offset. RE needed to identify the parent
+             linkage (per-entry 4-byte IDs + a repeated value
+             that might be an enum-back-pointer).
+           - Cross-unit CLASS-as-field (TLayout.fLeadItem :
+             TItem): registerAggr returns the wrong
+             nested_aggregate index (returns 0 / TPoint
+             instead of TItem's idx). Foreign pointer lookup
+             confirmed correct; bug in registerAggr's cache
+             or registration sequence when the same aggregate
+             is reached via different recursion paths.
+
 [ ] J    DWARF parity for D + E + F (DW_TAG_structure_type +
          DW_TAG_class_type + DW_TAG_member + DW_TAG_enumeration_type +
          DW_TAG_enumerator). Same metadata via model::AggregateRef.
