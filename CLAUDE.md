@@ -563,7 +563,43 @@ update this section first and explain why in the commit message.
         AdvPCB's FileSave (all 8 locals + correct TSaveFormat*
         type for the in-proc-emitted enum).
 
-30. **Pascal `property` declarations don't make it into the PDB.**
+30. **Self ALWAYS needs its type synthesised from the proc name,
+    not from RSM's Self encoding.** Pascal's implicit `Self`
+    parameter in a class method should display as a typed pointer
+    to the enclosing class. RSM tags Self with sentinel markers
+    (0x29 / 0xD5 / 0x31) or with a per-unit-encoded 2-byte value
+    that doesn't resolve to any aggregate hash -- if we trust
+    that decode, Self ends up as `unsigned __int64` and the
+    debugger renders it as a raw hex number (user saw
+    `Self: 8364525696` on AdvPCB's TPCBCommands.FileSave).
+
+    Fix (cli_cmd_pdb.cpp): for every ResolvedVar with is_self,
+    derive the enclosing class name from the proc name's
+    second-to-last dot-segment (`Unit.TClass.Method` -> `TClass`)
+    and look it up:
+      1. same unit, kind=Class
+      2. any  unit, kind=Class  (the class can live in an
+         interface-only unit)
+      3. any  unit, any kind    (AdvPCB-style opaque / forward-
+         declared classes -- TPCBCommands has a 0x2a record but
+         no class header / fields)
+      4. fallback: emit Self as VoidPointer64 (better than
+         unsigned __int64 because the debugger knows to follow
+         the pointer).
+
+    For pass 3 hits the writer synthesises an EMPTY LF_CLASS
+    named after the class -- cdb shows `Self: 0x... [TClass]`
+    even though no field info is available. self_opaque_cache
+    is keyed by class name so one synthetic LF_CLASS per class
+    is emitted, not one per method.
+
+    Performance note: a naive linear scan of rsm_reader.
+    aggregates() per Self lookup pushed AdvPCB from 46s to 152s.
+    Use a pre-built unordered_multimap<name, AggregateType*> +
+    unordered_multimap<(unit_anchor, name), ...> so each Self
+    lookup is O(1). Back to baseline 46s.
+
+31. **Pascal `property` declarations don't make it into the PDB.**
     CodeView has no `LF_PROPERTY` counterpart. What survives the
     Delphi -> RSM -> CodeView pipeline:
       - backing FIELDS (LF_MEMBER `fName`, `fBarkCount`, ...);

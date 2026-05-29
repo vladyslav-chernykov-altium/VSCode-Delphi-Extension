@@ -135,7 +135,12 @@ begin
 end;
 
 function TShape.Describe: string;
+Type
+    TSaveFormat = (eASCII, eBinary3, eBinary4, eBinary5, eBinary6, eBinaryPCBWorks, eBinaryCS, eBinaryCM, eExternal);
+var
+    r : set of TSaveFormat;
 begin
+  r := { eASCII, eBinaryCS };
   Result := fName + ' (base)';
 end;
 

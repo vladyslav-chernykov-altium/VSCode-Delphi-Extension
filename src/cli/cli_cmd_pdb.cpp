@@ -455,6 +455,47 @@ int cmdPdb(int argc, char** argv) {
     // registrar blows the stack -- STATUS_STACK_OVERFLOW observed
     // at registerAggr depth ~thousands on AdvPCB.
     std::set<std::pair<std::uint64_t, std::uint16_t>> aggr_in_progress;
+    // Self placeholders for opaque / forward-declared classes whose
+    // 0x2a record doesn't carry fields (e.g. AdvPCB's TPCBCommands).
+    // Keyed by class name so cdb sees a single typed pointer per
+    // class instead of one synthetic LF_CLASS per method.
+    std::map<std::string, std::size_t> self_opaque_cache;
+    // Pre-built indexes over rsm_reader.aggregates() so the per-Self
+    // class-name lookup runs in O(1) instead of O(N) per call.
+    // Without these, an AdvPCB-scale build (~3k class methods,
+    // ~66k aggregates) spends 100+ seconds linearly scanning the
+    // aggregate list for every Self.
+    std::unordered_multimap<std::string,
+                            const rsm2pdb::rsm::AggregateType*>
+        agg_by_name;
+    // Same-unit lookup wins when both kinds match; key on
+    // (unit_anchor, name) to avoid cross-unit confusion.
+    struct UA_Name {
+        std::uint64_t ua;
+        std::string  name;
+        bool operator==(const UA_Name& o) const {
+            return ua == o.ua && name == o.name;
+        }
+    };
+    struct UA_Name_Hash {
+        std::size_t operator()(const UA_Name& k) const noexcept {
+            return std::hash<std::uint64_t>{}(k.ua) * 1099511628211ull
+                 ^ std::hash<std::string>{}(k.name);
+        }
+    };
+    std::unordered_multimap<UA_Name,
+                            const rsm2pdb::rsm::AggregateType*,
+                            UA_Name_Hash>
+        agg_by_unit_name;
+    if (have_rsm) {
+        agg_by_name.reserve(rsm_reader.aggregates().size());
+        agg_by_unit_name.reserve(rsm_reader.aggregates().size());
+        for (const auto& a : rsm_reader.aggregates()) {
+            agg_by_name.emplace(a.name, &a);
+            agg_by_unit_name.emplace(
+                UA_Name{a.unit_anchor_offset, a.name}, &a);
+        }
+    }
     std::function<std::optional<std::size_t>(
         const rsm2pdb::rsm::AggregateType*)> registerAggr;
     registerAggr = [&](const rsm2pdb::rsm::AggregateType* a)
@@ -854,6 +895,135 @@ int cmdPdb(int argc, char** argv) {
                                     if (inputs.aggregates[*idx].byte_size)
                                         ml.byte_size =
                                             inputs.aggregates[*idx].byte_size;
+                                }
+                            }
+                            // Self of a class method: ALWAYS derive
+                            // type from the enclosing class via the
+                            // proc-name suffix instead of trusting
+                            // RSM's Self encoding (which can carry
+                            // sentinel markers like 0x29 / 0xD5 that
+                            // don't resolve to an aggregate, or a
+                            // 2-byte encoded marker like 0x0405 that
+                            // matches nothing).
+                            //
+                            // Pascal `procedure TClass.Method` -> the
+                            // implicit Self has type `TClass*`. Strip
+                            // the trailing `.Method`, then strip the
+                            // leading unit prefix. Look the class up:
+                            //   1. Same unit, kind = Class    (best)
+                            //   2. Any unit,  kind = Class    (class
+                            //      declared in interface-only unit)
+                            //   3. Any unit,  any kind        (opaque
+                            //      / forward-declared classes, AdvPCB
+                            //      style -- TPCBCommands has a 0x2a
+                            //      record but no class header or
+                            //      fields). registerAsClass synthesises
+                            //      an empty LF_CLASS so cdb at least
+                            //      knows it's a typed pointer.
+                            //   4. Nothing found              -> emit
+                            //      Self as void* (typeForSize(0)
+                            //      yields VoidPointer64, the only
+                            //      pointer-ish primitive we have).
+                            if (rv.is_self) {
+                                const auto& pn = pr->name;
+                                const auto last_dot = pn.rfind('.');
+                                std::string class_name;
+                                if (last_dot != std::string::npos
+                                    && last_dot > 0) {
+                                    const auto prev_dot =
+                                        pn.rfind('.', last_dot - 1);
+                                    class_name =
+                                        (prev_dot == std::string::npos)
+                                            ? pn.substr(0, last_dot)
+                                            : pn.substr(prev_dot + 1,
+                                                last_dot - prev_dot - 1);
+                                }
+                                if (!class_name.empty()) {
+                                    const auto ua =
+                                        rsm_reader.unitAnchorFor(
+                                            pr->file_offset);
+                                    const rsm2pdb::rsm::AggregateType*
+                                        cls = nullptr;
+                                    // Pass 1: same unit, kind=Class.
+                                    auto r1 = agg_by_unit_name.equal_range(
+                                        UA_Name{ua, class_name});
+                                    for (auto it = r1.first;
+                                         it != r1.second && !cls; ++it) {
+                                        if (it->second->kind
+                                            == rsm2pdb::rsm
+                                                  ::AggregateKind::Class) {
+                                            cls = it->second;
+                                        }
+                                    }
+                                    // Pass 2: any unit, kind=Class.
+                                    if (cls == nullptr) {
+                                        auto r2 =
+                                            agg_by_name.equal_range(
+                                                class_name);
+                                        for (auto it = r2.first;
+                                             it != r2.second && !cls;
+                                             ++it) {
+                                            if (it->second->kind
+                                                == rsm2pdb::rsm
+                                                      ::AggregateKind
+                                                          ::Class) {
+                                                cls = it->second;
+                                            }
+                                        }
+                                    }
+                                    // Pass 3: any kind, any unit
+                                    // (TPCBCommands-style opaque).
+                                    if (cls == nullptr) {
+                                        auto r3 =
+                                            agg_by_name.equal_range(
+                                                class_name);
+                                        if (r3.first != r3.second) {
+                                            cls = r3.first->second;
+                                        }
+                                    }
+                                    std::optional<std::size_t> self_idx;
+                                    if (cls != nullptr
+                                        && cls->kind == rsm2pdb::rsm
+                                              ::AggregateKind::Class) {
+                                        // Full class -- normal path.
+                                        self_idx = registerAggr(cls);
+                                    } else {
+                                        // Opaque / not found:
+                                        // synthesise an empty
+                                        // LF_CLASS placeholder so
+                                        // Self at least shows up as
+                                        // `TClassName *` with no
+                                        // fields. Cached by name.
+                                        auto cit = self_opaque_cache
+                                                       .find(class_name);
+                                        if (cit != self_opaque_cache.end()) {
+                                            self_idx = cit->second;
+                                        } else {
+                                            const auto idx =
+                                                inputs.aggregates.size();
+                                            rsm2pdb::pdb::AggregateRecord
+                                                rec;
+                                            rec.kind = rsm2pdb::pdb
+                                                ::AggregateKind::Class;
+                                            rec.name = class_name;
+                                            rec.byte_size = 0;
+                                            inputs.aggregates.push_back(
+                                                std::move(rec));
+                                            self_opaque_cache[class_name] =
+                                                idx;
+                                            self_idx = idx;
+                                        }
+                                    }
+                                    if (self_idx) {
+                                        ml.aggregate_index = self_idx;
+                                        ml.byte_size = 8;
+                                    } else {
+                                        // No class info AT ALL --
+                                        // void* hint is still better
+                                        // than unsigned __int64.
+                                        ml.byte_size = 0;
+                                        ml.prim_kind = std::nullopt;
+                                    }
                                 }
                             }
                             mf_out.locals.push_back(std::move(ml));
