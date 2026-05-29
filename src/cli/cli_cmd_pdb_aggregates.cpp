@@ -132,8 +132,15 @@ Context::registerAggr(const rsm2pdb::rsm::AggregateType *a) {
     }
     base_idx = registerAggr(base_a);
   }
-  const auto idx = inputs.aggregates.size();
-  aggr_idx_cache[key] = idx;
+  // NB: do NOT cache idx before recursing on fields -- the recursion
+  // may push children to inputs.aggregates first (children-before-
+  // referrers is the writer's TPI dependency-order invariant), making
+  // any pre-recursion `inputs.aggregates.size()` snapshot stale by
+  // push time. We cache idx AFTER push_back at each branch's tail
+  // (set / enum / record-class). Self-references during recursion are
+  // caught by aggr_in_progress (cycle break) which is checked above
+  // BEFORE the cache lookup -- so a missing pre-recursion cache entry
+  // is safe.
   rsm2pdb::pdb::AggregateRecord rec;
   rec.kind = is_class  ? rsm2pdb::pdb::AggregateKind::Class
              : is_enum ? rsm2pdb::pdb::AggregateKind::Enum
@@ -163,6 +170,8 @@ Context::registerAggr(const rsm2pdb::rsm::AggregateType *a) {
                     : max_ord <= 31 ? 4
                                     : 8;
     inputs.aggregates.push_back(std::move(rec));
+    const auto idx = inputs.aggregates.size() - 1;
+    aggr_idx_cache[key] = idx;
     aggr_in_progress.erase(key);
     return idx;
   }
@@ -184,6 +193,8 @@ Context::registerAggr(const rsm2pdb::rsm::AggregateType *a) {
       rec.enumerators.push_back(std::move(ae));
     }
     inputs.aggregates.push_back(std::move(rec));
+    const auto idx = inputs.aggregates.size() - 1;
+    aggr_idx_cache[key] = idx;
     aggr_in_progress.erase(key);
     return idx;
   }
@@ -251,6 +262,8 @@ Context::registerAggr(const rsm2pdb::rsm::AggregateType *a) {
     rec.fields.push_back(std::move(f));
   }
   inputs.aggregates.push_back(std::move(rec));
+  const auto idx = inputs.aggregates.size() - 1;
+  aggr_idx_cache[key] = idx;
   aggr_in_progress.erase(key);
   return idx;
 }
