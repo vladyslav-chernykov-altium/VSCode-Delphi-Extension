@@ -1138,6 +1138,15 @@ bool Reader::open(const std::string& path) {
     {
         std::unordered_map<std::uint16_t,
                            std::vector<FieldEntry>> pending_fields;
+        // Per-unit-scoped pending fields: same key shape as the
+        // aggr_by_unit_hash_ map so we can attach fields without
+        // tripping on cross-unit hash collisions (System.TTextRec's
+        // own_hash 0x0405 vs PCBCommands_PCB.TPCBCommands's
+        // linked_hash 0x0405 -- both legitimate, both real). The
+        // global pending_fields map above stays for the rare case
+        // where we can't determine a unit anchor.
+        std::map<std::pair<std::uint64_t, std::uint16_t>,
+                 std::vector<FieldEntry>> pending_fields_by_unit;
         std::unordered_map<std::uint16_t,
                            std::vector<EnumEntry>>  pending_enums;
         // For class header back-references (base_hash, total_size).
@@ -1175,6 +1184,18 @@ bool Reader::open(const std::string& path) {
                 AggregateType a;
                 a.name        = std::string(buf.data() + i + 2, nl);
                 a.own_hash    = readU16LE(at + 3);
+                // Linked hash: when kind has bit 0x80 set the
+                // 0x2a record carries a secondary hash at +7..+8
+                // that points at the actual class-header / fields
+                // anchor. Used by AdvPCB-style classes where the
+                // NAME record sits separately from the FIELDS.
+                // For other kinds (or when +8 is out-of-buffer)
+                // leave at 0.
+                const auto kind_byte =
+                    static_cast<std::uint8_t>(buf[at]);
+                if ((kind_byte & 0x80) != 0 && at + 8 < buf.size()) {
+                    a.linked_hash = readU16LE(at + 7);
+                }
                 a.file_offset = i;
                 // Pin the aggregate to its enclosing unit anchor.
                 // Closest-prior anchor via upper_bound on sorted
@@ -1261,7 +1282,20 @@ bool Reader::open(const std::string& path) {
                 }
                 if (ff_at == SIZE_MAX || ff_at < cur + 2) { ++i; continue; }
                 const std::uint16_t parent = readU16LE(ff_at - 2);
-                pending_fields[parent].push_back(std::move(fe));
+                // Stamp the field with its enclosing unit anchor so
+                // we can attach by (unit, parent_hash) and avoid
+                // cross-unit hash collisions (System.TTextRec
+                // 0x0405 vs PCBCommands_PCB.TPCBCommands linked
+                // 0x0405). Field's file_offset = `i` (start of the
+                // 0x2c record).
+                const std::uint64_t fua = unitAnchorFor(
+                    static_cast<std::uint64_t>(i));
+                if (fua != 0) {
+                    pending_fields_by_unit[{fua, parent}]
+                        .push_back(std::move(fe));
+                } else {
+                    pending_fields[parent].push_back(std::move(fe));
+                }
                 i = ff_at + 1;
                 continue;
             }
@@ -1362,14 +1396,47 @@ bool Reader::open(const std::string& path) {
                 aggr_by_unit_hash_[
                     UnitHashKey{a.unit_anchor_offset, a.own_hash}] = k;
             }
+            // ALSO index under linked_hash so variables that
+            // reference the class via the secondary hash (Self of
+            // AdvPCB TPCBCommands has aggregate_hash 0x0405 while
+            // the named 0x2a sits at own_hash 0xd0cf with
+            // linked_hash 0x0405) resolve to the same aggregate.
+            // Don't overwrite an existing primary-hash entry --
+            // a real own_hash always wins over a linked_hash.
+            if (a.linked_hash != 0
+                && a.linked_hash != a.own_hash) {
+                if (aggr_by_hash_.find(a.linked_hash)
+                    == aggr_by_hash_.end()) {
+                    aggr_by_hash_[a.linked_hash] = k;
+                }
+                if (a.unit_anchor_offset != 0) {
+                    UnitHashKey k2{a.unit_anchor_offset, a.linked_hash};
+                    if (aggr_by_unit_hash_.find(k2)
+                        == aggr_by_unit_hash_.end()) {
+                        aggr_by_unit_hash_[k2] = k;
+                    }
+                }
+            }
         }
 
-        // Attach pending fields / enums by parent_hash, then classify.
+        // Attach pending fields by (unit, parent_hash) -- this is
+        // the precise version that survives cross-unit hash
+        // collisions (e.g. System.TTextRec.own_hash collides with
+        // PCBCommands_PCB.TPCBCommands.linked_hash, both 0x0405).
+        for (auto& [k, v] : pending_fields_by_unit) {
+            auto it = aggr_by_unit_hash_.find(
+                UnitHashKey{k.first, k.second});
+            if (it == aggr_by_unit_hash_.end()) continue;
+            auto& a = aggregates_[it->second];
+            a.fields = std::move(v);
+        }
+        // Fallback: any fields we couldn't tie to a unit anchor get
+        // the global last-wins attach (rare; matches old behaviour).
         for (auto& [h, v] : pending_fields) {
             auto it = aggr_by_hash_.find(h);
             if (it == aggr_by_hash_.end()) continue;
             auto& a = aggregates_[it->second];
-            a.fields = std::move(v);
+            if (a.fields.empty()) a.fields = std::move(v);
         }
         for (auto& [h, v] : pending_enums) {
             auto it = aggr_by_hash_.find(h);
@@ -1415,7 +1482,9 @@ bool Reader::open(const std::string& path) {
                 a.kind = AggregateKind::Enum;
                 continue;
             }
-            if (class_hashes.count(a.own_hash)) {
+            if (class_hashes.count(a.own_hash)
+                || (a.linked_hash != 0
+                    && class_hashes.count(a.linked_hash))) {
                 a.kind = AggregateKind::Class;
                 continue;
             }

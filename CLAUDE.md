@@ -599,7 +599,48 @@ update this section first and explain why in the commit message.
     unordered_multimap<(unit_anchor, name), ...> so each Self
     lookup is O(1). Back to baseline 46s.
 
-31. **Anonymous in-proc `set of` locals need synthesis from a
+31. **AdvPCB-style classes carry the NAME and the FIELDS in two
+    separate 0x2a records linked by `kind & 0x80` + a secondary
+    hash at +7..+8.** Small-fixture classes (07_records, 08) emit
+    one 0x2a record per class (kind 0x20) that holds own_hash +
+    name + base + fields all together. AdvPCB's classes split:
+      - 0x2a NAME record (kind & 0x80, e.g. 0xa8) holds the
+        Pascal name and own_hash A; carries a SECONDARY hash B
+        at the byte pair +7..+8 from kind.
+      - 0x47 CLASS HEADER lives separately with own_hash = B.
+      - 0x2c FIELDS are parented to B, not A.
+
+    The two-pass parser must:
+      1. Read kind. If `kind & 0x80`, also read linked_hash from
+         +7..+8 onto AggregateType::linked_hash.
+      2. Index the aggregate under BOTH own_hash AND linked_hash
+         in aggr_by_hash_ / aggr_by_unit_hash_ (last-wins, with
+         own_hash always preferred). Variables referencing
+         either hash resolve to the same aggregate.
+      3. Attach pending_fields BY (unit_anchor, parent_hash) --
+         the global hash-only attach trips on cross-unit
+         collisions (System.TTextRec.own_hash 0x0405 collides
+         with PCBCommands_PCB.TPCBCommands.linked_hash 0x0405).
+      4. Classifier accepts kind=Class when EITHER own_hash OR
+         linked_hash is in class_hashes (the 0x47-header set).
+
+    Verified 81.8% match rate across 47k `kind & 0x80` 0x2a
+    records in AdvPCB.rsm (38,666 / 47,261 had linked_hash that
+    pointed to an existing 0x47 class header). The remaining
+    18% are primitives (Boolean / AnsiChar / Char with kind=0xa8
+    but no class header) -- harmless because they don't match
+    any class_hash so they stay classified as something else.
+
+    Inherent limitation: RSM emits class fields PER-UNIT-USAGE,
+    not the full class layout. TPCBCommands has ~hundreds of
+    fields in its full declaration, but PCBCommands_PCB.pas
+    only references FDensityPlanes + FECOImplementation, so
+    those are the only two fields visible when stepping into
+    TPCBCommands.FileSave. To see more fields the user'd need
+    to also load PDBs for units that reference the other
+    fields (or load the interface-unit declaration's PDB).
+
+32. **Anonymous in-proc `set of` locals need synthesis from a
     nearby enum.** When a Pascal function declares both a NESTED
     `Type X = (...)` enum and a `var r: set of X` local, RSM
     emits the enum as a regular 0x2a record but does NOT emit a
@@ -626,7 +667,7 @@ update this section first and explain why in the commit message.
     emits `type = 0x1025 (set of TSaveFormat)`. cdb shows each
     enumerator's bit individually. AdvPCB still 45s.
 
-32. **Pascal `property` declarations don't make it into the PDB.**
+33. **Pascal `property` declarations don't make it into the PDB.**
     CodeView has no `LF_PROPERTY` counterpart. What survives the
     Delphi -> RSM -> CodeView pipeline:
       - backing FIELDS (LF_MEMBER `fName`, `fBarkCount`, ...);

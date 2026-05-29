@@ -187,6 +187,15 @@ struct AggregateType {
     std::vector<FieldEntry> fields;          // records / classes
     std::vector<EnumEntry>  enum_entries;    // enums only
     std::uint16_t           base_hash = 0;   // classes only: parent's own_hash
+    // Secondary hash carried by 0x2a records whose kind byte has
+    // bit 0x80 set (AdvPCB-style large-project classes -- the type
+    // record at own_hash carries the NAME, while the actual class
+    // header + fields live under linked_hash). Empirically 81.8%
+    // of `kind & 0x80` 0x2a records in AdvPCB.rsm have linked_hash
+    // that exactly matches a 0x47 class-header own_hash. We index
+    // each such aggregate under BOTH own_hash and linked_hash so a
+    // variable referencing either resolves to the same record.
+    std::uint16_t           linked_hash = 0;
     std::uint32_t           total_size = 0;  // bytes; 0 if unknown
     std::uint64_t           file_offset = 0; // 0x2a record start (debug aid)
     // The closest-prior unit anchor's file offset. Pins this
