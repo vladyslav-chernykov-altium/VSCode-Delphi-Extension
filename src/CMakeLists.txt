@@ -25,6 +25,9 @@ add_library(rsm2pdb_core STATIC
   cli/cli_cmd_dwarf_emit.cpp
   cli/cli_cmd_dwarf.cpp
   cli/cli_cmd_pdb.cpp
+  cli/cli_cmd_pdb_thunks.cpp
+  cli/cli_cmd_pdb_aggregates.cpp
+  cli/cli_cmd_pdb_modules.cpp
 )
 
 target_include_directories(rsm2pdb_core PUBLIC
