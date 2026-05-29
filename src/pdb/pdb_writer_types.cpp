@@ -277,16 +277,25 @@ void PdbWriter::emitAggregates() {
     codeview::TypeIndex fwd_ptr_ti   = codeview::TypeIndex::None();
     std::vector<codeview::TypeIndex> method_mfunc_ti;
     if (has_methods) {
+      // Itanium-style mangled unique name: `.?AVClassName@@` for
+      // class, `.?AUStructName@@` for struct. MSVC emits one of
+      // these for every user type + sets ClassOptions::HasUniqueName.
+      // Without it, VS Watch IntelliSense doesn't index the type
+      // (typing `lDog->` gives no completion suggestions). Verified
+      // against examples/99_cpp_baseline -- MSVC's TDog LF_CLASS
+      // carries `unique name: .?AVTDog@@, options: has unique name`.
+      const std::string unique_name = ".?AV" + a.name + "@@";
       codeview::ClassRecord fwd(
           codeview::TypeRecordKind::Class,
           /*member_count=*/0,
-          codeview::ClassOptions::ForwardReference,
+          codeview::ClassOptions::ForwardReference
+              | codeview::ClassOptions::HasUniqueName,
           /*field_list=*/codeview::TypeIndex::None(),
           /*derivation_list=*/codeview::TypeIndex::None(),
           /*vshape=*/codeview::TypeIndex::None(),
           /*size=*/0,
           a.name,
-          std::string{});
+          unique_name);
       fwd_inner_ti = tpi_table_.writeLeafType(fwd);
       // ThisType for class methods is a plain Near64 pointer with
       // PointerOptions::None. Matches MSVC's emission (verified
@@ -382,12 +391,20 @@ void PdbWriter::emitAggregates() {
       }
     }
     const auto field_list_ti = tpi_table_.insertRecord(crb);
+    // Itanium-style unique name (see note on forward-decl above).
+    // `.?AV` prefix for classes, `.?AU` for structs/records --
+    // matches what MSVC emits. The trailing `@@` is the empty
+    // namespace terminator. This + HasUniqueName flag enables VS
+    // Watch IntelliSense to index user types for autocomplete.
+    const std::string complete_unique_name =
+        std::string(is_class ? ".?AV" : ".?AU") + a.name + "@@";
     codeview::ClassRecord cr(is_class ? codeview::TypeRecordKind::Class
                                       : codeview::TypeRecordKind::Struct,
-                             member_count, codeview::ClassOptions::None,
+                             member_count,
+                             codeview::ClassOptions::HasUniqueName,
                              field_list_ti, codeview::TypeIndex::None(),
                              codeview::TypeIndex::None(), a.byte_size, a.name,
-                             std::string{});
+                             complete_unique_name);
     const auto inner_ti = tpi_table_.writeLeafType(cr);
     aggregate_inner_ti_.push_back(inner_ti);
 

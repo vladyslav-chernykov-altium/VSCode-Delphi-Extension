@@ -15,6 +15,7 @@
 #include "llvm/DebugInfo/PDB/Native/RawConstants.h"
 #include "llvm/DebugInfo/PDB/Native/TpiStreamBuilder.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include <cstring>
 
@@ -111,6 +112,18 @@ bool PdbWriter::run() {
   // Publish the shared string table into the PDB-global /names
   // stream once, after every module has registered its file paths.
   builder_.getStringTableBuilder().setStrings(*shared_strings_);
+
+  // Embed NatVis XML as a PDB injected source. VS native + cppvsdbg
+  // auto-load NatVis from injected sources at debug time; this
+  // bypasses the launch.json `visualizerFile` requirement that
+  // cppvsdbg-in-VSCode otherwise needs, and matches how MSVC
+  // link.exe's /natvis: flow stores natvis content. The "name"
+  // shows up in dia2dump / llvm-pdbutil dump --injected-sources.
+  if (!inputs_.natvis_xml.empty()) {
+    auto buf = MemoryBuffer::getMemBufferCopy(inputs_.natvis_xml,
+                                              "rsm2pdb.natvis");
+    builder_.addInjectedSource("rsm2pdb.natvis", std::move(buf));
+  }
 
   codeview::GUID out_guid{};
   if (auto e = builder_.commit(path_, &out_guid)) {

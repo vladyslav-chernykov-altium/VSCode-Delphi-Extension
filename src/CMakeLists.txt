@@ -17,6 +17,7 @@ add_library(rsm2pdb_core STATIC
   pdb/pdb_writer_types.cpp
   pdb/pdb_writer_symbols.cpp
   pdb/pdb_writer_modules.cpp
+  natvis/natvis_writer.cpp
   cli/cli_usage.cpp
   cli/cli_cmd_dump.cpp
   cli/cli_cmd_diff_procs.cpp

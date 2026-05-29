@@ -9,6 +9,7 @@
 #include "cli/util.h"
 #include "compose/frame.h"
 #include "map/map_reader.h"
+#include "natvis/natvis_writer.h"
 #include "pdb/pdb_writer.h"
 #include "pe/pe_pdb_injector.h"
 #include "pe/thunk_scanner.h"
@@ -96,6 +97,8 @@ int cmdPdb(int argc, char **argv) {
       ctx.src_search_dirs.emplace_back(argv[++i]);
     } else if (std::strcmp(argv[i], "--include-rtl") == 0) {
       ctx.include_rtl = true;
+    } else if (std::strcmp(argv[i], "--no-natvis") == 0) {
+      ctx.emit_natvis = false;
     } else {
       std::fprintf(stderr, "error: unknown pdb arg: %s\n", argv[i]);
       return 1;
@@ -230,6 +233,19 @@ int cmdPdb(int argc, char **argv) {
   // ---- Compose DBI modules ----
   composeModules(ctx);
 
+  // ---- NatVis embedding (Tier 1: per-Class DisplayString + Expand
+  //      with base chain, fields, and 0-arg `function` methods as
+  //      synthetic getters). The XML is built in-memory and stored
+  //      in ctx.inputs.natvis_xml; the PDB writer embeds it as an
+  //      injected source. VS native + cppvsdbg auto-load NatVis
+  //      from injected sources without any launch.json
+  //      `visualizerFile` config or `.natvis` sidecar -- this
+  //      mirrors what MSVC link.exe /natvis: does. Disable with
+  //      --no-natvis. Built BEFORE writePdb so the writer sees it. ----
+  if (ctx.emit_natvis) {
+    ctx.inputs.natvis_xml = rsm2pdb::natvis::buildNatVisXml(ctx.inputs);
+  }
+
   // ---- Write PDB ----
   ctx.stamp("phase: write PDB (LLVM streams)");
   std::string err;
@@ -238,6 +254,15 @@ int cmdPdb(int argc, char **argv) {
     return 1;
   }
   std::fprintf(stdout, "wrote PDB: %s\n", ctx.output_pdb.c_str());
+  if (!ctx.inputs.natvis_xml.empty()) {
+    std::size_t class_count = 0;
+    for (const auto &a : ctx.inputs.aggregates) {
+      if (a.kind == rsm2pdb::pdb::AggregateKind::Class)
+        ++class_count;
+    }
+    std::fprintf(stdout, "  embedded natvis: %zu classes, %zu bytes\n",
+                 class_count, ctx.inputs.natvis_xml.size());
+  }
 
   // ---- Sibling .natstepfilter ----
   if (!ctx.thunks_to_emit.empty()) {

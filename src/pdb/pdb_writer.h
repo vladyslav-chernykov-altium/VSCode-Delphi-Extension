@@ -244,6 +244,12 @@ struct PdbInputs {
     // (nested types before their containers) -- the writer doesn't
     // topologically sort.
     std::vector<AggregateRecord> aggregates;
+    // Optional NatVis XML to embed into the PDB as an injected source.
+    // When non-empty the writer calls PDBFileBuilder::addInjectedSource
+    // with this content; VS native + cppvsdbg read it directly from
+    // the PDB at debug time (no `visualizerFile` config or sidecar
+    // hunt needed). Mirrors MSVC link.exe's /natvis: flow.
+    std::string natvis_xml;
 };
 
 // Write a PDB. Returns true on success; fills `error_out` with the

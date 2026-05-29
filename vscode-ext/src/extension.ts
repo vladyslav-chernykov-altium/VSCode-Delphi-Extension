@@ -557,6 +557,10 @@ export function activate(context: vscode.ExtensionContext): void {
           console: useExternalConsole ? 'externalTerminal' : 'integratedTerminal',
           stopAtEntry: false,
           sourceFileMap,
+          // NatVis is embedded directly in the PDB (via PDBFileBuilder's
+          // addInjectedSource) so we don't need visualizerFile here --
+          // VS native + cppvsdbg auto-discover NatVis from injected
+          // sources at debug time.
         }
       : {
           name: `rsm2pdb: ${settings.projectName} (${chosen.name} ${chosen.platform})`,

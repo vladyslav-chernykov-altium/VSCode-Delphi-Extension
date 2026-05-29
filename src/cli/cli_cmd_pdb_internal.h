@@ -63,6 +63,10 @@ struct Context {
   std::string output_pdb;
   std::vector<std::string> src_search_dirs;
   bool include_rtl = false;
+  // NatVis sidecar emission: ON by default; turn off with the
+  // --no-natvis CLI flag. The companion `.natvis` lives next to
+  // the PDB and is auto-loaded by cppvsdbg (VS native + VSCode).
+  bool emit_natvis = true;
 
   // ---- PE bytes + parsed header pointers ----
   std::vector<std::uint8_t> pe_bytes;
